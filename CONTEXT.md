@@ -48,6 +48,10 @@ _Avoid_: preview, simulation
 The atomic step that makes a verified temp file appear under its final destination name (rename + parent-directory sync), after any SafetyNet archiving of what it replaces.
 _Avoid_: commit (reserved for the Journal state), finalize
 
+**Convergence**:
+The guarantee that the next run after any interruption or fault reaches the correct destination state through its own fresh scan — one rerun, no manual repair, nothing replayed.
+_Avoid_: recovery, self-healing, resume (reserved for the rejected mid-file sense)
+
 **Verification**:
 The per-file gate a copy must pass before any destination change — the copied temp matches the source at the tier the run selected, and the source still matches what the run planned from.
 _Avoid_: validation, integrity check
