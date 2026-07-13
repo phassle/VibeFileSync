@@ -8,6 +8,10 @@ A native macOS (Apple Silicon) one-way file-sync tool: pick Folder pairs, choose
 A configured source directory and destination directory that sync runs operate on.
 _Avoid_: sync pair, job, profile
 
+**Pair name**:
+The unique user-chosen identifier of a Folder pair — the handle runs are invoked with and the key run records reference. Renaming a pair creates a new identity.
+_Avoid_: pair id, profile name, job name
+
 **Mirror**:
 The Sync mode that makes the destination an exact copy of the source, including removals — every removal or replacement goes through SafetyNet.
 _Avoid_: backup mode, clone
