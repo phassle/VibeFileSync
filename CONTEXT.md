@@ -25,7 +25,7 @@ The retention guarantee that the previous destination version is durably kept �
 _Avoid_: trash, recycle bin, versioning (as a synonym — versioning is one mechanism SafetyNet may use)
 
 **Run folder**:
-The timestamped subfolder of `_SafetyNet/` holding everything one run archived, with relative paths preserved — the unit of restore and of Prune.
+The subfolder of `_SafetyNet/`, named by the Run id, holding everything one run archived with relative paths preserved — the unit of restore and of Prune.
 _Avoid_: snapshot, backup set
 
 **Prune**:
@@ -33,8 +33,12 @@ The explicit command that deletes SafetyNet Run folders; the only way archived v
 _Avoid_: cleanup, auto-purge
 
 **Journal**:
-The file-level crash-safety record (`pending → in-progress → committed` per file) that lets a rerun skip committed files. Interrupted files are discarded and recopied in v1 — the Journal is not a mid-file resume mechanism.
+The retained per-run record of a run's intent, per-file transitions (`pending → in-progress → committed`), and outcome. Forensic and historical only — a rerun's fresh scan, never the Journal, decides what to copy; it is not a mid-file resume mechanism.
 _Avoid_: WAL, database, index
+
+**Run id**:
+The UTC timestamp identity (`YYYYMMDDTHHMMSSZ`) a run is known by everywhere — the Journal file name, the SafetyNet Run folder name, and the `run_id` field in JSON events.
+_Avoid_: run timestamp, session id
 
 **Dry-run**:
 A run that produces the diff of planned actions without mutating the destination; the reviewable plan a real run executes.
