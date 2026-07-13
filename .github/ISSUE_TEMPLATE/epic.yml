@@ -1,0 +1,58 @@
+name: "Epic"
+description: "An optional grouping of related Features under an Idea. Skip this level when a Feature stands on its own."
+title: "[Epic] "
+labels:
+  - "type: epic"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An **Epic** groups several related Features that together move an Idea forward. Use it when the scope is too large for one spec — skip it otherwise and let `to-spec` create a Feature directly under the Idea.
+
+        Write everything in English, even if the discussion that produced it happened in another language.
+
+  - type: input
+    id: parent-idea
+    attributes:
+      label: Parent Idea
+      description: Link (or #number) of the Idea this Epic belongs to, if any.
+    validations:
+      required: false
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome does this Epic exist to deliver?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope — Features expected under this Epic
+      description: A rough list of the Features (specs) you expect to fall under this Epic. This list is expected to change as Features get written.
+    validations:
+      required: false
+
+  - type: textarea
+    id: success-criteria
+    attributes:
+      label: Success criteria
+      description: How will you know this Epic is done or should be closed?
+    validations:
+      required: false
+
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Non-goals
+      description: What is explicitly out of scope for this Epic?
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Next steps for this hierarchy level:** run `/to-spec` for each piece of work under this Epic — each produces a `type: feature` issue linked as a sub-issue of this Epic.

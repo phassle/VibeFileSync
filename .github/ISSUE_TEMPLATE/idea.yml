@@ -1,0 +1,58 @@
+name: "Idea"
+description: "A loose, unscoped concept — the top of the Idea > Epic > Feature > Issue hierarchy. Not yet a commitment to build anything."
+title: "[Idea] "
+labels:
+  - "type: idea"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An **Idea** is deliberately unscoped and unproven. It captures a problem space or opportunity worth exploring before anyone commits to a plan.
+
+        Write everything in English, even if the discussion that produced it happened in another language.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is this idea, in a few sentences? What prompted it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / problem space
+      description: Why does this matter? What problem, opportunity, or curiosity is driving it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: rough-shape
+    attributes:
+      label: Rough shape (optional)
+      description: If you already have a sense of what this could become, sketch it here. It's fine to leave this thin or contradictory — that's what Epics/Features are for.
+    validations:
+      required: false
+
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open questions
+      description: What's still unknown? What would need to be decided or researched before this could become an Epic or Feature?
+    validations:
+      required: false
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Links to research docs, prior discussions, prototypes, or related issues.
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Next steps for this hierarchy level:** an Idea graduates by spinning off one or more `type: epic` or `type: feature` issues as sub-issues, once the shape is clear enough to scope. It is never closed by "doing" the work directly.
