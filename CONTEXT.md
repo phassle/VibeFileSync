@@ -1,0 +1,45 @@
+# VibeFileSync
+
+A native macOS (Apple Silicon) one-way file-sync tool: pick Folder pairs, choose a Sync mode, run it repeatedly — a crash-safe successor to the FreeFileSync concept. Pure-Rust binary, CLI-first, with a thin TUI on the same engine.
+
+## Language
+
+**Folder pair**:
+A configured source directory and destination directory that sync runs operate on.
+_Avoid_: sync pair, job, profile
+
+**Mirror**:
+The Sync mode that makes the destination an exact copy of the source, including removals — every removal or replacement goes through SafetyNet.
+_Avoid_: backup mode, clone
+
+**Update**:
+The additive-only Sync mode — new and changed source files are copied; nothing on the destination is ever removed.
+_Avoid_: copy mode, additive sync
+
+**SafetyNet**:
+The retention guarantee that the previous destination version is durably kept — by renaming it into the destination's `_SafetyNet/` tree — before any operation in any Sync mode removes or replaces an existing destination object, unless permanent deletion was explicitly selected for that run.
+_Avoid_: trash, recycle bin, versioning (as a synonym — versioning is one mechanism SafetyNet may use)
+
+**Run folder**:
+The timestamped subfolder of `_SafetyNet/` holding everything one run archived, with relative paths preserved — the unit of restore and of Prune.
+_Avoid_: snapshot, backup set
+
+**Prune**:
+The explicit command that deletes SafetyNet Run folders; the only way archived versions are ever deleted in v1.
+_Avoid_: cleanup, auto-purge
+
+**Journal**:
+The file-level crash-safety record (`pending → in-progress → committed` per file) that lets a rerun skip committed files. Interrupted files are discarded and recopied in v1 — the Journal is not a mid-file resume mechanism.
+_Avoid_: WAL, database, index
+
+**Dry-run**:
+A run that produces the diff of planned actions without mutating the destination; the reviewable plan a real run executes.
+_Avoid_: preview, simulation
+
+**Publish**:
+The atomic step that makes a verified temp file appear under its final destination name (rename + parent-directory sync), after any SafetyNet archiving of what it replaces.
+_Avoid_: commit (reserved for the Journal state), finalize
+
+**Run preconditions**:
+The sanity checks a run must pass before mutating the destination — e.g. source volume actually mounted (an unmounted source reads as an empty directory), volume identity matches the Folder pair, sufficient free space.
+_Avoid_: preflight checks, guards
