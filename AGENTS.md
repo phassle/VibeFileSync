@@ -11,3 +11,7 @@ Default canonical labels: `needs-triage`, `needs-info`, `ready-for-agent`, `read
 ### Domain docs
 
 Single-context layout: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Git workflow
+
+Gitflow: work lands on `develop` via `feature/*` branches; `main` is releases only. See `docs/agents/git-workflow.md`.
