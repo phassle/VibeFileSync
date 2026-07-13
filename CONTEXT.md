@@ -48,6 +48,14 @@ _Avoid_: preview, simulation
 The atomic step that makes a verified temp file appear under its final destination name (rename + parent-directory sync), after any SafetyNet archiving of what it replaces.
 _Avoid_: commit (reserved for the Journal state), finalize
 
+**Verification**:
+The per-file gate a copy must pass before any destination change — the copied temp matches the source at the tier the run selected, and the source still matches what the run planned from.
+_Avoid_: validation, integrity check
+
+**Expected degradation**:
+A metadata property the destination volume is known to be unable to preserve — a fact about the Folder pair stated once per run, never a per-file failure or warning.
+_Avoid_: warning (reserved for unexpected metadata mismatches), metadata loss
+
 **Run preconditions**:
 The sanity checks a run must pass before mutating the destination — e.g. source volume actually mounted (an unmounted source reads as an empty directory), volume identity matches the Folder pair, sufficient free space.
 _Avoid_: preflight checks, guards
