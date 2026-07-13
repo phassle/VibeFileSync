@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "proto:cli": "node prototype-cli-surface.mjs"
+  },
+  "devDependencies": {
+    "@ai-hero/sandcastle": "^0.12.0"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}
