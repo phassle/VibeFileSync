@@ -1,0 +1,17 @@
+# Dry-run output is grouped by operation, --json is an NDJSON stream, and every run is review-first
+
+Decided by reacting to a terminal prototype (branch [`prototype/dryrun-review`](https://github.com/phassle/VibeFileSync/tree/prototype/dryrun-review)) showing three CLI diff variants, two JSON framings, and two TUI review layouts on the same fake Mirror plan.
+
+1. **Human CLI diff: grouped by operation, summary first.** The plan prints a one-line totals header (`N copy · N update · N delete · N error`, marked as a dry-run), then one section per operation — COPY, UPDATE, DELETE, ERRORS — each row showing path, size, and reason. UPDATE and DELETE section headers state where old versions go (`→ _SafetyNet/<run-timestamp>/`). Scan totals (scanned / unchanged / excluded-by-filter) close the output. The flat-ledger and tree variants were rejected.
+2. **`--json` output: NDJSON stream.** One JSON object per line: a `plan_start` header (schema id `vibefilesync.plan/v1`, run id, pair, mode, `dry_run`), one `action` object per planned operation (`op`, `path`, `reason`, `bytes`/`old_bytes`, `safety_net` path for archiving ops), and a trailing `summary` object. Streaming keeps memory constant on huge plans and lets agents act on rows before the scan finishes. The single-document framing was rejected.
+3. **TUI review: action-list, not dual-pane.** One row per planned action (include-checkbox, op glyph + name, path, size, SafetyNet note) with cursor movement and per-row include/exclude before running. Exclusions are per-run only, never saved. The FreeFileSync-style dual-pane was rejected — the action is the unit of review, not the source/destination correspondence.
+4. **Review-first everywhere, never auto-run.** The TUI always lands on a confirm screen (recomputed totals, SafetyNet destination, exclusion count) before executing. The CLI `run` command prints the plan and asks y/N; `--yes` skips the prompt for scripted/agent/cron use. There is no mode that mutates the destination without either an explicit confirmation or an explicit `--yes`.
+5. **Errors block the run.** A planned-action error (e.g. symlink to an exFAT destination, a v1 hard error) blocks confirmation while included: the user must exclude the row (TUI) or resolve it at the source. No auto-skip-with-warning.
+
+## Consequences
+
+- The CLI surface inherits a plan/run split with review-first semantics and a `--yes` flag; the `--json` schema above is the contract the CLI-surface prototype ([ticket #7](https://github.com/phassle/VibeFileSync/issues/7)) should build on.
+- Blocking-on-error plus per-run exclusions means a run's executed set is always an explicitly reviewed subset of the plan — the Journal and acceptance tests can assume no action executes that wasn't in the confirmed plan.
+- The `ratatui` TUI is a thin action-list + confirm screen over the same plan the CLI prints — no dual-pane tree browser is needed in v1.
+
+Decided on the wayfinder ticket [Prototype the dry-run diff & review interaction](https://github.com/phassle/VibeFileSync/issues/6).
