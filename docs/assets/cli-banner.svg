@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="150" viewBox="0 0 680 150" role="img" aria-label="vibesync startup banner: V I B E S Y N C — one-way file sync with SafetyNet · plan → review → run">
+  <defs>
+    <linearGradient id="mark1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a855f7"/>
+      <stop offset="1" stop-color="#ec4899"/>
+    </linearGradient>
+    <linearGradient id="mark2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4aadf1"/>
+      <stop offset="0.5" stop-color="#c05cf0"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+  </defs>
+  <rect width="680" height="150" rx="10" fill="#16161e"/>
+  <circle cx="24" cy="24" r="6" fill="#ff5f57"/>
+  <circle cx="44" cy="24" r="6" fill="#febc2e"/>
+  <circle cx="64" cy="24" r="6" fill="#28c840"/>
+  <g font-family="Menlo, 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', monospace" font-size="16">
+    <text x="24" y="64" xml:space="preserve"><tspan fill="#6a6f85">$</tspan><tspan fill="#c8ccd9"> vibesync</tspan></text>
+    <text x="24" y="100" xml:space="preserve" fill="url(#mark1)">◢█◣</text>
+    <text x="76" y="100" xml:space="preserve" fill="#e6edf3" font-weight="bold">V I B E S Y N C</text>
+    <text x="24" y="126" xml:space="preserve" fill="url(#mark2)">◥█◤</text>
+    <text x="76" y="126" xml:space="preserve" fill="#787f95">one-way file sync with SafetyNet · plan → review → run</text>
+  </g>
+</svg>
