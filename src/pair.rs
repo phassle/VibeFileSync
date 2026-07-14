@@ -29,6 +29,16 @@ fn require_existing_dir(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Pins `path`'s volume UUID, wrapping any failure as the `AppError`
+/// variant the CLI reports (used identically for both the source and
+/// destination side of a pair).
+fn pin_volume_uuid(path: &Path) -> Result<String, AppError> {
+    volume::volume_uuid(path).map_err(|e| AppError::VolumeUuid {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
 pub fn add(
     config_path: &Path,
     name: &str,
@@ -52,15 +62,8 @@ pub fn add(
     require_existing_dir(source)?;
     require_existing_dir(destination)?;
 
-    let source_volume_uuid = volume::volume_uuid(source).map_err(|e| AppError::VolumeUuid {
-        path: source.to_path_buf(),
-        source: e,
-    })?;
-    let destination_volume_uuid =
-        volume::volume_uuid(destination).map_err(|e| AppError::VolumeUuid {
-            path: destination.to_path_buf(),
-            source: e,
-        })?;
+    let source_volume_uuid = pin_volume_uuid(source)?;
+    let destination_volume_uuid = pin_volume_uuid(destination)?;
 
     cfg.pairs.insert(
         name.to_string(),

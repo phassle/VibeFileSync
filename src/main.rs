@@ -173,5 +173,5 @@ fn run_pair(action: &PairCommand, config_path: &std::path::Path) -> Result<i32, 
 
 fn not_yet_implemented(verb: &str, pair: &str) -> i32 {
     eprintln!("vibesync {verb}: not yet implemented (pair: {pair})");
-    1
+    error::EXIT_UNIMPLEMENTED
 }

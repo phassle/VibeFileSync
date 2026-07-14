@@ -14,6 +14,7 @@ use std::path::Path;
 const EXIT_OK: i32 = 0;
 const EXIT_PRECONDITION: i32 = 2;
 const EXIT_USAGE: i32 = 64;
+const EXIT_UNIMPLEMENTED: i32 = 69;
 
 fn vibesync(config_home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("vibesync").expect("binary builds");
@@ -309,7 +310,7 @@ fn run_stub_accepts_the_adr_0004_per_run_flags() {
             "some/relative/path",
         ])
         .assert()
-        .code(1);
+        .code(EXIT_UNIMPLEMENTED);
 }
 
 #[test]
@@ -318,7 +319,7 @@ fn plan_stub_accepts_json_and_exclude_flags() {
     fx.cmd()
         .args(["plan", "photos", "--json", "--exclude", "a/b"])
         .assert()
-        .code(1);
+        .code(EXIT_UNIMPLEMENTED);
 }
 
 #[test]
@@ -327,7 +328,7 @@ fn history_stub_accepts_json_flag() {
     fx.cmd()
         .args(["history", "photos", "--json"])
         .assert()
-        .code(1);
+        .code(EXIT_UNIMPLEMENTED);
 }
 
 #[test]
