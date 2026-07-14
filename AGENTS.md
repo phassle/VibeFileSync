@@ -14,4 +14,10 @@ Single-context layout: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/ag
 
 ### Git workflow
 
-Gitflow: work lands on `develop` via `feature/*` branches; `main` is releases only. See `docs/agents/git-workflow.md`.
+This repo uses **gitflow**. Never commit directly to `develop` or `main`:
+
+- **Always create a feature branch**: `feature/<kebab-name>` off `develop`, one per coherent change — code, docs, and ADRs alike.
+- Merge back to `develop` via PR (or `--no-ff` merge), then delete the branch. PRs target `develop` (the default branch), never `main`.
+- `main` is releases only; it advances via release/hotfix merges from `develop`.
+
+Details and exemptions (throwaway `prototype/*` and `research/*` branches): `docs/agents/git-workflow.md`.
