@@ -275,6 +275,62 @@ mode = "mirror"
 }
 
 #[test]
+fn bad_config_aborts_before_an_unimplemented_verb_runs() {
+    // A config typo must abort loudly before *any* command's logic runs,
+    // not just `pair` subcommands (ADR-0006 §7).
+    let fx = Fixture::new();
+    let path = config_file(fx.xdg.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "version = 1\nbogus = true\n").unwrap();
+
+    let output = fx.cmd().args(["plan", "photos"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("not yet implemented"),
+        "should abort on the bad config, never reach the stub: {stderr}"
+    );
+}
+
+#[test]
+fn run_stub_accepts_the_adr_0004_per_run_flags() {
+    let fx = Fixture::new();
+    fx.cmd()
+        .args([
+            "run",
+            "photos",
+            "--yes",
+            "--json",
+            "--permanent-delete",
+            "--allow-empty-source",
+            "--ignore-space-check",
+            "--exclude",
+            "some/relative/path",
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn plan_stub_accepts_json_and_exclude_flags() {
+    let fx = Fixture::new();
+    fx.cmd()
+        .args(["plan", "photos", "--json", "--exclude", "a/b"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn history_stub_accepts_json_flag() {
+    let fx = Fixture::new();
+    fx.cmd()
+        .args(["history", "photos", "--json"])
+        .assert()
+        .code(1);
+}
+
+#[test]
 fn no_mode_flag_exists_on_run_or_plan() {
     // ADR-0006: sync mode is per-pair config only, never a per-run flag.
     let fx = Fixture::new();

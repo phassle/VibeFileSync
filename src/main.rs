@@ -25,13 +25,46 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show the diff of planned actions without mutating the destination.
-    Plan { pair: String },
+    Plan {
+        pair: String,
+        /// Stream the plan as NDJSON (schema `vibefilesync.plan/v1`).
+        #[arg(long)]
+        json: bool,
+        /// Exclude an exact plan path (repeatable); glob-free per ADR-0004.
+        #[arg(long, value_name = "PATH")]
+        exclude: Vec<String>,
+    },
     /// Execute a run for a Folder pair.
-    Run { pair: String },
+    Run {
+        pair: String,
+        /// Skip the confirmation prompt (scripted/agent/cron use).
+        #[arg(long)]
+        yes: bool,
+        /// Stream run events as NDJSON (schema `vibefilesync.run/v1`).
+        #[arg(long)]
+        json: bool,
+        /// Delete archived versions permanently instead of via SafetyNet.
+        #[arg(long)]
+        permanent_delete: bool,
+        /// Allow an empty source against a non-empty Mirror destination.
+        #[arg(long)]
+        allow_empty_source: bool,
+        /// Skip the free-space preflight check.
+        #[arg(long)]
+        ignore_space_check: bool,
+        /// Exclude an exact plan path (repeatable); glob-free per ADR-0004.
+        #[arg(long, value_name = "PATH")]
+        exclude: Vec<String>,
+    },
     /// Show the last run's outcome for a Folder pair.
     Status { pair: String },
     /// Show past runs for a Folder pair.
-    History { pair: String },
+    History {
+        pair: String,
+        /// Emit history as JSON (schema `vibefilesync.history/v1`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete SafetyNet Run folders for a Folder pair.
     Prune { pair: String },
     /// Manage Folder pairs.
@@ -92,11 +125,16 @@ fn main() -> ExitCode {
 }
 
 fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError> {
+    // Every command loads (and so validates) the config first: a strict
+    // TOML typo must abort loudly before any command-specific logic runs,
+    // not just the `pair` ones (ADR-0006 §7).
+    config::load(config_path)?;
+
     match command {
-        Command::Plan { pair } => Ok(not_yet_implemented("plan", pair)),
-        Command::Run { pair } => Ok(not_yet_implemented("run", pair)),
+        Command::Plan { pair, .. } => Ok(not_yet_implemented("plan", pair)),
+        Command::Run { pair, .. } => Ok(not_yet_implemented("run", pair)),
         Command::Status { pair } => Ok(not_yet_implemented("status", pair)),
-        Command::History { pair } => Ok(not_yet_implemented("history", pair)),
+        Command::History { pair, .. } => Ok(not_yet_implemented("history", pair)),
         Command::Prune { pair } => Ok(not_yet_implemented("prune", pair)),
         Command::Tui { pair } => Ok(not_yet_implemented(
             "tui",

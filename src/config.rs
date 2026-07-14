@@ -168,6 +168,16 @@ pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
         source: e.error,
     })?;
 
+    // Publish idiom (CONTEXT.md: "rename + parent-directory sync"): fsync
+    // the directory so the rename itself is durable, not just the file's
+    // contents.
+    fs::File::open(dir)
+        .and_then(|dir_file| dir_file.sync_all())
+        .map_err(|e| ConfigError::Io {
+            path: dir.to_path_buf(),
+            source: e,
+        })?;
+
     Ok(())
 }
 
