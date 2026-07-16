@@ -10,6 +10,7 @@
 use assert_cmd::Command;
 use std::fs;
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 const EXIT_OK: i32 = 0;
 const EXIT_PRECONDITION: i32 = 2;
@@ -20,6 +21,25 @@ fn vibesync(config_home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("vibesync").expect("binary builds");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd
+}
+
+/// Run the real binary under macOS's `script(1)`, which supplies its stderr
+/// with a pseudo-terminal. The normal helpers deliberately use pipes, so
+/// they cover the non-TTY contract instead.
+fn vibesync_in_tty(config_home: &Path, args: &[&str], no_color: bool) -> std::process::Output {
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut command = ProcessCommand::new("script");
+    command
+        .args(["-q", "/dev/null"])
+        .arg(binary.get_program())
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_home);
+    if no_color {
+        command.env("NO_COLOR", "1");
+    } else {
+        command.env_remove("NO_COLOR");
+    }
+    command.output().expect("script starts a pseudo-terminal")
 }
 
 fn config_file(config_home: &Path) -> std::path::PathBuf {
@@ -414,16 +434,105 @@ fn unimplemented_verbs_print_a_clear_message() {
 }
 
 #[test]
-fn missing_subcommand_is_a_usage_error_exit_64() {
+fn bare_invocation_shows_help_and_exits_zero() {
     let fx = Fixture::new();
     let output = fx.cmd().output().unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: vibesync"));
 }
 
 #[test]
 fn help_exits_zero() {
     let fx = Fixture::new();
     fx.cmd().arg("--help").assert().success();
+}
+
+// --- Slice 14: startup banner (issue #28, ADR-0005) ---
+
+#[test]
+fn banner_renders_on_bare_help_and_tui_tty_surfaces() {
+    let fx = Fixture::new();
+
+    for args in [&[][..], &["--help"][..], &["tui"][..]] {
+        let output = vibesync_in_tty(fx.xdg.path(), args, false);
+        let output = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.contains('◢') && output.contains('█') && output.contains('◣'),
+            "top mark missing for {args:?}: {output}"
+        );
+        assert!(
+            output.contains('◥') && output.contains('◤'),
+            "bottom mark missing for {args:?}: {output}"
+        );
+        assert!(output.contains("V I B E S Y N C"), "wordmark missing for {args:?}: {output}");
+        assert!(
+            output.contains("one-way file sync with SafetyNet · plan → review → run"),
+            "tagline missing for {args:?}: {output}"
+        );
+        assert!(
+            output.contains("\x1b[38;2;168;85;247m"),
+            "truecolor purple gradient stop missing for {args:?}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn no_color_uses_a_plain_banner_one_liner_in_a_tty() {
+    let fx = Fixture::new();
+    let output = vibesync_in_tty(fx.xdg.path(), &["--help"], true);
+    let output = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.contains("V I B E S Y N C — one-way file sync with SafetyNet · plan → review → run"));
+    assert!(!output.contains("\x1b["), "NO_COLOR output must contain no ANSI bytes: {output:?}");
+}
+
+#[test]
+fn piped_commands_never_receive_banner_bytes() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    for args in [
+        &["plan", "photos"][..],
+        &["run", "photos"][..],
+        &["status", "photos"][..],
+        &["history", "photos"][..],
+        &["prune", "photos"][..],
+        &["pair", "list"][..],
+    ] {
+        let output = fx.cmd().args(args).output().unwrap();
+        let all_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !all_output.contains("V I B E S Y N C") && !all_output.contains("◢█◣"),
+            "working command must have no banner bytes for {args:?}: {all_output}"
+        );
+    }
+}
+
+#[test]
+fn banner_is_suppressed_by_environment_or_a_non_tty_stderr() {
+    let fx = Fixture::new();
+
+    let suppressed = ProcessCommand::new("script")
+        .args(["-q", "/dev/null"])
+        .arg(Command::cargo_bin("vibesync").unwrap().get_program())
+        .arg("--help")
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("VIBESYNC_NO_BANNER", "1")
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&suppressed.stdout).contains("V I B E S Y N C"));
+
+    let piped = fx.cmd().arg("--help").output().unwrap();
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&piped.stdout),
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    assert!(!all_output.contains("V I B E S Y N C"));
 }
 
 // --- Slice 2: `plan <pair>` human Dry-run diff (issue #16) ---
