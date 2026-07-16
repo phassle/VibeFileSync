@@ -208,6 +208,127 @@ The blank-context guarantee is the primary gate; model-family diversity is a
 secondary preference and must never be used as a substitute for a genuinely
 new reviewer session.
 
+## Additional harnesses: OpenCode and Pi
+
+The following findings use OpenCode at commit
+[`c69abee0c73253aebae65e87e4e1b9bfa8c38021`](https://github.com/anomalyco/opencode/tree/c69abee0c73253aebae65e87e4e1b9bfa8c38021)
+and Pi at commit
+[`e022eec37dee52790564f3af93819c34f3f78af1`](https://github.com/badlogic/pi-mono/tree/e022eec37dee52790564f3af93819c34f3f78af1).
+
+### OpenCode
+
+OpenCode natively implements Agent Skills and can load the same minimal
+`SKILL.md` core. It discovers project skills in `.opencode/skills/`,
+`.claude/skills/`, and `.agents/skills/`, and global skills in
+`~/.config/opencode/skills/`, `~/.claude/skills/`, and `~/.agents/skills/`.
+It requires `name` and `description` frontmatter and loads full skill content
+on demand through its `skill` tool
+([Agent Skills documentation](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/skills.mdx#L6-L45),
+[tool invocation](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/skills.mdx#L103-L123)).
+The shared `~/.agents/skills/dynamic-implement` installation is therefore
+already a valid OpenCode personal installation; no OpenCode-only copy is
+required.
+
+`opencode run <prompt>` is the noninteractive entry point. `--continue` and
+`--session` are the explicit resume paths and `--fork` is valid only with one
+of them; without those flags the implementation creates a new session
+([CLI contract](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/cli.mdx#L339-L386),
+[new-session source](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/opencode/src/cli/cmd/run.ts#L492-L527)).
+That makes a direct invocation such as
+`opencode run --model <provider/model> --format json <blind-review-prompt>` an
+auditable blank reviewer boundary. It must omit `--continue`, `--session`, and
+`--fork`; attaching to a server is acceptable only if it still creates a new
+session and no session ID is reused.
+
+OpenCode lists configured-provider candidates with `opencode models
+[provider]`, using `provider/model` identifiers, and accepts the same format
+through `--model`
+([model-list command](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/cli.mdx#L306-L334),
+[model selection](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/models.mdx#L204-L220)).
+`setup-dynamic-skills` should treat that list as candidates, then run a
+minimal fresh-session prompt before recording a model as callable; a cached
+catalog entry alone is not authentication evidence. Model family must be
+derived from the selected model identity, not just provider ID, because a
+gateway provider can expose several families.
+
+OpenCode also has native subagents. Its built-in `general` agent is intended
+for multiple parallel units, and `subagent_depth` defaults to one level
+([agent types](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/agents.mdx#L16-L91),
+[depth setting](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/config.mdx#L541-L554)).
+The Task tool creates a new child session when no `task_id` is supplied and
+prompts that session only with the delegated prompt; supplying `task_id`
+resumes an existing child
+([Task parameters](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/opencode/src/tool/task.ts#L40-L53),
+[child creation and prompt](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/opencode/src/tool/task.ts#L145-L220)).
+That is suitable for isolated implementers. For the strict blind reviewer,
+the separate `opencode run` process is preferable because it has neither a
+parent session nor any temptation to reuse a task ID.
+
+### Pi
+
+Pi also implements the Agent Skills standard. It searches personal
+`~/.pi/agent/skills/` and `~/.agents/skills/`, project `.pi/skills/` and
+`.agents/skills/`, packages, configured paths, and explicit repeatable
+`--skill` paths. Full instructions load on demand, and `/skill:<name>` forces
+loading
+([skills and locations](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/skills.md#L3-L41),
+[loading and invocation](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/skills.md#L43-L86)).
+The existing shared `~/.agents/skills/dynamic-implement` installation is valid
+for Pi too. Project-local skills require project trust; a personal
+`~/.agents/skills` install avoids making setup depend on an interactive trust
+prompt.
+
+Pi has a particularly strong direct blind-review command:
+`pi -p --no-session --model <provider/model> "/skill:<review-skill> ..."`.
+`-p` is noninteractive print mode, `--no-session` makes the run ephemeral, and
+`--provider`/`--model` select the provider and model. The invocation must not
+use `--continue`, `--resume`, `--session`, or `--fork`
+([CLI options](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/usage.md#L190-L264),
+[examples](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/usage.md#L266-L298)).
+The same command may add `--no-extensions --no-skills --skill <exact-path>` to
+load only an explicitly selected review skill; Pi documents explicit
+`--skill` paths as additive even when discovery is disabled. Pi's prompt path
+expands `/skill:<name>` into the selected `SKILL.md` body before calling the
+model
+([skill expansion source](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/src/core/agent-session.ts#L1285-L1316)).
+
+Pi exposes callable model candidates through `pi --list-models [search]` and
+selects them with `--provider` and `--model`. Its built-in authentication paths
+include ChatGPT/Codex, Claude, and GitHub Copilot subscriptions as well as API
+key providers
+([provider authentication](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/providers.md#L1-L55),
+[model CLI options](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/usage.md#L190-L208)).
+As with OpenCode, setup should follow discovery with a minimal ephemeral model
+call before marking it usable, and should record the actual model family rather
+than assuming the harness or provider identifies the family.
+
+Pi intentionally ships **without built-in subagents**. The official repository
+instead includes an example extension that launches each subagent as a
+separate Pi process with isolated context, supports parallel tasks, and invokes
+children as `--mode json -p --no-session`
+([core design](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/usage.md#L306-L310),
+[subagent example](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/examples/extensions/subagent/README.md#L1-L18),
+[parallel limits](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/examples/extensions/subagent/README.md#L88-L100),
+[process invocation](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/examples/extensions/subagent/index.ts#L276-L320)).
+Therefore setup must not mark Pi as having native subagent dispatch merely
+because `pi` exists. It can always mark the direct ephemeral Pi process as an
+eligible reviewer harness; parallel orchestration inside Pi requires a detected
+extension/package or an explicit external process adapter.
+
+### Resulting capability-probe rules
+
+For both harnesses, `setup-dynamic-skills` should separately record:
+
+1. skill discovery (does the shared `dynamic-implement` name appear/load?);
+2. candidate models (`opencode models` or `pi --list-models`);
+3. a successful minimal call for each selected model, including model family;
+4. native subagent support versus external-process-only support; and
+5. a tested blank-review command that starts a new, non-resumed session.
+
+The blank-review command is the acceptance test. A second model family is
+useful only after the setup probe has proved that the reviewer starts without
+the controller's conversation history.
+
 `docs/research/` did not exist before this note, so this file establishes the
 repository's research-note location. It is intentionally on the throwaway
 `research/dynamic-implement` branch and must not be merged under the current
