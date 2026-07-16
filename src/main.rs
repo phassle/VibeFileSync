@@ -1,10 +1,12 @@
 //! `vibesync`: hot-path verbs top-level, management namespaced, per
-//! ADR-0004. This slice stubs the hot-path verbs and the TUI entry point;
-//! only `pair add | list | remove` are implemented.
+//! ADR-0004. Implemented so far: `pair add | list | remove` and the
+//! read-only `plan <pair>` human diff; `run`, `status`, `history`, `prune`,
+//! the TUI, and `plan --json` are still stubbed.
 
 mod config;
 mod error;
 mod pair;
+mod plan;
 mod volume;
 
 use std::path::PathBuf;
@@ -131,7 +133,14 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
     config::load(config_path)?;
 
     match command {
-        Command::Plan { pair, .. } => Ok(not_yet_implemented("plan", pair)),
+        Command::Plan { pair, json, exclude } => {
+            // The NDJSON `vibefilesync.plan/v1` stream is a later slice;
+            // only the human diff is implemented here.
+            if *json {
+                return Ok(not_yet_implemented("plan --json", pair));
+            }
+            plan::run(config_path, pair, exclude)
+        }
         Command::Run { pair, .. } => Ok(not_yet_implemented("run", pair)),
         Command::Status { pair } => Ok(not_yet_implemented("status", pair)),
         Command::History { pair, .. } => Ok(not_yet_implemented("history", pair)),
