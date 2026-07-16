@@ -208,6 +208,33 @@ The blank-context guarantee is the primary gate; model-family diversity is a
 secondary preference and must never be used as a substitute for a genuinely
 new reviewer session.
 
+## Slash-only admission
+
+`dynamic-implement` is a user-invoked root command. Ordinary prose, implicit
+skill matching, and skill-picker selection are not admission evidence. The
+portable body uses a binary gate: either the host preserves the user's slash
+invocation, or a local slash adapter expands to
+`DYNAMIC_IMPLEMENT_SLASH_ENTRY=1`. Downstream skills remain model-reachable
+after the root gate so setup, TDD, review, and calibration can complete the
+admitted run.
+
+The host syntax cannot be identical because the command surfaces differ:
+
+| Harness | Root entry | Mechanism |
+| --- | --- | --- |
+| Codex | `/prompts:dynamic-implement <issue>` | A local custom prompt expands to `$dynamic-implement` plus the admission marker. Codex documents `$skill` or `/skills` for skills and reserves `/prompts:<name>` for local custom slash prompts; it does not expose arbitrary first-level custom skill commands ([skills](https://learn.chatgpt.com/docs/build-skills), [custom prompts](https://learn.chatgpt.com/docs/custom-prompts.md)). |
+| Claude Code | `/dynamic-implement <issue>` | Native direct skill command with `disable-model-invocation: true`, which removes automatic model admission while retaining the user command ([invocation control](https://code.claude.com/docs/en/skills#control-who-invokes-a-skill)). |
+| GitHub Copilot | `/dynamic-implement <issue>` | Native direct skill command; `disable-model-invocation` prevents automatic CLI skill invocation ([CLI skill fields](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)). |
+| OpenCode | `/dynamic-implement <issue>` | A Markdown command in `~/.config/opencode/commands/` expands to the admission marker and asks the native skill tool to load the portable body ([custom commands](https://opencode.ai/docs/commands/)). |
+| Pi | `/skill:dynamic-implement <issue>` | Native forced skill loading; `disable-model-invocation: true` hides the skill from automatic model discovery while leaving the explicit command available ([skill invocation](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/skills.md#L68-L86)). |
+
+Invocation metadata is a harness adapter rather than portable core behavior.
+Codex uses `agents/openai.yaml` with `allow_implicit_invocation: false`; Claude,
+Copilot, and Pi recognize the extended `disable-model-invocation: true`
+frontmatter. Setup must verify command discovery and marker/slash preservation
+without spending model credits before it marks a harness eligible for root
+entry.
+
 ## Additional harnesses: OpenCode and Pi
 
 The following findings use OpenCode at commit
