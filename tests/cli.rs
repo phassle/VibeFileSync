@@ -926,3 +926,66 @@ fn run_warns_about_existing_safetynet_size() {
         "warning missing: {stderr}"
     );
 }
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn insufficient_space_aborts_before_mutation_and_its_override_runs_the_copy() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "contents");
+    fx.add_photos_pair();
+
+    let blocked = fx
+        .cmd()
+        .env("VIBESYNC_TEST_AVAILABLE_BYTES", "0")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(blocked.status.code(), Some(EXIT_PRECONDITION));
+    assert!(!fx.destination.path().join("new.txt").exists());
+
+    fx.cmd()
+        .env("VIBESYNC_TEST_AVAILABLE_BYTES", "0")
+        .args(["run", "photos", "--yes", "--ignore-space-check"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("new.txt")).unwrap(),
+        "contents"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn injected_enospc_discards_temp_retains_commits_and_exits_nonzero() {
+    let fx = Fixture::new();
+    fx.write_source("a-committed.txt", "first");
+    fx.write_source("z-full.txt", "second");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_ENOSPC_PATH", "z-full.txt")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("a-committed.txt")).unwrap(),
+        "first"
+    );
+    assert!(!fx.destination.path().join("z-full.txt").exists());
+    let names: Vec<_> = fs::read_dir(fx.destination.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|name| !name.contains(".vibesync-tmp-")),
+        "ENOSPC must discard the in-progress temp: {names:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("destination full"),
+        "clear disk-full error required: {:?}",
+        output.stderr
+    );
+}

@@ -115,6 +115,12 @@ fn copy_new_file(
 
     let result = (|| {
         copyfile_all_but_acls(source, &temp)?;
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
+            .is_some_and(|path| Path::new(&path) == action.rel_path)
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
         fully_sync(&temp)?;
         let warnings = verify(source, &source_before, &temp, action.bytes)?;
         // New-file-only slice: the plan promised this path did not exist.

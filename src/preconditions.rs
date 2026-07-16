@@ -53,10 +53,11 @@ fn resolve_path(
     let relocated_folder = relocated_folder(&relocated, relative_path, side, expected_uuid)?;
     Ok((
         relocated_folder.clone(),
-        Some(format!(
-            "vibesync: {side} volume moved: {} → {} (UUID {expected_uuid})",
-            path.display(),
-            relocated_folder.display()
+        Some(relocation_notice(
+            side,
+            path,
+            &relocated_folder,
+            expected_uuid,
         )),
     ))
 }
@@ -139,6 +140,15 @@ fn enforce_space(required: u64, available: u64, ignore_space_check: bool) -> Res
 }
 
 fn available_space(path: &Path) -> io::Result<u64> {
+    #[cfg(feature = "fault-injection")]
+    if let Some(value) = std::env::var_os("VIBESYNC_TEST_AVAILABLE_BYTES") {
+        return value.to_string_lossy().parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bad VIBESYNC_TEST_AVAILABLE_BYTES",
+            )
+        });
+    }
     let bytes = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -150,6 +160,14 @@ fn available_space(path: &Path) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+fn relocation_notice(side: &str, from: &Path, to: &Path, uuid: &str) -> String {
+    format!(
+        "vibesync: {side} volume moved: {} → {} (UUID {uuid})",
+        from.display(),
+        to.display()
+    )
 }
 
 fn tree_size(root: &Path) -> io::Result<u64> {
@@ -245,5 +263,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("remove and re-add"));
+    }
+
+    #[test]
+    fn relocation_notice_loudly_names_both_paths_and_uuid() {
+        let notice = relocation_notice(
+            "source",
+            Path::new("/Volumes/Backup/Photos"),
+            Path::new("/Volumes/Backup 1/Photos"),
+            "A1B2",
+        );
+        assert!(notice.contains("moved"));
+        assert!(notice.contains("/Volumes/Backup/Photos"));
+        assert!(notice.contains("/Volumes/Backup 1/Photos"));
+        assert!(notice.contains("A1B2"));
     }
 }
