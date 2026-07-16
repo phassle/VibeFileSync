@@ -315,12 +315,69 @@ because `pi` exists. It can always mark the direct ephemeral Pi process as an
 eligible reviewer harness; parallel orchestration inside Pi requires a detected
 extension/package or an explicit external process adapter.
 
+## Full harness audit: durable work and a genuinely fresh reviewer
+
+This audit was repeated against the installed command-line versions on 2026-07-16:
+Codex CLI 0.144.0, Claude Code 2.1.211, GitHub Copilot CLI 1.0.71,
+OpenCode 1.17.12, and Pi 0.70.5. Repository findings are pinned to Codex
+[`0f44bca`](https://github.com/openai/codex/tree/0f44bca9154e056a32fde7a89026b4620599e6f2),
+Claude Code
+[`c39cb0f`](https://github.com/anthropics/claude-code/tree/c39cb0f14bfe8bb519bae5bfc55add6867c5e2ab),
+Copilot CLI
+[`fd24cea`](https://github.com/github/copilot-cli/tree/fd24cea5cb11da4e630485ff2d9269318b8c2a4e),
+and the OpenCode/Pi commits cited above. A feature being present in one surface
+does not imply that every host embedding the same engine exposes it.
+
+### Capability matrix
+
+| Harness | Goal/task durability and continuation | Zero-history review boundary | Skills | Parallel/subagent fit | Models |
+| --- | --- | --- | --- | --- | --- |
+| **Codex App/runtime + CLI** | **First-class Goal: yes in the current App/runtime.** A goal stores objective, status, optional token budget, token/time accounting; statuses include active, paused, blocked, usage-limited, budget-limited, and complete. It is restored from the state database on resume and automatically launches another turn when the live thread is idle ([tool contract](https://github.com/openai/codex/blob/0f44bca9154e056a32fde7a89026b4620599e6f2/codex-rs/ext/goal/src/spec.rs), [restore/continue runtime](https://github.com/openai/codex/blob/0f44bca9154e056a32fde7a89026b4620599e6f2/codex-rs/ext/goal/src/runtime.rs#L335-L411), [persisted model](https://github.com/openai/codex/blob/0f44bca9154e056a32fde7a89026b4620599e6f2/codex-rs/state/src/model/thread_goal.rs#L14-L80)). Installed feature discovery reports `goals` stable/enabled. **Caveat:** this is an App/app-server capability; do not assume an arbitrary Codex CLI embedding exposes the three goal tools. | **Strong.** Start a separate process: `codex exec --ephemeral --ignore-user-config -s read-only -m <model> <review-prompt>`. Do not use `exec resume`, thread resume, or fork. `--ephemeral` prevents session persistence; the installed help is the source for this still-evolving flag. | Project `.codex/skills` and `.agents/skills`; personal legacy `$CODEX_HOME/skills` plus shared `~/.agents/skills`, loaded by the current core loader ([loader](https://github.com/openai/codex/blob/0f44bca9154e056a32fde7a89026b4620599e6f2/codex-rs/core-skills/src/loader.rs#L300-L420)). | Native multi-agent dispatch is stable/enabled in the installed build and is sufficient for planners/implementers. For the reviewer, use the separate ephemeral CLI process, not a forked or parent-authored child. | Explicit `-m/--model`; app-server provides `model/list` ([protocol](https://github.com/openai/codex/blob/0f44bca9154e056a32fde7a89026b4620599e6f2/codex-rs/app-server/README.md#L202-L204)). There is no equally simple documented `codex models` CLI command; setup may query app-server where available, then smoke-test the chosen ID. |
+| **Claude Code** | **Goal-equivalent: no. Durable task list: yes.** Interactive Claude has `TaskCreate`, `TaskGet`, `TaskList`, and `TaskUpdate` (pending/in-progress/completed plus dependencies); print/SDK mode also exposes task tracking ([tools](https://code.claude.com/docs/en/tools-reference)). Tasks survive context compaction and a named `CLAUDE_CODE_TASK_LIST_ID` shares `~/.claude/tasks/<id>/` across sessions ([task-list lifecycle](https://code.claude.com/docs/en/interactive-mode#task-list)). This is durable bookkeeping, **not a Goal engine**: the official lifecycle does not say that an incomplete task starts a new turn after the agent becomes idle or after process exit. Background agents are a separate execution mechanism. | **Strongest native command.** `claude -p --bare --no-session-persistence --model <model> <review-prompt>`. `--bare` strips hooks, plugin sync, auto-memory and `CLAUDE.md` auto-discovery while still allowing an explicitly named skill; `--no-session-persistence` makes the print-mode session non-resumable ([CLI reference](https://code.claude.com/docs/en/cli-usage)). Do not use `--continue`, `--resume`, a fork, or `context: fork`. | Personal `~/.claude/skills`, project `.claude/skills`, plugin skills; direct `/skill-name` invocation; implements the Agent Skills standard ([skills](https://code.claude.com/docs/en/skills#where-skills-live)). Shared `~/.agents/skills` is **not documented as a Claude Code discovery root**, so setup needs a Claude-specific install/symlink/plugin copy. | Native subagents start with isolated context and support parallel work, custom tools/model/worktree, but cannot themselves spawn subagents ([subagents](https://code.claude.com/docs/en/sub-agents#manage-subagent-context)). This is sufficient when the top-level orchestrator owns fan-out. A normal subagent still receives a delegation message and ambient rules, so it is not the strict blind-review boundary. | Explicit `--model` and `/model`; Claude aliases/full IDs are documented ([CLI reference](https://code.claude.com/docs/en/cli-usage)). Native selection is within the Claude family even when routed through Bedrock, Vertex, or Foundry; there is no documented native GPT/Codex-family selector. |
+| **GitHub Copilot CLI / desktop-app launcher** | **No Codex-style Goal object.** CLI sessions persist event logs, plans, checkpoints, and tracked files and can resume; `/tasks` manages running subagents/shell commands ([session storage](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference#session-state), [commands](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)). Autopilot does auto-continue until `task_complete`, a blocker/interrupt, or the configured continuation cap ([autopilot](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/autopilot)). Thus it has a durable resumable session plus an auto-run mode, but no documented persistent objective/status/budget Goal API. The desktop app is launched by `/app`; app-specific task durability beyond this shared CLI/session surface remains **unknown**. | **Fresh at entry, but not ephemeral.** `copilot -p --model <model> --no-custom-instructions --no-remote --no-remote-export --available-tools '<read-only set>' <review-prompt>`, with no `--continue`, `--resume`, `--connect`, or existing `--session-id`. Prompt-mode memory is disabled unless `--enable-memory` is passed ([flags](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference#command-line-options)). A new session starts without prior conversation but is saved afterward; no documented `--no-session-persistence` flag exists. `/review` and `/rubber-duck` inside the implementer's session are useful critiques but fail the strict standalone-process rule. | Project `.github/skills`, `.claude/skills`, `.agents/skills`; personal `~/.copilot/skills`, `~/.agents/skills`; `/skills` and automatic loading ([skills](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills)). | `/fleet` decomposes work and runs independent subagents in parallel, each in a separate context, with custom-agent and per-subtask model choice ([fleet](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/fleet)). Sufficient for orchestration; strict review still uses a new top-level CLI process. | `/model`/`/models` discovers choices and `--model` selects explicitly. Current official choices span Claude, GPT/Codex, Gemini, and MAI ([model table](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference#supported-models)); this is the best native different-family reviewer path. |
+| **OpenCode** | **No Goal. Session todo: yes.** `todowrite` stores pending/in-progress/completed items in a database table keyed by session, and the server exposes `GET /session/:id/todo` ([todo service](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/opencode/src/session/todo.ts), [server API](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/server.mdx)). Sessions can be listed/resumed, but no primary source documents a named cross-session task list or an idle auto-continuation engine. | **Strong new-session boundary, not proven nonpersistent.** Use the separate `opencode run --model <provider/model> ...` command described above, with no resume/session/fork flags. It creates a new session, but there is no documented ephemeral flag in this command. | Native Agent Skills and shared `~/.agents/skills`, as detailed above. | Native fresh child sessions and parallel `general` agents; sufficient, but a separate `run` process is stricter for review. | `opencode models` plus explicit `provider/model`, followed by a live probe. |
+| **Pi** | **No Goal and no built-in todo/task system.** Pi explicitly omits built-in to-dos and subagents; it has resumable conversations but no durable work object or automatic idle continuation ([design](https://github.com/badlogic/pi-mono/blob/e022eec37dee52790564f3af93819c34f3f78af1/packages/coding-agent/docs/usage.md#L300-L313)). | **Strong.** `pi -p --no-session --no-extensions --no-skills --skill <exact-review-skill> --provider <provider> --model <model> <review-prompt>` is a separate, ephemeral process with only the explicitly selected skill. | Native Agent Skills and shared `~/.agents/skills`, as detailed above. | External-process/example extension only, not native; setup must detect/configure that adapter. | `pi --list-models`, explicit provider/model, and a live ephemeral probe. |
+
+### Non-negotiable reviewer isolation contract
+
+“Empty context” cannot literally mean no system prompt or no repository files:
+the reviewer must know the acceptance criteria and must be able to read the
+diff. It means **zero prior conversational or implementation context**. The
+portable guarantee is therefore a brand-new top-level process/session, never a
+fork/resume/continued task, supplied only with:
+
+1. the authoritative issue/spec and review rubric;
+2. repository standards that are part of the judgment criteria; and
+3. immutable base/head identifiers (or the complete current diff).
+
+The process must not receive planner reasoning, implementer prompts, transcript,
+memory, self-review, claimed test results, prior reviewer findings, or a parent
+agent's summary. Every re-review repeats this procedure in another new session.
+Native “fresh subagent context” is insufficient for this contract because the
+parent still composes its delegation message and can leak foreknowledge. The
+setup probe must test the exact standalone command and reject a harness adapter
+that can only fork, resume, or inherit the controller's session.
+
+### What `dynamic-implement` may rely on
+
+Only Codex currently provides the complete persistent Goal lifecycle required
+for unattended resume plus automatic idle continuation. Copilot Autopilot can
+continue within a running task, but its durable unit is the session, not a Goal.
+Claude's named task lists are genuinely durable and dependency-aware, but they
+do not themselves schedule another model turn. OpenCode todos are session
+state, and Pi has neither feature. Therefore the portable skill core must keep
+its own orchestration ledger (issue IDs, branches/worktrees, gates, tests,
+reviews, and integration status); a harness adapter may mirror that ledger into
+native Goal/task/todo state, but must never treat the latter as the sole source
+of truth.
+
 ### Resulting capability-probe rules
 
-For both harnesses, `setup-dynamic-skills` should separately record:
+For every detected harness, `setup-dynamic-skills` should separately record:
 
 1. skill discovery (does the shared `dynamic-implement` name appear/load?);
-2. candidate models (`opencode models` or `pi --list-models`);
+2. candidate models through that harness's documented catalog/selector
+   (`model/list`, `/model`, `opencode models`, or `pi --list-models`);
 3. a successful minimal call for each selected model, including model family;
 4. native subagent support versus external-process-only support; and
 5. a tested blank-review command that starts a new, non-resumed session.
