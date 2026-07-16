@@ -108,7 +108,11 @@ impl Fixture {
             entries.sort_by_key(|e| e.path());
             for entry in entries {
                 let path = entry.path();
-                let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
                 if entry.file_type().unwrap().is_dir() {
                     out.push(format!("{rel}/"));
                     walk(&path, base, out);
@@ -185,7 +189,9 @@ fn pair_add_pins_both_volume_uuids_into_the_config_file() {
     assert!(contents.contains("version = 1"));
     assert!(contents.contains("[pairs.photos]"));
     assert!(contents.contains("source_volume_uuid"));
+    assert!(contents.contains("source_volume_relative_path"));
     assert!(contents.contains("destination_volume_uuid"));
+    assert!(contents.contains("destination_volume_relative_path"));
     assert!(contents.contains("mode = \"mirror\""));
 }
 
@@ -464,7 +470,10 @@ fn banner_renders_on_bare_help_and_tui_tty_surfaces() {
             output.contains('◥') && output.contains('◤'),
             "bottom mark missing for {args:?}: {output}"
         );
-        assert!(output.contains("V I B E S Y N C"), "wordmark missing for {args:?}: {output}");
+        assert!(
+            output.contains("V I B E S Y N C"),
+            "wordmark missing for {args:?}: {output}"
+        );
         assert!(
             output.contains("one-way file sync with SafetyNet · plan → review → run"),
             "tagline missing for {args:?}: {output}"
@@ -482,8 +491,13 @@ fn no_color_uses_a_plain_banner_one_liner_in_a_tty() {
     let output = vibesync_in_tty(fx.xdg.path(), &["--help"], true);
     let output = String::from_utf8_lossy(&output.stdout);
 
-    assert!(output.contains("V I B E S Y N C — one-way file sync with SafetyNet · plan → review → run"));
-    assert!(!output.contains("\x1b["), "NO_COLOR output must contain no ANSI bytes: {output:?}");
+    assert!(
+        output.contains("V I B E S Y N C — one-way file sync with SafetyNet · plan → review → run")
+    );
+    assert!(
+        !output.contains("\x1b["),
+        "NO_COLOR output must contain no ANSI bytes: {output:?}"
+    );
 }
 
 #[test]
@@ -553,8 +567,10 @@ fn plan_prints_summary_first_then_grouped_sections() {
     // Totals summary comes first, before any section header.
     let summary_line = stdout.lines().next().unwrap();
     assert!(
-        summary_line.contains("1 copy") && summary_line.contains("1 update")
-            && summary_line.contains("1 delete") && summary_line.contains("0 error"),
+        summary_line.contains("1 copy")
+            && summary_line.contains("1 update")
+            && summary_line.contains("1 delete")
+            && summary_line.contains("0 error"),
         "totals summary should lead: {summary_line}"
     );
     assert!(summary_line.to_lowercase().contains("dry-run"));
@@ -564,11 +580,20 @@ fn plan_prints_summary_first_then_grouped_sections() {
     let update = stdout.find("UPDATE").unwrap();
     let delete = stdout.find("DELETE").unwrap();
     let errors = stdout.find("ERRORS").unwrap();
-    assert!(copy < update && update < delete && delete < errors, "section order: {stdout}");
+    assert!(
+        copy < update && update < delete && delete < errors,
+        "section order: {stdout}"
+    );
 
     assert!(stdout.contains("new.txt"), "COPY row present: {stdout}");
-    assert!(stdout.contains("changed.txt"), "UPDATE row present: {stdout}");
-    assert!(stdout.contains("old/stale.txt"), "DELETE row present: {stdout}");
+    assert!(
+        stdout.contains("changed.txt"),
+        "UPDATE row present: {stdout}"
+    );
+    assert!(
+        stdout.contains("old/stale.txt"),
+        "DELETE row present: {stdout}"
+    );
 }
 
 #[test]
@@ -579,7 +604,8 @@ fn plan_update_and_delete_sections_carry_the_safetynet_annotation() {
     fx.write_dest("gone.txt", "zzz");
     fx.add_photos_pair();
 
-    let stdout = String::from_utf8(fx.cmd().args(["plan", "photos"]).output().unwrap().stdout).unwrap();
+    let stdout =
+        String::from_utf8(fx.cmd().args(["plan", "photos"]).output().unwrap().stdout).unwrap();
 
     for line in stdout.lines() {
         if line.starts_with("UPDATE") || line.starts_with("DELETE") {
@@ -598,14 +624,24 @@ fn plan_update_mode_never_plans_a_deletion() {
     fx.write_dest("only-on-dest.txt", "zzz"); // would be a DELETE under Mirror
     fx.add_pair("docs", "update");
 
-    let stdout = String::from_utf8(fx.cmd().args(["plan", "docs"]).output().unwrap().stdout).unwrap();
+    let stdout =
+        String::from_utf8(fx.cmd().args(["plan", "docs"]).output().unwrap().stdout).unwrap();
 
     // The DELETE section still prints (fixed four-section layout) but is
     // always empty in Update — nothing at the destination is ever removed.
     assert!(stdout.contains("(update)"));
-    assert!(stdout.contains("0 delete"), "Update totals report zero deletes: {stdout}");
-    assert!(stdout.contains("DELETE (0)"), "empty DELETE section still shown: {stdout}");
-    assert!(!stdout.contains("only-on-dest.txt"), "dest-only file must not be a delete row: {stdout}");
+    assert!(
+        stdout.contains("0 delete"),
+        "Update totals report zero deletes: {stdout}"
+    );
+    assert!(
+        stdout.contains("DELETE (0)"),
+        "empty DELETE section still shown: {stdout}"
+    );
+    assert!(
+        !stdout.contains("only-on-dest.txt"),
+        "dest-only file must not be a delete row: {stdout}"
+    );
     assert!(stdout.contains("new.txt"));
 }
 
@@ -618,17 +654,30 @@ fn plan_never_shows_or_deletes_machinery() {
     fx.write_dest(".real.txt.vibesync-tmp-abc123", "half-written");
     fx.add_photos_pair();
 
-    let stdout = String::from_utf8(fx.cmd().args(["plan", "photos"]).output().unwrap().stdout).unwrap();
+    let stdout =
+        String::from_utf8(fx.cmd().args(["plan", "photos"]).output().unwrap().stdout).unwrap();
 
     // Machinery content is never a plan row (`_SafetyNet/` still appears in
     // the UPDATE/DELETE header annotation — that's the archive destination,
     // not a synced path — so we check the actual entries, not the prefix).
-    assert!(!stdout.contains("archived.txt"), "SafetyNet contents must never appear: {stdout}");
-    assert!(!stdout.contains("20200101T000000Z"), "SafetyNet run folder must never appear: {stdout}");
-    assert!(!stdout.contains("vibesync-tmp"), "Publish temps must never appear: {stdout}");
+    assert!(
+        !stdout.contains("archived.txt"),
+        "SafetyNet contents must never appear: {stdout}"
+    );
+    assert!(
+        !stdout.contains("20200101T000000Z"),
+        "SafetyNet run folder must never appear: {stdout}"
+    );
+    assert!(
+        !stdout.contains("vibesync-tmp"),
+        "Publish temps must never appear: {stdout}"
+    );
     // The only planned action is the real source file (a COPY); nothing is
     // planned for deletion even though the destination is non-empty.
-    assert!(stdout.contains("1 copy") && stdout.contains("0 delete"), "{stdout}");
+    assert!(
+        stdout.contains("1 copy") && stdout.contains("0 delete"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -639,13 +688,23 @@ fn plan_excludes_an_exact_path() {
     fx.add_photos_pair();
 
     let stdout = String::from_utf8(
-        fx.cmd().args(["plan", "photos", "--exclude", "skip.txt"]).output().unwrap().stdout,
+        fx.cmd()
+            .args(["plan", "photos", "--exclude", "skip.txt"])
+            .output()
+            .unwrap()
+            .stdout,
     )
     .unwrap();
 
     assert!(stdout.contains("keep.txt"));
-    assert!(!stdout.contains("skip.txt"), "excluded path must not appear: {stdout}");
-    assert!(stdout.contains("excluded 1"), "excluded count reported: {stdout}");
+    assert!(
+        !stdout.contains("skip.txt"),
+        "excluded path must not appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("excluded 1"),
+        "excluded count reported: {stdout}"
+    );
 }
 
 #[test]
@@ -662,8 +721,16 @@ fn plan_performs_zero_writes_to_source_or_destination() {
 
     fx.cmd().args(["plan", "photos"]).assert().success();
 
-    assert_eq!(src_before, Fixture::snapshot(fx.source.path()), "plan wrote to the source");
-    assert_eq!(dst_before, Fixture::snapshot(fx.destination.path()), "plan wrote to the destination");
+    assert_eq!(
+        src_before,
+        Fixture::snapshot(fx.source.path()),
+        "plan wrote to the source"
+    );
+    assert_eq!(
+        dst_before,
+        Fixture::snapshot(fx.destination.path()),
+        "plan wrote to the destination"
+    );
 }
 
 #[test]
@@ -672,7 +739,10 @@ fn plan_for_an_unknown_pair_is_a_usage_error_exit_64() {
     let output = fx.cmd().args(["plan", "nope"]).output().unwrap();
     assert_eq!(output.status.code(), Some(EXIT_USAGE));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("nope"), "error should name the pair: {stderr}");
+    assert!(
+        stderr.contains("nope"),
+        "error should name the pair: {stderr}"
+    );
 }
 
 // --- Slice 3: first safe copy (issue #17) ---
@@ -687,8 +757,14 @@ fn run_yes_prints_the_review_then_publishes_new_files() {
 
     assert_eq!(output.status.code(), Some(EXIT_OK));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.starts_with("Dry-run for 'photos'"), "review must print first: {stdout}");
-    assert_eq!(fs::read_to_string(fx.destination.path().join("nested/photo.txt")).unwrap(), "the complete photo");
+    assert!(
+        stdout.starts_with("Dry-run for 'photos'"),
+        "review must print first: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("nested/photo.txt")).unwrap(),
+        "the complete photo"
+    );
 }
 
 #[test]
@@ -718,12 +794,18 @@ fn run_publishes_no_temp_files_after_a_successful_copy() {
 
     fx.cmd().args(["run", "photos", "--yes"]).assert().success();
 
-    assert_eq!(fs::read_to_string(fx.destination.path().join("document.txt")).unwrap(), "complete contents");
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("document.txt")).unwrap(),
+        "complete contents"
+    );
     let names: Vec<_> = fs::read_dir(fx.destination.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.iter().all(|name| !name.contains(".vibesync-tmp-")), "no temporary file may be published: {names:?}");
+    assert!(
+        names.iter().all(|name| !name.contains(".vibesync-tmp-")),
+        "no temporary file may be published: {names:?}"
+    );
 }
 
 #[test]
@@ -740,11 +822,18 @@ fn a_failed_copy_never_replaces_the_final_path_and_other_copies_continue() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(fx.destination.path().join("blocked.txt").is_dir());
-    assert_eq!(fs::read_to_string(fx.destination.path().join("good.txt")).unwrap(), "this copy should still finish");
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("good.txt")).unwrap(),
+        "this copy should still finish"
+    );
     assert!(
         fs::read_dir(fx.destination.path())
             .unwrap()
-            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".vibesync-tmp-")),
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".vibesync-tmp-")),
         "a failed file must not leave a publishable temp"
     );
 }
@@ -755,7 +844,12 @@ fn run_preserves_a_source_xattr_through_copyfile() {
     fx.write_source("tagged.txt", "complete contents");
     let source = fx.source.path().join("tagged.txt");
     let status = std::process::Command::new("xattr")
-        .args(["-w", "com.vibesync.slice3", "kept", source.to_str().unwrap()])
+        .args([
+            "-w",
+            "com.vibesync.slice3",
+            "kept",
+            source.to_str().unwrap(),
+        ])
         .status()
         .expect("xattr command is available on macOS");
     assert!(status.success(), "source xattr is writable");
@@ -768,6 +862,67 @@ fn run_preserves_a_source_xattr_through_copyfile() {
         .args(["-p", "com.vibesync.slice3", destination.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(value.status.success(), "copyfile must preserve source xattrs");
+    assert!(
+        value.status.success(),
+        "copyfile must preserve source xattrs"
+    );
     assert_eq!(String::from_utf8(value.stdout).unwrap(), "kept\n");
+}
+
+// --- Slice 6: deterministic run preconditions (issue #20) ---
+
+#[test]
+fn mirror_empty_source_against_a_nonempty_destination_aborts_unless_overridden() {
+    let fx = Fixture::new();
+    fx.write_dest("would-be-deleted.txt", "keep me");
+    fx.add_photos_pair();
+
+    let blocked = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+    assert_eq!(blocked.status.code(), Some(EXIT_PRECONDITION));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("--allow-empty-source"));
+    assert!(fx.destination.path().join("would-be-deleted.txt").exists());
+
+    fx.cmd()
+        .args(["run", "photos", "--yes", "--allow-empty-source"])
+        .assert()
+        .success();
+    assert!(
+        fx.destination.path().join("would-be-deleted.txt").exists(),
+        "Slice 3 does not delete yet"
+    );
+}
+
+#[test]
+fn missing_pinned_volume_aborts_plan_before_scanning() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "contents");
+    fx.add_photos_pair();
+    let path = config_file(fx.xdg.path());
+    let contents = fs::read_to_string(&path).unwrap().replace(
+        "source_volume_uuid = \"",
+        "source_volume_uuid = \"00000000-0000-0000-0000-000000000000#",
+    );
+    // Keep valid TOML while changing only the pinned UUID.
+    fs::write(&path, contents.replace("#", "")).unwrap();
+
+    let output = fx.cmd().args(["plan", "photos"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not mounted"));
+    assert!(!fx.destination.path().join("new.txt").exists());
+}
+
+#[test]
+fn run_warns_about_existing_safetynet_size() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "contents");
+    fx.write_dest("_SafetyNet/old-run/old.txt", "archived bytes");
+    fx.add_photos_pair();
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("_SafetyNet/ uses"),
+        "warning missing: {stderr}"
+    );
 }

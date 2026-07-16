@@ -37,10 +37,18 @@ pub fn run(
     config_path: &Path,
     pair_name: &str,
     yes: bool,
+    allow_empty_source: bool,
+    ignore_space_check: bool,
     excludes: &[String],
 ) -> Result<i32, AppError> {
     let (pair, plan) = plan::build(config_path, pair_name, excludes)?;
     print!("{}", plan::render(&plan, pair_name, pair.mode));
+
+    for warning in
+        crate::preconditions::check_run(&pair, &plan, allow_empty_source, ignore_space_check)?
+    {
+        eprintln!("{warning}");
+    }
 
     if !plan.errors.is_empty() {
         eprintln!(
@@ -66,6 +74,10 @@ pub fn run(
                 "vibesync: COPY {} failed: {error}",
                 action.rel_path.display()
             );
+            if error.raw_os_error() == Some(libc::ENOSPC) {
+                eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
+                break;
+            }
         }
     }
 

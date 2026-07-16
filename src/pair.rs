@@ -64,14 +64,30 @@ pub fn add(
 
     let source_volume_uuid = pin_volume_uuid(source)?;
     let destination_volume_uuid = pin_volume_uuid(destination)?;
+    let source_mount =
+        volume::mount_point_for_path(source).map_err(|e| AppError::Precondition(e.to_string()))?;
+    let destination_mount = volume::mount_point_for_path(destination)
+        .map_err(|e| AppError::Precondition(e.to_string()))?;
 
     cfg.pairs.insert(
         name.to_string(),
         Pair {
             source: source.to_path_buf(),
             source_volume_uuid,
+            source_volume_relative_path: Some(
+                source
+                    .strip_prefix(&source_mount)
+                    .expect("mount contains source")
+                    .to_path_buf(),
+            ),
             destination: destination.to_path_buf(),
             destination_volume_uuid,
+            destination_volume_relative_path: Some(
+                destination
+                    .strip_prefix(&destination_mount)
+                    .expect("mount contains destination")
+                    .to_path_buf(),
+            ),
             mode,
         },
     );

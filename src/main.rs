@@ -3,11 +3,12 @@
 //! read-only `plan <pair>` human diff; `run`, `status`, `history`, `prune`,
 //! the TUI, and `plan --json` are still stubbed.
 
-mod config;
 mod banner;
+mod config;
 mod error;
 mod pair;
 mod plan;
+mod preconditions;
 mod run;
 mod volume;
 
@@ -151,7 +152,11 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
     config::load(config_path)?;
 
     match command {
-        Command::Plan { pair, json, exclude } => {
+        Command::Plan {
+            pair,
+            json,
+            exclude,
+        } => {
             // The NDJSON `vibefilesync.plan/v1` stream is a later slice;
             // only the human diff is implemented here.
             if *json {
@@ -164,14 +169,21 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             yes,
             json,
             permanent_delete: _,
-            allow_empty_source: _,
-            ignore_space_check: _,
+            allow_empty_source,
+            ignore_space_check,
             exclude,
         } => {
             if *json {
                 return Ok(not_yet_implemented("run --json", pair));
             }
-            run::run(config_path, pair, *yes, exclude)
+            run::run(
+                config_path,
+                pair,
+                *yes,
+                *allow_empty_source,
+                *ignore_space_check,
+                exclude,
+            )
         }
         Command::Status { pair } => Ok(not_yet_implemented("status", pair)),
         Command::History { pair, .. } => Ok(not_yet_implemented("history", pair)),
