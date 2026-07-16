@@ -1,7 +1,7 @@
 //! Errors that cross the CLI boundary, each carrying the exit code its
 //! class maps to under ADR-0004's exit-code taxonomy (the subset this
-//! slice uses: 2 precondition abort, 64 usage, plus 69 for this slice's
-//! own "not yet implemented" verbs).
+//! slice uses: 2 precondition abort, 4 interrupted run, 64 usage, plus
+//! 69 for this slice's own "not yet implemented" verbs).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -12,6 +12,8 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_PRECONDITION: i32 = 2;
 /// The reviewed plan contains an included error action and cannot run.
 pub const EXIT_BLOCKED_PLAN: i32 = 3;
+/// A run started but could not complete reliably.
+pub const EXIT_INTERRUPTED: i32 = 4;
 pub const EXIT_USAGE: i32 = 64;
 /// BSD sysexits `EX_UNAVAILABLE`. Used for verbs this slice hasn't
 /// implemented yet — deliberately distinct from ADR-0004's exit 1, which
@@ -30,6 +32,8 @@ pub enum AppError {
     /// source directory is gone or unmounted (exit 2, same class as other
     /// pre-mutation aborts under ADR-0002).
     Precondition(String),
+    /// A run failed after its durable start record was written (exit 4).
+    Interrupted(String),
     /// Reading a volume's UUID failed (exit 2 — same class as other
     /// volume-identity precondition failures, ADR-0002).
     VolumeUuid {
@@ -44,6 +48,7 @@ impl AppError {
             AppError::Config(_) => EXIT_PRECONDITION,
             AppError::Usage(_) => EXIT_USAGE,
             AppError::Precondition(_) => EXIT_PRECONDITION,
+            AppError::Interrupted(_) => EXIT_INTERRUPTED,
             AppError::VolumeUuid { .. } => EXIT_PRECONDITION,
         }
     }
@@ -55,6 +60,7 @@ impl fmt::Display for AppError {
             AppError::Config(e) => write!(f, "config error: {e}"),
             AppError::Usage(message) => write!(f, "{message}"),
             AppError::Precondition(message) => write!(f, "{message}"),
+            AppError::Interrupted(message) => write!(f, "{message}"),
             AppError::VolumeUuid { path, source } => {
                 write!(
                     f,
