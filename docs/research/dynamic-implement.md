@@ -235,6 +235,40 @@ frontmatter. Setup must verify command discovery and marker/slash preservation
 without spending model credits before it marks a harness eligible for root
 entry.
 
+## Testability and agent activity logs
+
+The root command has two non-mutating test modes. `--smoke-test` checks local
+slash adapters, required skills, repository/tracker/Git-policy discovery, and
+the logger without creating a Goal, branch, worktree, commit, tracker update,
+PR, model session, or paid probe. `--smoke-test=agents <issue>` is a live
+read-only rehearsal of planner, implementer preflight, reviewer preflight, and
+merger preflight. Because that route can consume model credits, setup must show
+the exact routes and obtain approval before launching it.
+
+Every coordinator, role agent, and child agent writes append-only private
+events through the bundled `scripts/agent_log.py`. Events cover assignment,
+start, observable decisions, command/check batches, file summaries, tests,
+reviews, handoffs, next step/blocker, reported usage, and exactly one terminal
+state. The script writes both JSONL and a readable line log, validates that each
+agent started and terminated, and atomically renders the combined chronological
+Markdown/JSONL view. Prompts, transcripts, hidden reasoning, secrets, raw
+environment dumps, and full issue/code contents are excluded.
+
+Review logging must preserve the zero-history boundary. Each review pass starts
+with a separate empty bundle for the clean review coordinator and Matt
+`code-review`'s Standards and Spec children. Each process sees only its own
+destination; the main run ledger and earlier logs are absent. The root
+coordinator imports and renders those three logs only after the top-level
+reviewer exits. A missing or unterminated child log fails the smoke test and
+blocks acceptance of the parent handoff.
+
+Each smoke run also preserves a failure-oriented report. Every failed check is
+linked to its first event and records expected versus observed behavior, a
+minimal reproduction command, the suspected contract/harness boundary, and a
+proposed skill or configuration change. Hypotheses stay labelled, and the
+smoke run does not repair or rerun the failure; this keeps the evidence useful
+for the next deliberate iteration.
+
 ## Additional harnesses: OpenCode and Pi
 
 The following findings use OpenCode at commit
