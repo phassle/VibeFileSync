@@ -418,7 +418,7 @@ fn no_mode_flag_exists_on_run_or_plan() {
 #[test]
 fn unimplemented_verbs_print_a_clear_message() {
     let fx = Fixture::new();
-    for verb in ["status", "history", "prune"] {
+    for verb in ["status", "history"] {
         let output = fx.cmd().args([verb, "photos"]).output().unwrap();
         assert_ne!(
             output.status.code(),
@@ -770,4 +770,109 @@ fn run_preserves_a_source_xattr_through_copyfile() {
         .unwrap();
     assert!(value.status.success(), "copyfile must preserve source xattrs");
     assert_eq!(String::from_utf8(value.stdout).unwrap(), "kept\n");
+}
+
+// --- Slice 4: SafetyNet (issue #18) ---
+
+#[test]
+fn run_archives_an_updated_destination_before_publishing_the_replacement() {
+    let fx = Fixture::new();
+    fx.write_source("report.txt", "new version");
+    fx.write_dest("report.txt", "old version");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    assert_eq!(fs::read_to_string(fx.destination.path().join("report.txt")).unwrap(), "new version");
+    let archive = fx.destination.path().join("_SafetyNet");
+    let run_folders: Vec<_> = fs::read_dir(&archive).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(run_folders.len(), 1, "one Run folder is created");
+    assert_eq!(fs::read_to_string(run_folders[0].join("report.txt")).unwrap(), "old version");
+}
+
+#[test]
+fn update_mode_also_archives_a_replaced_destination() {
+    let fx = Fixture::new();
+    fx.write_source("report.txt", "new version");
+    fx.write_dest("report.txt", "old version");
+    fx.add_pair("documents", "update");
+
+    fx.cmd()
+        .args(["run", "documents", "--yes"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("report.txt")).unwrap(),
+        "new version"
+    );
+    let run = fs::read_dir(fx.destination.path().join("_SafetyNet"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::read_to_string(run.join("report.txt")).unwrap(), "old version");
+}
+
+#[test]
+fn mirror_deletion_archives_old_file_and_leaves_safetynet_untouched() {
+    let fx = Fixture::new();
+    fx.write_dest("removed.txt", "old version");
+    fx.write_dest("_SafetyNet/older-run/kept.txt", "already archived");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    assert!(!fx.destination.path().join("removed.txt").exists());
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("_SafetyNet/older-run/kept.txt")).unwrap(),
+        "already archived"
+    );
+    let new_archives: Vec<_> = fs::read_dir(fx.destination.path().join("_SafetyNet"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap() != "older-run")
+        .collect();
+    assert_eq!(new_archives.len(), 1);
+    assert_eq!(fs::read_to_string(new_archives[0].join("removed.txt")).unwrap(), "old version");
+}
+
+#[test]
+fn permanent_delete_bypasses_safetynet_for_this_run() {
+    let fx = Fixture::new();
+    fx.write_dest("removed.txt", "old version");
+    fx.add_photos_pair();
+
+    fx.cmd()
+        .args(["run", "photos", "--yes", "--permanent-delete"])
+        .assert()
+        .success();
+
+    assert!(!fx.destination.path().join("removed.txt").exists());
+    assert!(!fx.destination.path().join("_SafetyNet").exists());
+}
+
+#[test]
+fn prune_removes_run_folders_but_nothing_else() {
+    let fx = Fixture::new();
+    fx.write_dest("_SafetyNet/20260716T120000Z/old.txt", "old one");
+    fx.write_dest("_SafetyNet/20260716T120000Z-2/nested/old.txt", "old two");
+    fx.write_dest("_SafetyNet/keep-for-manual-restore/old.txt", "keep me");
+    fx.write_dest("current.txt", "current");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["prune", "photos"]).assert().success();
+
+    assert!(fx.destination.path().join("_SafetyNet").is_dir());
+    assert_eq!(
+        fs::read_to_string(
+            fx.destination
+                .path()
+                .join("_SafetyNet/keep-for-manual-restore/old.txt")
+        )
+        .unwrap(),
+        "keep me"
+    );
+    assert_eq!(fs::read_to_string(fx.destination.path().join("current.txt")).unwrap(), "current");
 }
