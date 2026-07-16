@@ -42,10 +42,29 @@ fn resolve_path(
     relative_path: Option<&Path>,
     side: &str,
 ) -> Result<(PathBuf, Option<String>), AppError> {
+    resolve_path_with_lookup(
+        path,
+        expected_uuid,
+        relative_path,
+        side,
+        volume::mounted_path_for_uuid,
+    )
+}
+
+fn resolve_path_with_lookup<F>(
+    path: &Path,
+    expected_uuid: &str,
+    relative_path: Option<&Path>,
+    side: &str,
+    find_mounted_volume: F,
+) -> Result<(PathBuf, Option<String>), AppError>
+where
+    F: FnOnce(&str) -> io::Result<Option<PathBuf>>,
+{
     if path.is_dir() && volume::volume_uuid(path).ok().as_deref() == Some(expected_uuid) {
         return Ok((path.to_path_buf(), None));
     }
-    let relocated = volume::mounted_path_for_uuid(expected_uuid)
+    let relocated = find_mounted_volume(expected_uuid)
         .map_err(|error| AppError::Precondition(format!("could not inspect mounted volumes for {side}: {error}")))?
         .ok_or_else(|| AppError::Precondition(format!(
             "{side} volume {expected_uuid} is not mounted; refusing to enumerate a different or empty path"
@@ -277,5 +296,27 @@ mod tests {
         assert!(notice.contains("/Volumes/Backup/Photos"));
         assert!(notice.contains("/Volumes/Backup 1/Photos"));
         assert!(notice.contains("A1B2"));
+    }
+
+    #[test]
+    fn resolution_uses_the_relocated_folder_and_emits_its_notice() {
+        let mount = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(mount.path().join("Photos/2026")).unwrap();
+        let old = Path::new("/Volumes/Backup/Photos/2026");
+
+        let (resolved, notice) = resolve_path_with_lookup(
+            old,
+            "A1B2",
+            Some(Path::new("Photos/2026")),
+            "source",
+            |_| Ok(Some(mount.path().to_path_buf())),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, mount.path().join("Photos/2026"));
+        let notice = notice.expect("mount drift must be loud");
+        assert!(notice.contains("source volume moved"));
+        assert!(notice.contains("A1B2"));
+        assert!(notice.contains(&resolved.display().to_string()));
     }
 }
