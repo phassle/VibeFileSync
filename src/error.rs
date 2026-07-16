@@ -10,6 +10,8 @@ use crate::config::ConfigError;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_PRECONDITION: i32 = 2;
+/// The reviewed plan contains an included error action and cannot run.
+pub const EXIT_BLOCKED_PLAN: i32 = 3;
 pub const EXIT_USAGE: i32 = 64;
 /// BSD sysexits `EX_UNAVAILABLE`. Used for verbs this slice hasn't
 /// implemented yet — deliberately distinct from ADR-0004's exit 1, which

@@ -398,7 +398,7 @@ fn no_mode_flag_exists_on_run_or_plan() {
 #[test]
 fn unimplemented_verbs_print_a_clear_message() {
     let fx = Fixture::new();
-    for verb in ["run", "status", "history", "prune"] {
+    for verb in ["status", "history", "prune"] {
         let output = fx.cmd().args([verb, "photos"]).output().unwrap();
         assert_ne!(
             output.status.code(),
@@ -564,4 +564,101 @@ fn plan_for_an_unknown_pair_is_a_usage_error_exit_64() {
     assert_eq!(output.status.code(), Some(EXIT_USAGE));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("nope"), "error should name the pair: {stderr}");
+}
+
+// --- Slice 3: first safe copy (issue #17) ---
+
+#[test]
+fn run_yes_prints_the_review_then_publishes_new_files() {
+    let fx = Fixture::new();
+    fx.write_source("nested/photo.txt", "the complete photo");
+    fx.add_photos_pair();
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("Dry-run for 'photos'"), "review must print first: {stdout}");
+    assert_eq!(fs::read_to_string(fx.destination.path().join("nested/photo.txt")).unwrap(), "the complete photo");
+}
+
+#[test]
+fn declining_run_leaves_both_trees_untouched() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "source");
+    fx.write_dest("existing.txt", "destination");
+    fx.add_photos_pair();
+    let source_before = Fixture::snapshot(fx.source.path());
+    let destination_before = Fixture::snapshot(fx.destination.path());
+
+    fx.cmd()
+        .args(["run", "photos"])
+        .write_stdin("n\n")
+        .assert()
+        .success();
+
+    assert_eq!(Fixture::snapshot(fx.source.path()), source_before);
+    assert_eq!(Fixture::snapshot(fx.destination.path()), destination_before);
+}
+
+#[test]
+fn run_publishes_no_temp_files_after_a_successful_copy() {
+    let fx = Fixture::new();
+    fx.write_source("document.txt", "complete contents");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    assert_eq!(fs::read_to_string(fx.destination.path().join("document.txt")).unwrap(), "complete contents");
+    let names: Vec<_> = fs::read_dir(fx.destination.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().all(|name| !name.contains(".vibesync-tmp-")), "no temporary file may be published: {names:?}");
+}
+
+#[test]
+fn a_failed_copy_never_replaces_the_final_path_and_other_copies_continue() {
+    let fx = Fixture::new();
+    fx.write_source("blocked.txt", "would be partial if published");
+    fx.write_source("good.txt", "this copy should still finish");
+    // Directories are not plan entries, so this models a destination object
+    // appearing after the fresh scan; Slice 3 must refuse to replace it.
+    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    fx.add_photos_pair();
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(fx.destination.path().join("blocked.txt").is_dir());
+    assert_eq!(fs::read_to_string(fx.destination.path().join("good.txt")).unwrap(), "this copy should still finish");
+    assert!(
+        fs::read_dir(fx.destination.path())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".vibesync-tmp-")),
+        "a failed file must not leave a publishable temp"
+    );
+}
+
+#[test]
+fn run_preserves_a_source_xattr_through_copyfile() {
+    let fx = Fixture::new();
+    fx.write_source("tagged.txt", "complete contents");
+    let source = fx.source.path().join("tagged.txt");
+    let status = std::process::Command::new("xattr")
+        .args(["-w", "com.vibesync.slice3", "kept", source.to_str().unwrap()])
+        .status()
+        .expect("xattr command is available on macOS");
+    assert!(status.success(), "source xattr is writable");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let destination = fx.destination.path().join("tagged.txt");
+    let value = std::process::Command::new("xattr")
+        .args(["-p", "com.vibesync.slice3", destination.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(value.status.success(), "copyfile must preserve source xattrs");
+    assert_eq!(String::from_utf8(value.stdout).unwrap(), "kept\n");
 }
