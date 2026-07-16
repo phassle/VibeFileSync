@@ -856,14 +856,23 @@ fn permanent_delete_bypasses_safetynet_for_this_run() {
 #[test]
 fn prune_removes_run_folders_but_nothing_else() {
     let fx = Fixture::new();
-    fx.write_dest("_SafetyNet/run-one/old.txt", "old one");
-    fx.write_dest("_SafetyNet/run-two/nested/old.txt", "old two");
+    fx.write_dest("_SafetyNet/20260716T120000Z/old.txt", "old one");
+    fx.write_dest("_SafetyNet/20260716T120000Z-2/nested/old.txt", "old two");
+    fx.write_dest("_SafetyNet/keep-for-manual-restore/old.txt", "keep me");
     fx.write_dest("current.txt", "current");
     fx.add_photos_pair();
 
     fx.cmd().args(["prune", "photos"]).assert().success();
 
     assert!(fx.destination.path().join("_SafetyNet").is_dir());
-    assert!(fs::read_dir(fx.destination.path().join("_SafetyNet")).unwrap().next().is_none());
+    assert_eq!(
+        fs::read_to_string(
+            fx.destination
+                .path()
+                .join("_SafetyNet/keep-for-manual-restore/old.txt")
+        )
+        .unwrap(),
+        "keep me"
+    );
     assert_eq!(fs::read_to_string(fx.destination.path().join("current.txt")).unwrap(), "current");
 }

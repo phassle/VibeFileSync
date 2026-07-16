@@ -2,7 +2,7 @@
 //! before SafetyNet archives any old destination object and Publish renames the
 //! verified temp into place (ADR-0001 and ADR-0008).
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -220,7 +220,7 @@ pub fn prune(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
     for entry in entries {
         let entry = entry.map_err(io_error)?;
         let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
-        if metadata.file_type().is_dir() {
+        if metadata.file_type().is_dir() && is_run_id(&entry.file_name()) {
             fs::remove_dir_all(entry.path()).map_err(io_error)?;
         }
     }
@@ -377,7 +377,14 @@ fn allocate_run_id(destination_root: &Path) -> io::Result<(String, PathBuf)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch");
-    let base = utc_basic(now.as_secs());
+    allocate_run_id_at(destination_root, now.as_secs())
+}
+
+/// Allocates a Run id that has no persisted archive folder as well as no
+/// in-progress lock. The archive check prevents a later run in the same
+/// second from reusing a completed Run's id and overwriting its SafetyNet.
+fn allocate_run_id_at(destination_root: &Path, seconds: u64) -> io::Result<(String, PathBuf)> {
+    let base = utc_basic(seconds);
     let mut suffix = 1_u32;
     loop {
         let run_id = if suffix == 1 {
@@ -385,6 +392,15 @@ fn allocate_run_id(destination_root: &Path) -> io::Result<(String, PathBuf)> {
         } else {
             format!("{base}-{suffix}")
         };
+        if destination_root.join("_SafetyNet").join(&run_id).exists() {
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "run id suffix space exhausted",
+                )
+            })?;
+            continue;
+        }
         let lock = destination_root.join(format!("._vibesync-run-{run_id}"));
         match OpenOptions::new().write(true).create_new(true).open(&lock) {
             Ok(_) => return Ok((run_id, lock)),
@@ -398,6 +414,32 @@ fn allocate_run_id(destination_root: &Path) -> io::Result<(String, PathBuf)> {
             )
         })?;
     }
+}
+
+/// A Run id is the basic UTC timestamp used throughout the product, with the
+/// collision suffix the allocator emits when more than one run starts in the
+/// same second. Prune must leave every other user-created SafetyNet folder.
+fn is_run_id(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let (timestamp, suffix) = match name.split_once('-') {
+        Some((timestamp, suffix)) => (timestamp, Some(suffix)),
+        None => (name, None),
+    };
+    let timestamp_is_valid = timestamp.len() == 16
+        && timestamp.as_bytes()[8] == b'T'
+        && timestamp.as_bytes()[15] == b'Z'
+        && timestamp
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 8 | 15) || byte.is_ascii_digit());
+    timestamp_is_valid
+        && suffix.is_none_or(|suffix| {
+            suffix
+                .parse::<u32>()
+                .is_ok_and(|value| value >= 2)
+        })
 }
 
 fn utc_basic(seconds: u64) -> String {
@@ -444,6 +486,26 @@ mod tests {
         assert_eq!(second, format!("{first}-2"));
         fs::remove_file(first_lock).unwrap();
         fs::remove_file(second_lock).unwrap();
+    }
+
+    #[test]
+    fn run_id_allocator_does_not_reuse_a_completed_archive_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let archived = root.path().join("_SafetyNet/19700101T000000Z");
+        fs::create_dir_all(&archived).unwrap();
+
+        let (run_id, lock) = allocate_run_id_at(root.path(), 0).unwrap();
+
+        assert_eq!(run_id, "19700101T000000Z-2");
+        fs::remove_file(lock).unwrap();
+    }
+
+    #[test]
+    fn run_id_recognizes_only_allocator_format() {
+        assert!(is_run_id(OsStr::new("20260716T120000Z")));
+        assert!(is_run_id(OsStr::new("20260716T120000Z-2")));
+        assert!(!is_run_id(OsStr::new("run-one")));
+        assert!(!is_run_id(OsStr::new("20260716T120000Z-1")));
     }
 
     #[test]
