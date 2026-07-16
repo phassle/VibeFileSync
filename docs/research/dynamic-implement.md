@@ -208,12 +208,12 @@ The blank-context guarantee is the primary gate; model-family diversity is a
 secondary preference and must never be used as a substitute for a genuinely
 new reviewer session.
 
-## Slash-only admission
+## Explicit-only admission
 
 `dynamic-implement` is a user-invoked root command. Ordinary prose, implicit
-skill matching, and skill-picker selection are not admission evidence. The
-portable body uses a binary gate: either the host preserves the user's slash
-invocation, or a local slash adapter expands to
+skill matching, and automatic model selection are not admission evidence. The
+portable body uses a binary gate: either the host preserves its native explicit
+skill/command invocation, or a local command adapter expands to
 `DYNAMIC_IMPLEMENT_SLASH_ENTRY=1`. Downstream skills remain model-reachable
 after the root gate so setup, TDD, review, and calibration can complete the
 admitted run.
@@ -222,7 +222,7 @@ The host syntax cannot be identical because the command surfaces differ:
 
 | Harness | Root entry | Mechanism |
 | --- | --- | --- |
-| Codex | `/prompts:dynamic-implement <issue>` | A local custom prompt expands to `$dynamic-implement` plus the admission marker. Codex documents `$skill` or `/skills` for skills and reserves `/prompts:<name>` for local custom slash prompts; it does not expose arbitrary first-level custom skill commands ([skills](https://learn.chatgpt.com/docs/build-skills), [custom prompts](https://learn.chatgpt.com/docs/custom-prompts.md)). |
+| Codex | `$dynamic-implement <issue>` or `/skills` selection | Native explicit skill invocation with `agents/openai.yaml` setting `allow_implicit_invocation: false`; no custom-prompt bridge ([skills](https://learn.chatgpt.com/docs/build-skills)). |
 | Claude Code | `/dynamic-implement <issue>` | Native direct skill command with `disable-model-invocation: true`, which removes automatic model admission while retaining the user command ([invocation control](https://code.claude.com/docs/en/skills#control-who-invokes-a-skill)). |
 | GitHub Copilot | `/dynamic-implement <issue>` | Native direct skill command; `disable-model-invocation` prevents automatic CLI skill invocation ([CLI skill fields](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)). |
 | OpenCode | `/dynamic-implement <issue>` | A Markdown command in `~/.config/opencode/commands/` expands to the admission marker and asks the native skill tool to load the portable body ([custom commands](https://opencode.ai/docs/commands/)). |
@@ -231,16 +231,17 @@ The host syntax cannot be identical because the command surfaces differ:
 Invocation metadata is a harness adapter rather than portable core behavior.
 Codex uses `agents/openai.yaml` with `allow_implicit_invocation: false`; Claude,
 Copilot, and Pi recognize the extended `disable-model-invocation: true`
-frontmatter. Setup must verify command discovery and marker/slash preservation
-without spending model credits before it marks a harness eligible for root
-entry.
+frontmatter. Setup must verify explicit invocation or adapter-marker
+preservation without spending model credits before it marks a harness eligible
+for root entry.
 
 ## Testability and agent activity logs
 
 The root command has two non-mutating test modes. `--smoke-test` checks local
-slash adapters, required skills, repository/tracker/Git-policy discovery, and
-the logger without creating a Goal, branch, worktree, commit, tracker update,
-PR, model session, or paid probe. `--smoke-test=agents <issue>` is a live
+explicit-entry adapters, required skills, repository/tracker/Git-policy
+discovery, and logger operation without creating a Goal, branch, worktree,
+commit, tracker update, PR, model session, or paid probe.
+`--smoke-test=agents <issue>` is a live
 read-only rehearsal of planner, implementer preflight, reviewer preflight, and
 merger preflight. Because that route can consume model credits, setup must show
 the exact routes and obtain approval before launching it.
