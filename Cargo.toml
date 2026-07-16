@@ -3,6 +3,9 @@ name = "vibesync"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+fault-injection = []
+
 [[bin]]
 name = "vibesync"
 path = "src/main.rs"

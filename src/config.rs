@@ -33,8 +33,12 @@ impl fmt::Display for Mode {
 pub struct Pair {
     pub source: PathBuf,
     pub source_volume_uuid: String,
+    #[serde(default)]
+    pub source_volume_relative_path: Option<PathBuf>,
     pub destination: PathBuf,
     pub destination_volume_uuid: String,
+    #[serde(default)]
+    pub destination_volume_relative_path: Option<PathBuf>,
     pub mode: Mode,
 }
 
@@ -209,8 +213,10 @@ mod tests {
             Pair {
                 source: PathBuf::from("/Users/per/Photos"),
                 source_volume_uuid: "A1B2".to_string(),
+                source_volume_relative_path: Some(PathBuf::from("Users/per/Photos")),
                 destination: PathBuf::from("/Volumes/Backup/Photos"),
                 destination_volume_uuid: "C3D4".to_string(),
+                destination_volume_relative_path: Some(PathBuf::from("Photos")),
                 mode: Mode::Mirror,
             },
         );

@@ -6,7 +6,8 @@
 use std::ffi::CString;
 use std::io;
 use std::os::raw::{c_int, c_void};
-use std::path::Path;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 
 /// Mirrors `<sys/attr.h>`'s `struct attrlist`. `bitmapcount` must be
 /// `ATTR_BIT_MAP_COUNT` (5); the rest select which attribute groups to
@@ -108,10 +109,61 @@ pub fn filesystem_type(path: &Path) -> io::Result<String> {
     // `f_fstypename` is a fixed-size, NUL-terminated C string. `c_char` is
     // signed on this target, so reinterpret as bytes before the NUL scan.
     let raw = &buf.f_fstypename;
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, raw.len()) };
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, raw.len()) };
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+/// Finds the root of a currently mounted volume by its pinned UUID. This is
+/// deliberately a mount-table scan rather than a pathname heuristic: a
+/// remount at `/Volumes/Backup 1` must not be mistaken for the old path.
+pub fn mounted_path_for_uuid(expected: &str) -> io::Result<Option<PathBuf>> {
+    for path in mounted_paths()? {
+        if volume_uuid(&path).ok().as_deref() == Some(expected) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Returns the mount point containing a path, selecting the longest match.
+pub fn mount_point_for_path(path: &Path) -> io::Result<PathBuf> {
+    mounted_paths()?
+        .into_iter()
+        .filter(|mount| path.starts_with(mount))
+        .max_by_key(|mount| mount.as_os_str().len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no mount for {}", path.display()),
+            )
+        })
+}
+
+fn mounted_paths() -> io::Result<Vec<PathBuf>> {
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut mounts: Vec<libc::statfs> = (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let bytes = (mounts.len() * std::mem::size_of::<libc::statfs>()) as i32;
+    let actual = unsafe { libc::getfsstat(mounts.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    if actual < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(mounts
+        .into_iter()
+        .take(actual as usize)
+        .map(|mount| {
+            let raw = &mount.f_mntonname;
+            let bytes: Vec<u8> = raw
+                .iter()
+                .map(|c| *c as u8)
+                .take_while(|b| *b != 0)
+                .collect();
+            PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        })
+        .collect())
 }
 
 fn format_uuid(bytes: &[u8; 16]) -> String {

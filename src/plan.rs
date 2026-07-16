@@ -67,6 +67,10 @@ pub struct Plan {
     pub unchanged: usize,
     /// Rows removed by `--exclude`.
     pub excluded: usize,
+    /// Files found under the source and destination before filtering. These
+    /// counts are precondition inputs, not presentation rows.
+    pub source_entries: usize,
+    pub destination_entries: usize,
 }
 
 /// Is `name` sync machinery the scanner must never treat as content?
@@ -152,6 +156,8 @@ pub fn compute(
     let dest_only = || dest.keys().filter(|p| !source.contains_key(*p)).count();
     let mut plan = Plan {
         scanned: source.len() + if mode == Mode::Mirror { dest_only() } else { 0 },
+        source_entries: source.len(),
+        destination_entries: dest.len(),
         ..Plan::default()
     };
     let is_excluded = |rel: &Path| excludes.iter().any(|e| Path::new(e) == rel);
@@ -252,14 +258,30 @@ pub fn render(plan: &Plan, pair_name: &str, mode: Mode) -> String {
         .chain(&plan.updates)
         .chain(&plan.deletes)
         .map(|a| a.rel_path.display().to_string().len())
-        .chain(plan.errors.iter().map(|e| e.rel_path.display().to_string().len()))
+        .chain(
+            plan.errors
+                .iter()
+                .map(|e| e.rel_path.display().to_string().len()),
+        )
         .max()
         .unwrap_or(0)
         .clamp(8, 60);
 
     push_actions(&mut out, "COPY", &plan.copies, None, path_width);
-    push_actions(&mut out, "UPDATE", &plan.updates, Some(SAFETYNET_NOTE), path_width);
-    push_actions(&mut out, "DELETE", &plan.deletes, Some(SAFETYNET_NOTE), path_width);
+    push_actions(
+        &mut out,
+        "UPDATE",
+        &plan.updates,
+        Some(SAFETYNET_NOTE),
+        path_width,
+    );
+    push_actions(
+        &mut out,
+        "DELETE",
+        &plan.deletes,
+        Some(SAFETYNET_NOTE),
+        path_width,
+    );
     push_errors(&mut out, &plan.errors, path_width);
 
     out.push_str(&format!(
@@ -340,6 +362,10 @@ pub(crate) fn build(
         .pairs
         .get(pair_name)
         .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+    let (pair, notices) = crate::preconditions::resolve_pair(pair)?;
+    for notice in notices {
+        eprintln!("{notice}");
+    }
 
     if !pair.source.is_dir() {
         return Err(AppError::Precondition(format!(
@@ -371,7 +397,7 @@ pub(crate) fn build(
     };
 
     let plan = compute(&source, &dest, pair.mode, supports_symlinks, excludes);
-    Ok((pair.clone(), plan))
+    Ok((pair, plan))
 }
 
 fn scan_error(path: &Path, source: io::Error) -> AppError {
@@ -467,7 +493,13 @@ mod tests {
         let source = tree(&[("link", link(12)), ("regular.txt", file(10, 100))]);
         let dest = BTreeMap::new();
 
-        let plan = compute(&source, &dest, Mode::Mirror, /* supports_symlinks */ false, &[]);
+        let plan = compute(
+            &source,
+            &dest,
+            Mode::Mirror,
+            /* supports_symlinks */ false,
+            &[],
+        );
 
         assert_eq!(plan.errors.len(), 1);
         assert_eq!(plan.errors[0].rel_path, PathBuf::from("link"));
@@ -492,7 +524,13 @@ mod tests {
         let source = tree(&[("keep.txt", file(10, 100)), ("skip.txt", file(10, 100))]);
         let dest = BTreeMap::new();
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &["skip.txt".to_string()]);
+        let plan = compute(
+            &source,
+            &dest,
+            Mode::Mirror,
+            true,
+            &["skip.txt".to_string()],
+        );
 
         assert_eq!(plan.copies.len(), 1);
         assert_eq!(plan.copies[0].rel_path, PathBuf::from("keep.txt"));
@@ -504,7 +542,13 @@ mod tests {
         let source = BTreeMap::new();
         let dest = tree(&[("gone.txt", file(5, 50))]);
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &["gone.txt".to_string()]);
+        let plan = compute(
+            &source,
+            &dest,
+            Mode::Mirror,
+            true,
+            &["gone.txt".to_string()],
+        );
         assert!(plan.deletes.is_empty());
         assert_eq!(plan.excluded, 1);
     }
@@ -517,7 +561,8 @@ mod tests {
 
         let out = render(&plan, "photos", Mode::Mirror);
 
-        assert!(out.starts_with("Dry-run for 'photos' (mirror): 1 copy · 1 update · 1 delete · 0 error"));
+        assert!(out
+            .starts_with("Dry-run for 'photos' (mirror): 1 copy · 1 update · 1 delete · 0 error"));
         assert!(out.contains("COPY (1)"));
         // SafetyNet note appears on the UPDATE and DELETE section headers.
         assert!(out.contains(&format!("UPDATE (1) {SAFETYNET_NOTE}")));
@@ -537,13 +582,25 @@ mod tests {
 
         let out = render(&plan, "docs", Mode::Update);
 
-        assert!(out.contains("0 delete"), "totals keep the fixed four parts: {out}");
-        assert!(out.contains("DELETE (0)"), "DELETE section still prints, empty: {out}");
-        assert!(!out.contains("gone.txt"), "no dest-only file is ever a delete row: {out}");
+        assert!(
+            out.contains("0 delete"),
+            "totals keep the fixed four parts: {out}"
+        );
+        assert!(
+            out.contains("DELETE (0)"),
+            "DELETE section still prints, empty: {out}"
+        );
+        assert!(
+            !out.contains("gone.txt"),
+            "no dest-only file is ever a delete row: {out}"
+        );
         assert!(out.contains("COPY (1)"));
         // Update considers only the source side, so scanned excludes the
         // destination-only file and the totals still reconcile.
-        assert!(out.contains("Scanned 1 · unchanged 0 · excluded 0"), "{out}");
+        assert!(
+            out.contains("Scanned 1 · unchanged 0 · excluded 0"),
+            "{out}"
+        );
     }
 
     #[test]
