@@ -126,6 +126,88 @@ authorization), then an implementer follows it, then a single merger handles
 integration. Replanning after each merge is essential: it makes parallelism
 depend on actual completed blockers rather than a stale initial plan.
 
+## Superpowers comparison: parallel workers and blind review
+
+This comparison uses Obra's `superpowers` repository at commit
+[`d884ae04edebef577e82ff7c4e143debd0bbec99`](https://github.com/obra/superpowers/tree/d884ae04edebef577e82ff7c4e143debd0bbec99).
+
+### What transfers directly
+
+* **Fresh agents receive curated context, not inherited conversation history.**
+  Both `dispatching-parallel-agents` and `subagent-driven-development` say
+  agents should never inherit the controller's session context or history;
+  the controller constructs only the context required for the task
+  ([parallel-agent overview](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/dispatching-parallel-agents/SKILL.md#L8-L14),
+  [subagent-driven overview](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/subagent-driven-development/SKILL.md#L6-L12)).
+  The parallel form is allowed only for independent domains with no shared
+  state, and each prompt must be focused and self-contained
+  ([selection rules](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/dispatching-parallel-agents/SKILL.md#L16-L45),
+  [prompt contract](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/dispatching-parallel-agents/SKILL.md#L58-L92)).
+* **Planning defines independently testable units and their interfaces.** The
+  planning skill asks for exact files, produced/consumed interfaces, exact
+  commands and expected results, and TDD-sized steps; a task boundary should
+  carry its own test cycle and reviewer gate
+  ([task sizing and structure](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/writing-plans/SKILL.md#L37-L126)).
+* **Workspace isolation is a harness-aware precondition.** The worktree skill
+  first detects whether the harness already supplied isolation, prefers a
+  native worktree facility, falls back to `git worktree`, and verifies a clean
+  test baseline before implementation
+  ([worktree workflow](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/using-git-worktrees/SKILL.md#L6-L123)).
+* **Completion needs fresh evidence.** The verification skill rejects an
+  agent's success report as proof and requires the controller to run and read
+  the command that proves the claim
+  ([verification gate](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/verification-before-completion/SKILL.md#L16-L50),
+  [delegation example](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/verification-before-completion/SKILL.md#L102-L105)).
+
+### Important differences to preserve in `dynamic-implement`
+
+`subagent-driven-development` is not itself a parallel-implementer workflow.
+Its task loop dispatches one implementer, reviews that task, and then moves to
+the next task; its red flags explicitly prohibit multiple implementation
+subagents in parallel because of conflicts
+([process](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/subagent-driven-development/SKILL.md#L45-L81),
+[red flags](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/subagent-driven-development/SKILL.md#L374-L395)).
+`dynamic-implement` can still run independent slices concurrently, but only by
+combining the stricter independence test from `dispatching-parallel-agents`
+with one branch and worktree per writer, predicted file/API conflict edges,
+and serial integration by the merger.
+
+Superpowers' task reviewer is **fresh-context but not fully blind**. It receives
+the task brief, global constraints, a diff package, **and the implementer's own
+report under “What the Implementer Claims They Built”**, although it is told to
+distrust that report and verify claims against the diff
+([reviewer inputs and distrust rule](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/subagent-driven-development/task-reviewer-prompt.md#L13-L55)).
+That is weaker than the requested `dynamic-implement` rule. Its reviewer must
+start as a new process/session with no inherited or forked context and receive
+only:
+
+1. the authoritative issue/spec and repository standards needed to judge it;
+2. the immutable base/head identifiers and diff/review package; and
+3. the review rubric and required output schema.
+
+It must not receive the planner's reasoning, implementer identity, prompts,
+conversation, self-review, report, claimed test result, earlier reviewer
+findings, or the coordinator's prediction of what is correct. A re-review is
+also a new blank reviewer, given the current authoritative spec and complete
+current diff rather than the previous review narrative. Test execution evidence
+can be verified by the coordinator after the blind verdict; including an
+implementer-authored report would reintroduce the bias this rule removes.
+
+Superpowers does advise explicitly selecting a model by task complexity and
+using a capable model for final review, but it does **not** require a different
+model family from the implementer and does not define a runtime cross-harness
+model-discovery profile
+([model selection](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/skills/subagent-driven-development/SKILL.md#L99-L130)).
+Its porting guide instead defines a per-harness tool-mapping layer and a static
+capability checklist, with subagent dispatch explicitly degradable when absent
+([harness architecture](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/docs/porting-to-a-new-harness.md#L31-L77),
+[capability checklist](https://github.com/obra/superpowers/blob/d884ae04edebef577e82ff7c4e143debd0bbec99/docs/porting-to-a-new-harness.md#L81-L122)).
+Therefore a different-family reviewer and first-run harness probe are additions
+to `dynamic-implement`, not behavior that can be inherited from Superpowers.
+The blank-context guarantee is the primary gate; model-family diversity is a
+secondary preference and must never be used as a substitute for a genuinely
+new reviewer session.
+
 `docs/research/` did not exist before this note, so this file establishes the
 repository's research-note location. It is intentionally on the throwaway
 `research/dynamic-implement` branch and must not be merged under the current
