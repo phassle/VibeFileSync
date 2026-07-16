@@ -1,11 +1,12 @@
 //! `vibesync`: hot-path verbs top-level, management namespaced, per
-//! ADR-0004. Implemented so far: `pair add | list | remove` and the
-//! read-only `plan <pair>` human diff; `run`, `status`, `history`, `prune`,
-//! the TUI, and `plan --json` are still stubbed.
+//! ADR-0004. Implemented so far: Folder-pair management, the human Dry-run,
+//! safe `run`/`prune`, and Journal-backed `status`/`history`; the TUI and
+//! streaming JSON plan/run surfaces remain later slices.
 
 mod banner;
 mod config;
 mod error;
+mod journal;
 mod pair;
 mod plan;
 mod preconditions;
@@ -186,8 +187,14 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
                 exclude,
             )
         }
-        Command::Status { pair } => Ok(not_yet_implemented("status", pair)),
-        Command::History { pair, .. } => Ok(not_yet_implemented("history", pair)),
+        Command::Status { pair } => journal::status(config_path, pair),
+        Command::History { pair, json } => {
+            if *json {
+                journal::history_json(config_path, pair)
+            } else {
+                journal::history_human(config_path, pair)
+            }
+        }
         Command::Prune { pair } => run::prune(config_path, pair),
         Command::Tui { pair } => Ok(not_yet_implemented(
             "tui",

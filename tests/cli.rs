@@ -9,11 +9,13 @@
 
 use assert_cmd::Command;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
 const EXIT_OK: i32 = 0;
 const EXIT_PRECONDITION: i32 = 2;
+const EXIT_INTERRUPTED: i32 = 4;
 const EXIT_USAGE: i32 = 64;
 const EXIT_UNIMPLEMENTED: i32 = 69;
 
@@ -48,6 +50,7 @@ fn config_file(config_home: &Path) -> std::path::PathBuf {
 
 struct Fixture {
     xdg: tempfile::TempDir,
+    home: tempfile::TempDir,
     source: tempfile::TempDir,
     destination: tempfile::TempDir,
 }
@@ -56,13 +59,16 @@ impl Fixture {
     fn new() -> Self {
         Fixture {
             xdg: tempfile::tempdir().expect("xdg tempdir"),
+            home: tempfile::tempdir().expect("home tempdir"),
             source: tempfile::tempdir().expect("source tempdir"),
             destination: tempfile::tempdir().expect("destination tempdir"),
         }
     }
 
     fn cmd(&self) -> Command {
-        vibesync(self.xdg.path())
+        let mut cmd = vibesync(self.xdg.path());
+        cmd.env("HOME", self.home.path());
+        cmd
     }
 
     fn add_photos_pair(&self) {
@@ -125,6 +131,13 @@ impl Fixture {
         let mut out = Vec::new();
         walk(root, root, &mut out);
         out
+    }
+
+    fn journal_dir(&self, pair: &str) -> std::path::PathBuf {
+        self.home
+            .path()
+            .join("Library/Application Support/VibeFileSync/runs")
+            .join(pair)
     }
 }
 
@@ -401,15 +414,6 @@ fn plan_json_is_not_yet_implemented() {
 }
 
 #[test]
-fn history_stub_accepts_json_flag() {
-    let fx = Fixture::new();
-    fx.cmd()
-        .args(["history", "photos", "--json"])
-        .assert()
-        .code(EXIT_UNIMPLEMENTED);
-}
-
-#[test]
 fn no_mode_flag_exists_on_run_or_plan() {
     // ADR-0006: sync mode is per-pair config only, never a per-run flag.
     let fx = Fixture::new();
@@ -419,24 +423,6 @@ fn no_mode_flag_exists_on_run_or_plan() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(EXIT_USAGE));
-}
-
-#[test]
-fn unimplemented_verbs_print_a_clear_message() {
-    let fx = Fixture::new();
-    for verb in ["status", "history"] {
-        let output = fx.cmd().args([verb, "photos"]).output().unwrap();
-        assert_ne!(
-            output.status.code(),
-            Some(EXIT_OK),
-            "{verb} should not succeed"
-        );
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(
-            stderr.contains("not yet implemented"),
-            "{verb} should say not yet implemented: {stderr}"
-        );
-    }
 }
 
 #[test]
@@ -1120,4 +1106,263 @@ fn injected_enospc_discards_temp_retains_commits_and_exits_nonzero() {
         "clear disk-full error required: {:?}",
         output.stderr
     );
+}
+
+// --- Slice 5: Journal, lock, status, and history (issue #19) ---
+
+#[test]
+fn completed_run_journal_correlates_every_event_and_safetynet_folder() {
+    let fx = Fixture::new();
+    fx.write_source("report.txt", "new version");
+    fx.write_dest("report.txt", "old version");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let journals: Vec<_> = fs::read_dir(fx.journal_dir("photos"))
+        .expect("run creates the per-pair Journal directory")
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension().and_then(|value| value.to_str()) == Some("ndjson")).then_some(path)
+        })
+        .collect();
+    assert_eq!(journals.len(), 1, "one Journal is retained per run");
+    let run_id = journals[0].file_stem().unwrap().to_str().unwrap();
+    let events: Vec<serde_json::Value> = fs::read_to_string(&journals[0])
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every Journal line is JSON"))
+        .collect();
+
+    assert_eq!(events.first().unwrap()["type"], "run_start");
+    assert_eq!(events.last().unwrap()["type"], "summary");
+    assert!(events.iter().all(|event| {
+        event["schema"] == "vibefilesync.journal/v1" && event["run_id"] == run_id
+    }));
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "action_done" && event["path"] == "report.txt"));
+    let action_start = events
+        .iter()
+        .find(|event| event["type"] == "action_start" && event["path"] == "report.txt")
+        .expect("Journal records the in-progress transition");
+    assert!(action_start["temp_path"]
+        .as_str()
+        .is_some_and(|path| path.contains(&format!(".vibesync-tmp-{run_id}"))));
+    assert_eq!(action_start["source_identity"]["size"], 11);
+    assert!(action_start["source_identity"]["modified_ns"].is_string());
+    assert_eq!(
+        fs::read_to_string(
+            fx.destination
+                .path()
+                .join("_SafetyNet")
+                .join(run_id)
+                .join("report.txt")
+        )
+        .unwrap(),
+        "old version"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("report.txt")).unwrap(),
+        "new version",
+        "action_done describes content already Published at the process boundary"
+    );
+}
+
+#[test]
+fn pair_lock_rejects_overlap_and_dies_with_a_killed_process() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "complete photo");
+    fx.add_photos_pair();
+
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut first = ProcessCommand::new(binary.get_program())
+        .args(["run", "photos"])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("first run starts");
+
+    let lock = fx.journal_dir("photos").join(".lock");
+    for _ in 0..100 {
+        if lock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let before = Fixture::snapshot(fx.destination.path());
+    let second = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+    first.kill().expect("kill lock holder");
+    first.wait().expect("reap lock holder");
+
+    assert!(
+        lock.exists(),
+        "run creates the specified per-pair lock file"
+    );
+    assert_eq!(second.status.code(), Some(EXIT_PRECONDITION));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("run already in progress"));
+    assert_eq!(
+        Fixture::snapshot(fx.destination.path()),
+        before,
+        "contending run performs zero destination writes"
+    );
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("photo.txt")).unwrap(),
+        "complete photo",
+        "killing the holder leaves no stale lock"
+    );
+}
+
+#[test]
+fn status_reports_the_latest_summaryless_journal_as_interrupted() {
+    let fx = Fixture::new();
+    fx.write_dest("kept.txt", "untouched");
+    fx.add_photos_pair();
+    let journal_dir = fx.journal_dir("photos");
+    fs::create_dir_all(&journal_dir).unwrap();
+    let run_id = "20991231T235959Z";
+    fs::write(
+        journal_dir.join(format!("{run_id}.ndjson")),
+        format!(
+            "{{\"schema\":\"vibefilesync.journal/v1\",\"type\":\"run_start\",\"run_id\":\"{run_id}\",\"pair\":\"photos\",\"planned_actions\":[]}}\n"
+        ),
+    )
+    .unwrap();
+    let before = Fixture::snapshot(fx.destination.path());
+
+    let output = fx.cmd().args(["status", "photos"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(run_id),
+        "status identifies the latest run: {stdout}"
+    );
+    assert!(
+        stdout.to_ascii_lowercase().contains("interrupted"),
+        "summary-less Journal is interrupted: {stdout}"
+    );
+    assert_eq!(
+        Fixture::snapshot(fx.destination.path()),
+        before,
+        "status is read-only on the destination"
+    );
+}
+
+#[test]
+fn history_human_lists_runs_with_results_counts_bytes_and_warnings() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "first");
+    fx.add_photos_pair();
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+    fx.write_source("photo.txt", "a longer second version");
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let output = fx.cmd().args(["history", "photos"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Run id") && stdout.contains("Result"));
+    assert!(stdout.contains("Done/Planned"));
+    assert!(stdout.contains("Bytes") && stdout.contains("Warnings"));
+    assert_eq!(
+        stdout.matches("success").count(),
+        2,
+        "both retained runs are listed: {stdout}"
+    );
+}
+
+#[test]
+fn history_json_emits_the_versioned_run_list_shape() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "five!");
+    fx.add_photos_pair();
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let output = fx
+        .cmd()
+        .args(["history", "photos", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["schema"], "vibefilesync.history/v1");
+    assert_eq!(payload["pair"], "photos");
+    let runs = payload["runs"]
+        .as_array()
+        .expect("history contains a run list");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["result"], "success");
+    assert_eq!(runs[0]["counts"]["planned"], 1);
+    assert_eq!(runs[0]["counts"]["done"], 1);
+    assert_eq!(runs[0]["bytes"], 5);
+    assert_eq!(runs[0]["warnings"], 0);
+    assert!(runs[0]["run_id"].as_str().unwrap().ends_with('Z'));
+}
+
+#[test]
+fn journal_failure_after_publish_is_an_interrupted_run_not_a_precondition_abort() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "x");
+    fx.add_pair("baseline", "mirror");
+    fx.cmd()
+        .args(["run", "baseline", "--yes"])
+        .assert()
+        .success();
+
+    let baseline_journal = fs::read_dir(fx.journal_dir("baseline"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("ndjson"))
+        .unwrap();
+    let contents = fs::read_to_string(baseline_journal).unwrap();
+    let mut file_limit = 0;
+    for line in contents.split_inclusive('\n') {
+        file_limit += line.len();
+        let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        if event["type"] == "action_start" {
+            break;
+        }
+    }
+
+    fs::remove_file(fx.destination.path().join("photo.txt")).unwrap();
+    fx.add_pair("limited", "mirror");
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut command = ProcessCommand::new(binary.get_program());
+    command
+        .args(["run", "limited", "--yes"])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path());
+    unsafe {
+        command.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: file_limit as libc::rlim_t,
+                rlim_max: file_limit as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let output = command.output().unwrap();
+
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("photo.txt")).unwrap(),
+        "x",
+        "the Journal tail fails only after Publish"
+    );
+    assert_eq!(output.status.code(), Some(EXIT_INTERRUPTED));
+    let status = fx.cmd().args(["status", "limited"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("interrupted"));
 }

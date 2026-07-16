@@ -2,15 +2,16 @@
 //! before SafetyNet archives any old destination object and Publish renames the
 //! verified temp into place (ADR-0001 and ADR-0008).
 
-use std::ffi::{CString, OsStr};
-use std::fs::{self, File, OpenOptions};
+use std::ffi::CString;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
+use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
@@ -40,12 +41,17 @@ pub fn run(
     ignore_space_check: bool,
     excludes: &[String],
 ) -> Result<i32, AppError> {
+    let config = crate::config::load(config_path)?;
+    if !config.pairs.contains_key(pair_name) {
+        return Err(AppError::Usage(format!("pair '{pair_name}' not found")));
+    }
+    let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, plan) = plan::build(config_path, pair_name, excludes)?;
     print!("{}", plan::render(&plan, pair_name, pair.mode));
 
-    for warning in
-        crate::preconditions::check_run(&pair, &plan, allow_empty_source, ignore_space_check)?
-    {
+    let run_warnings =
+        crate::preconditions::check_run(&pair, &plan, allow_empty_source, ignore_space_check)?;
+    for warning in &run_warnings {
         eprintln!("{warning}");
     }
 
@@ -62,55 +68,112 @@ pub fn run(
         return Ok(EXIT_OK);
     }
 
-    let (run_id, run_lock) = allocate_run_id(&pair.destination).map_err(io_error)?;
-    let mut failed = 0;
+    let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
+    journal
+        .run_start(pair_name, &plan, &run_warnings)
+        .map_err(io_error)?;
+    let mut stats = RunStats {
+        counts: Counts {
+            planned: plan.copies.len() + plan.updates.len() + plan.deletes.len(),
+            ..Counts::default()
+        },
+        ..RunStats::default()
+    };
     for (operation, action) in plan
         .copies
         .iter()
-        .map(|action| ("COPY", action))
-        .chain(plan.updates.iter().map(|action| ("UPDATE", action)))
+        .map(|action| (Operation::Copy, action))
+        .chain(
+            plan.updates
+                .iter()
+                .map(|action| (Operation::Update, action)),
+        )
     {
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
-        if let Err(error) = copy_file(
+        let temp = temporary_path(&destination, journal.run_id());
+        journal
+            .action_start(operation, action, Some(&source), Some(&temp))
+            .map_err(journal_runtime_error)?;
+        match copy_file(
             &pair.destination,
             &source,
             &destination,
+            &temp,
             action,
-            &run_id,
+            journal.run_id(),
             permanent_delete,
         ) {
-            failed += 1;
-            eprintln!(
-                "vibesync: {} {} failed: {error}",
-                operation,
-                action.rel_path.display()
-            );
-            if error.raw_os_error() == Some(libc::ENOSPC) {
-                eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
-                break;
+            Ok(outcome) => {
+                journal
+                    .action_done(
+                        operation,
+                        action,
+                        outcome.safety_net.as_deref(),
+                        &outcome.warnings,
+                    )
+                    .map_err(journal_runtime_error)?;
+                stats.counts.done += 1;
+                stats.bytes += action.bytes;
+                stats.warnings += outcome.warnings.len();
+                match operation {
+                    Operation::Copy => stats.counts.copied += 1,
+                    Operation::Update => stats.counts.updated += 1,
+                    Operation::Delete => unreachable!("deletes use their own execution loop"),
+                }
+            }
+            Err(error) => {
+                stats.counts.failed += 1;
+                journal
+                    .action_failed(operation, action, &error.to_string())
+                    .map_err(journal_runtime_error)?;
+                eprintln!(
+                    "vibesync: {} {} failed: {error}",
+                    operation.as_str().to_ascii_uppercase(),
+                    action.rel_path.display()
+                );
+                if error.raw_os_error() == Some(libc::ENOSPC) {
+                    eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
+                    break;
+                }
             }
         }
     }
     for action in &plan.deletes {
         let destination = pair.destination.join(&action.rel_path);
-        if let Err(error) = remove_file(
+        journal
+            .action_start(Operation::Delete, action, None, None)
+            .map_err(journal_runtime_error)?;
+        match remove_file(
             &pair.destination,
             &destination,
             &action.rel_path,
-            &run_id,
+            journal.run_id(),
             permanent_delete,
         ) {
-            failed += 1;
-            eprintln!(
-                "vibesync: DELETE {} failed: {error}",
-                action.rel_path.display()
-            );
+            Ok(safety_net) => {
+                journal
+                    .action_done(Operation::Delete, action, safety_net.as_deref(), &[])
+                    .map_err(journal_runtime_error)?;
+                stats.counts.done += 1;
+                stats.counts.deleted += 1;
+                stats.bytes += action.bytes;
+            }
+            Err(error) => {
+                stats.counts.failed += 1;
+                journal
+                    .action_failed(Operation::Delete, action, &error.to_string())
+                    .map_err(journal_runtime_error)?;
+                eprintln!(
+                    "vibesync: DELETE {} failed: {error}",
+                    action.rel_path.display()
+                );
+            }
         }
     }
 
-    let _ = fs::remove_file(run_lock);
-    if failed == 0 {
+    journal.summary(&stats).map_err(journal_runtime_error)?;
+    if stats.counts.failed == 0 {
         Ok(EXIT_OK)
     } else {
         Ok(1)
@@ -132,49 +195,56 @@ fn copy_file(
     destination_root: &Path,
     source: &Path,
     destination: &Path,
+    temp: &Path,
     action: &Action,
     run_id: &str,
     permanent_delete: bool,
-) -> io::Result<()> {
+) -> io::Result<ActionOutcome> {
     let source_before = fs::metadata(source)?;
     let parent = destination
         .parent()
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
-    let temp = temporary_path(destination, run_id);
-
     let result = (|| {
-        copyfile_all_but_acls(source, &temp)?;
+        copyfile_all_but_acls(source, temp)?;
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
             .is_some_and(|path| Path::new(&path) == action.rel_path)
         {
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
-        fully_sync(&temp)?;
-        let warnings = verify(source, &source_before, &temp, action.bytes)?;
-        remove_file(
+        fully_sync(temp)?;
+        let warnings = verify(source, &source_before, temp, action.bytes)?;
+        let safety_net = remove_file(
             destination_root,
             destination,
             &action.rel_path,
             run_id,
             permanent_delete,
         )?;
-        fs::rename(&temp, destination)?;
+        fs::rename(temp, destination)?;
         sync_directory(parent)?;
-        for warning in warnings {
+        for warning in &warnings {
             eprintln!(
                 "vibesync: COPY {} warning: {warning}",
                 action.rel_path.display()
             );
         }
-        Ok(())
+        Ok(ActionOutcome {
+            safety_net,
+            warnings,
+        })
     })();
 
     if result.is_err() {
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(temp);
     }
     result
+}
+
+struct ActionOutcome {
+    safety_net: Option<PathBuf>,
+    warnings: Vec<String>,
 }
 
 /// Removes a final destination object only after the copy gate has passed,
@@ -187,15 +257,15 @@ fn remove_file(
     relative_path: &Path,
     run_id: &str,
     permanent_delete: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<PathBuf>> {
     match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.file_type().is_dir() => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "destination path is a directory",
         )),
-        Ok(_) if permanent_delete => fs::remove_file(destination),
-        Ok(_) => archive_by_rename(destination_root, destination, relative_path, run_id),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) if permanent_delete => fs::remove_file(destination).map(|()| None),
+        Ok(_) => archive_by_rename(destination_root, destination, relative_path, run_id).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -209,7 +279,7 @@ fn archive_by_rename(
     destination: &Path,
     relative_path: &Path,
     run_id: &str,
-) -> io::Result<()> {
+) -> io::Result<PathBuf> {
     let archive = destination_root
         .join("_SafetyNet")
         .join(run_id)
@@ -223,7 +293,7 @@ fn archive_by_rename(
     if let Some(destination_parent) = destination.parent() {
         sync_directory(destination_parent)?;
     }
-    Ok(())
+    Ok(archive)
 }
 
 /// Deletes only direct, real Run folders below this pair's visible
@@ -234,6 +304,7 @@ pub fn prune(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
         .pairs
         .get(pair_name)
         .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+    let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let safety_net = pair.destination.join("_SafetyNet");
     let entries = match fs::read_dir(&safety_net) {
         Ok(entries) => entries,
@@ -243,7 +314,7 @@ pub fn prune(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
     for entry in entries {
         let entry = entry.map_err(io_error)?;
         let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
-        if metadata.file_type().is_dir() && is_run_id(&entry.file_name()) {
+        if metadata.file_type().is_dir() && crate::journal::is_run_id(&entry.file_name()) {
             fs::remove_dir_all(entry.path()).map_err(io_error)?;
         }
     }
@@ -393,98 +464,23 @@ fn io_error(error: io::Error) -> AppError {
     AppError::Precondition(error.to_string())
 }
 
-/// Acquires a short-lived root lock with `create_new`, which makes Run id
-/// allocation collision-safe across separate processes as well as threads.
-/// The lock name is scanner machinery and is removed when this run returns.
-fn allocate_run_id(destination_root: &Path) -> io::Result<(String, PathBuf)> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch");
-    allocate_run_id_at(destination_root, now.as_secs())
+fn journal_runtime_error(error: io::Error) -> AppError {
+    AppError::Interrupted(format!(
+        "Journal write failed after the run started: {error}"
+    ))
 }
 
-/// Allocates a Run id that has no persisted archive folder as well as no
-/// in-progress lock. The archive check prevents a later run in the same
-/// second from reusing a completed Run's id and overwriting its SafetyNet.
-fn allocate_run_id_at(destination_root: &Path, seconds: u64) -> io::Result<(String, PathBuf)> {
-    let base = utc_basic(seconds);
-    let mut suffix = 1_u32;
-    loop {
-        let run_id = if suffix == 1 {
-            base.clone()
-        } else {
-            format!("{base}-{suffix}")
-        };
-        if destination_root.join("_SafetyNet").join(&run_id).exists() {
-            suffix = suffix.checked_add(1).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "run id suffix space exhausted",
-                )
-            })?;
-            continue;
-        }
-        let lock = destination_root.join(format!("._vibesync-run-{run_id}"));
-        match OpenOptions::new().write(true).create_new(true).open(&lock) {
-            Ok(_) => return Ok((run_id, lock)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        suffix = suffix.checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "run id suffix space exhausted",
-            )
-        })?;
+fn lock_error(error: io::Error) -> AppError {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        AppError::Precondition("run already in progress".to_string())
+    } else {
+        io_error(error)
     }
-}
-
-/// A Run id is the basic UTC timestamp used throughout the product, with the
-/// collision suffix the allocator emits when more than one run starts in the
-/// same second. Prune must leave every other user-created SafetyNet folder.
-fn is_run_id(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let (timestamp, suffix) = match name.split_once('-') {
-        Some((timestamp, suffix)) => (timestamp, Some(suffix)),
-        None => (name, None),
-    };
-    let timestamp_is_valid = timestamp.len() == 16
-        && timestamp.as_bytes()[8] == b'T'
-        && timestamp.as_bytes()[15] == b'Z'
-        && timestamp
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 8 | 15) || byte.is_ascii_digit());
-    timestamp_is_valid
-        && suffix.is_none_or(|suffix| suffix.parse::<u32>().is_ok_and(|value| value >= 2))
-}
-
-fn utc_basic(seconds: u64) -> String {
-    let timestamp = seconds as libc::time_t;
-    let mut value: libc::tm = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::gmtime_r(&timestamp, &mut value) };
-    assert!(!result.is_null(), "system clock must convert to UTC");
-    format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        value.tm_year + 1900,
-        value.tm_mon + 1,
-        value.tm_mday,
-        value.tm_hour,
-        value.tm_min,
-        value.tm_sec
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn utc_run_ids_use_the_basic_exfat_safe_format() {
-        assert_eq!(utc_basic(0), "19700101T000000Z");
-    }
 
     #[test]
     fn temp_suffixes_are_sibling_dot_files() {
@@ -494,37 +490,6 @@ mod tests {
             temporary_path(&destination, "20260716T120000Z"),
             dir.path().join(".photo.jpg.vibesync-tmp-20260716T120000Z")
         );
-    }
-
-    #[test]
-    fn run_id_allocator_suffixes_a_same_second_collision() {
-        let root = tempfile::tempdir().unwrap();
-        let (first, first_lock) = allocate_run_id(root.path()).unwrap();
-        let (second, second_lock) = allocate_run_id(root.path()).unwrap();
-        assert!(first.ends_with('Z'));
-        assert_eq!(second, format!("{first}-2"));
-        fs::remove_file(first_lock).unwrap();
-        fs::remove_file(second_lock).unwrap();
-    }
-
-    #[test]
-    fn run_id_allocator_does_not_reuse_a_completed_archive_folder() {
-        let root = tempfile::tempdir().unwrap();
-        let archived = root.path().join("_SafetyNet/19700101T000000Z");
-        fs::create_dir_all(&archived).unwrap();
-
-        let (run_id, lock) = allocate_run_id_at(root.path(), 0).unwrap();
-
-        assert_eq!(run_id, "19700101T000000Z-2");
-        fs::remove_file(lock).unwrap();
-    }
-
-    #[test]
-    fn run_id_recognizes_only_allocator_format() {
-        assert!(is_run_id(OsStr::new("20260716T120000Z")));
-        assert!(is_run_id(OsStr::new("20260716T120000Z-2")));
-        assert!(!is_run_id(OsStr::new("run-one")));
-        assert!(!is_run_id(OsStr::new("20260716T120000Z-1")));
     }
 
     #[test]
@@ -539,11 +504,13 @@ mod tests {
             bytes: 1, // independent planned expectation forces gate failure
             reason: "new".to_string(),
         };
+        let temp = temporary_path(&destination, "20260716T120000Z");
 
         let result = copy_file(
             destination_dir.path(),
             &source,
             &destination,
+            &temp,
             &action,
             "20260716T120000Z",
             false,
@@ -573,11 +540,13 @@ mod tests {
             bytes: 1,
             reason: "size differs".to_string(),
         };
+        let temp = temporary_path(&destination, "20260716T120000Z");
 
         let result = copy_file(
             destination_dir.path(),
             &source,
             &destination,
+            &temp,
             &action,
             "20260716T120000Z",
             false,
