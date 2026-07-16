@@ -46,20 +46,61 @@ impl Fixture {
     }
 
     fn add_photos_pair(&self) {
+        self.add_pair("photos", "mirror");
+    }
+
+    fn add_pair(&self, name: &str, mode: &str) {
         self.cmd()
             .args([
                 "pair",
                 "add",
-                "photos",
+                name,
                 "--source",
                 self.source.path().to_str().unwrap(),
                 "--destination",
                 self.destination.path().to_str().unwrap(),
                 "--mode",
-                "mirror",
+                mode,
             ])
             .assert()
             .success();
+    }
+
+    fn write_source(&self, rel: &str, contents: &str) {
+        Self::write_under(self.source.path(), rel, contents);
+    }
+
+    fn write_dest(&self, rel: &str, contents: &str) {
+        Self::write_under(self.destination.path(), rel, contents);
+    }
+
+    fn write_under(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    /// A recursively-sorted snapshot of a tree, used to prove `plan` writes
+    /// nothing.
+    fn snapshot(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+            entries.sort_by_key(|e| e.path());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if entry.file_type().unwrap().is_dir() {
+                    out.push(format!("{rel}/"));
+                    walk(&path, base, out);
+                } else {
+                    let len = fs::metadata(&path).unwrap().len();
+                    out.push(format!("{rel} ({len})"));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out
     }
 }
 
@@ -314,12 +355,23 @@ fn run_stub_accepts_the_adr_0004_per_run_flags() {
 }
 
 #[test]
-fn plan_stub_accepts_json_and_exclude_flags() {
+fn plan_json_is_not_yet_implemented() {
+    // The human `plan` diff ships in this slice; the NDJSON
+    // `vibefilesync.plan/v1` stream is a later one.
     let fx = Fixture::new();
-    fx.cmd()
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
         .args(["plan", "photos", "--json", "--exclude", "a/b"])
-        .assert()
-        .code(EXIT_UNIMPLEMENTED);
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_UNIMPLEMENTED));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("not yet implemented"),
+        "plan --json should say not yet implemented: {stderr}"
+    );
 }
 
 #[test]
@@ -346,7 +398,7 @@ fn no_mode_flag_exists_on_run_or_plan() {
 #[test]
 fn unimplemented_verbs_print_a_clear_message() {
     let fx = Fixture::new();
-    for verb in ["plan", "run", "status", "history", "prune"] {
+    for verb in ["run", "status", "history", "prune"] {
         let output = fx.cmd().args([verb, "photos"]).output().unwrap();
         assert_ne!(
             output.status.code(),
@@ -372,4 +424,144 @@ fn missing_subcommand_is_a_usage_error_exit_64() {
 fn help_exits_zero() {
     let fx = Fixture::new();
     fx.cmd().arg("--help").assert().success();
+}
+
+// --- Slice 2: `plan <pair>` human Dry-run diff (issue #16) ---
+
+#[test]
+fn plan_prints_summary_first_then_grouped_sections() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "aaaa");
+    fx.write_source("changed.txt", "aaaaaa"); // 6 bytes
+    fx.write_dest("changed.txt", "bb"); // 2 bytes -> UPDATE (size differs)
+    fx.write_dest("old/stale.txt", "zzz"); // dest-only -> DELETE (mirror)
+    fx.add_photos_pair();
+
+    let output = fx.cmd().args(["plan", "photos"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Totals summary comes first, before any section header.
+    let summary_line = stdout.lines().next().unwrap();
+    assert!(
+        summary_line.contains("1 copy") && summary_line.contains("1 update")
+            && summary_line.contains("1 delete") && summary_line.contains("0 error"),
+        "totals summary should lead: {summary_line}"
+    );
+    assert!(summary_line.to_lowercase().contains("dry-run"));
+
+    // Sections are grouped and ordered COPY, UPDATE, DELETE, ERRORS.
+    let copy = stdout.find("COPY").unwrap();
+    let update = stdout.find("UPDATE").unwrap();
+    let delete = stdout.find("DELETE").unwrap();
+    let errors = stdout.find("ERRORS").unwrap();
+    assert!(copy < update && update < delete && delete < errors, "section order: {stdout}");
+
+    assert!(stdout.contains("new.txt"), "COPY row present: {stdout}");
+    assert!(stdout.contains("changed.txt"), "UPDATE row present: {stdout}");
+    assert!(stdout.contains("old/stale.txt"), "DELETE row present: {stdout}");
+}
+
+#[test]
+fn plan_update_and_delete_sections_carry_the_safetynet_annotation() {
+    let fx = Fixture::new();
+    fx.write_source("changed.txt", "aaaaaa");
+    fx.write_dest("changed.txt", "bb");
+    fx.write_dest("gone.txt", "zzz");
+    fx.add_photos_pair();
+
+    let stdout = String::from_utf8(fx.cmd().args(["plan", "photos"]).output().unwrap().stdout).unwrap();
+
+    for line in stdout.lines() {
+        if line.starts_with("UPDATE") || line.starts_with("DELETE") {
+            assert!(
+                line.contains("_SafetyNet/"),
+                "old versions destination must be annotated: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn plan_update_mode_never_plans_a_deletion() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "aaaa");
+    fx.write_dest("only-on-dest.txt", "zzz"); // would be a DELETE under Mirror
+    fx.add_pair("docs", "update");
+
+    let stdout = String::from_utf8(fx.cmd().args(["plan", "docs"]).output().unwrap().stdout).unwrap();
+
+    // The DELETE section still prints (fixed four-section layout) but is
+    // always empty in Update — nothing at the destination is ever removed.
+    assert!(stdout.contains("(update)"));
+    assert!(stdout.contains("0 delete"), "Update totals report zero deletes: {stdout}");
+    assert!(stdout.contains("DELETE (0)"), "empty DELETE section still shown: {stdout}");
+    assert!(!stdout.contains("only-on-dest.txt"), "dest-only file must not be a delete row: {stdout}");
+    assert!(stdout.contains("new.txt"));
+}
+
+#[test]
+fn plan_never_shows_or_deletes_machinery() {
+    let fx = Fixture::new();
+    fx.write_source("real.txt", "aaaa");
+    // Destination machinery that must stay invisible and undeleted.
+    fx.write_dest("_SafetyNet/20200101T000000Z/archived.txt", "old-version");
+    fx.write_dest(".real.txt.vibesync-tmp-abc123", "half-written");
+    fx.add_photos_pair();
+
+    let stdout = String::from_utf8(fx.cmd().args(["plan", "photos"]).output().unwrap().stdout).unwrap();
+
+    // Machinery content is never a plan row (`_SafetyNet/` still appears in
+    // the UPDATE/DELETE header annotation — that's the archive destination,
+    // not a synced path — so we check the actual entries, not the prefix).
+    assert!(!stdout.contains("archived.txt"), "SafetyNet contents must never appear: {stdout}");
+    assert!(!stdout.contains("20200101T000000Z"), "SafetyNet run folder must never appear: {stdout}");
+    assert!(!stdout.contains("vibesync-tmp"), "Publish temps must never appear: {stdout}");
+    // The only planned action is the real source file (a COPY); nothing is
+    // planned for deletion even though the destination is non-empty.
+    assert!(stdout.contains("1 copy") && stdout.contains("0 delete"), "{stdout}");
+}
+
+#[test]
+fn plan_excludes_an_exact_path() {
+    let fx = Fixture::new();
+    fx.write_source("keep.txt", "aaaa");
+    fx.write_source("skip.txt", "aaaa");
+    fx.add_photos_pair();
+
+    let stdout = String::from_utf8(
+        fx.cmd().args(["plan", "photos", "--exclude", "skip.txt"]).output().unwrap().stdout,
+    )
+    .unwrap();
+
+    assert!(stdout.contains("keep.txt"));
+    assert!(!stdout.contains("skip.txt"), "excluded path must not appear: {stdout}");
+    assert!(stdout.contains("excluded 1"), "excluded count reported: {stdout}");
+}
+
+#[test]
+fn plan_performs_zero_writes_to_source_or_destination() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "aaaa");
+    fx.write_source("changed.txt", "aaaaaa");
+    fx.write_dest("changed.txt", "bb");
+    fx.write_dest("gone.txt", "zzz");
+    fx.add_photos_pair();
+
+    let src_before = Fixture::snapshot(fx.source.path());
+    let dst_before = Fixture::snapshot(fx.destination.path());
+
+    fx.cmd().args(["plan", "photos"]).assert().success();
+
+    assert_eq!(src_before, Fixture::snapshot(fx.source.path()), "plan wrote to the source");
+    assert_eq!(dst_before, Fixture::snapshot(fx.destination.path()), "plan wrote to the destination");
+}
+
+#[test]
+fn plan_for_an_unknown_pair_is_a_usage_error_exit_64() {
+    let fx = Fixture::new();
+    let output = fx.cmd().args(["plan", "nope"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("nope"), "error should name the pair: {stderr}");
 }

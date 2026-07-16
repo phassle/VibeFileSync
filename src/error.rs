@@ -24,6 +24,10 @@ pub enum AppError {
     /// Invalid command usage: bad pair name, duplicate/missing pair,
     /// non-existent source/destination path (exit 64).
     Usage(String),
+    /// A run/plan precondition failed at invocation time — e.g. a pair's
+    /// source directory is gone or unmounted (exit 2, same class as other
+    /// pre-mutation aborts under ADR-0002).
+    Precondition(String),
     /// Reading a volume's UUID failed (exit 2 — same class as other
     /// volume-identity precondition failures, ADR-0002).
     VolumeUuid {
@@ -37,6 +41,7 @@ impl AppError {
         match self {
             AppError::Config(_) => EXIT_PRECONDITION,
             AppError::Usage(_) => EXIT_USAGE,
+            AppError::Precondition(_) => EXIT_PRECONDITION,
             AppError::VolumeUuid { .. } => EXIT_PRECONDITION,
         }
     }
@@ -47,6 +52,7 @@ impl fmt::Display for AppError {
         match self {
             AppError::Config(e) => write!(f, "config error: {e}"),
             AppError::Usage(message) => write!(f, "{message}"),
+            AppError::Precondition(message) => write!(f, "{message}"),
             AppError::VolumeUuid { path, source } => {
                 write!(
                     f,

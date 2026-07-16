@@ -85,6 +85,35 @@ pub fn volume_uuid(path: &Path) -> io::Result<String> {
     Ok(format_uuid(&buf.uuid))
 }
 
+/// Reads the filesystem type name of the volume containing `path` (macOS
+/// `statfs(2)`'s `f_fstypename`, e.g. `"apfs"`, `"exfat"`, `"msdos"`).
+///
+/// `plan` uses this to know whether the destination can store symlinks:
+/// exFAT cannot, so a source symlink bound for it is a per-file plan error
+/// rather than a copy.
+pub fn filesystem_type(path: &Path) -> io::Result<String> {
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains an interior NUL byte: {}", path.display()),
+        )
+    })?;
+
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // `f_fstypename` is a fixed-size, NUL-terminated C string. `c_char` is
+    // signed on this target, so reinterpret as bytes before the NUL scan.
+    let raw = &buf.f_fstypename;
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, raw.len()) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
 fn format_uuid(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(36);
     for (i, b) in bytes.iter().enumerate() {
@@ -122,5 +151,14 @@ mod tests {
     fn errors_for_a_nonexistent_path() {
         let err = volume_uuid(Path::new("/no/such/path/vibesync-test")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn reads_a_nonempty_filesystem_type_for_the_root_volume() {
+        // The Mac's native root volume is APFS; asserting the exact name
+        // would be brittle, so we just require a plausible, non-empty type.
+        let fs = filesystem_type(Path::new("/")).expect("root volume has a filesystem type");
+        assert!(!fs.is_empty());
+        assert!(fs.is_ascii());
     }
 }
