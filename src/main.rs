@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod pair;
 mod plan;
+mod run;
 mod volume;
 
 use std::path::PathBuf;
@@ -141,7 +142,20 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             }
             plan::run(config_path, pair, exclude)
         }
-        Command::Run { pair, .. } => Ok(not_yet_implemented("run", pair)),
+        Command::Run {
+            pair,
+            yes,
+            json,
+            permanent_delete: _,
+            allow_empty_source: _,
+            ignore_space_check: _,
+            exclude,
+        } => {
+            if *json {
+                return Ok(not_yet_implemented("run --json", pair));
+            }
+            run::run(config_path, pair, *yes, exclude)
+        }
         Command::Status { pair } => Ok(not_yet_implemented("status", pair)),
         Command::History { pair, .. } => Ok(not_yet_implemented("history", pair)),
         Command::Prune { pair } => Ok(not_yet_implemented("prune", pair)),

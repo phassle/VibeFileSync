@@ -77,7 +77,9 @@ pub struct Plan {
 /// both the source and destination side.
 fn is_machinery(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
-    name == "_SafetyNet" || (name.starts_with('.') && name.contains(".vibesync-tmp-"))
+    name == "_SafetyNet"
+        || (name.starts_with('.')
+            && (name.contains(".vibesync-tmp-") || name.starts_with("._vibesync-run-")))
 }
 
 /// Recursively collects every file and symlink under `root`, keyed by path
@@ -320,6 +322,19 @@ fn human_size(bytes: u64) -> String {
 /// blast radius we refuse to imply. A missing destination is fine — it just
 /// reads as empty (a first sync), so everything plans as COPY.
 pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
+    let (pair, plan) = build(config_path, pair_name, excludes)?;
+    print!("{}", render(&plan, pair_name, pair.mode));
+    Ok(crate::error::EXIT_OK)
+}
+
+/// Builds a fresh plan for the CLI edges which need to render it and then
+/// act on exactly the reviewed COPY rows. The scan remains owned by this
+/// module; callers receive no filesystem internals.
+pub(crate) fn build(
+    config_path: &Path,
+    pair_name: &str,
+    excludes: &[String],
+) -> Result<(config::Pair, Plan), AppError> {
     let cfg = config::load(config_path)?;
     let pair = cfg
         .pairs
@@ -356,8 +371,7 @@ pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i
     };
 
     let plan = compute(&source, &dest, pair.mode, supports_symlinks, excludes);
-    print!("{}", render(&plan, pair_name, pair.mode));
-    Ok(crate::error::EXIT_OK)
+    Ok((pair.clone(), plan))
 }
 
 fn scan_error(path: &Path, source: io::Error) -> AppError {
@@ -545,6 +559,7 @@ mod tests {
     fn machinery_names_are_recognized() {
         assert!(is_machinery(OsStr::new("_SafetyNet")));
         assert!(is_machinery(OsStr::new(".photo.jpg.vibesync-tmp-abc123")));
+        assert!(is_machinery(OsStr::new("._vibesync-run-20260716T120000Z")));
         assert!(!is_machinery(OsStr::new("_SafetyNetworkNotes")));
         assert!(!is_machinery(OsStr::new("vibesync-tmp-visible")));
         assert!(!is_machinery(OsStr::new("regular.txt")));
