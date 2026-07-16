@@ -4,6 +4,7 @@
 //! the TUI, and `plan --json` are still stubbed.
 
 mod config;
+mod banner;
 mod error;
 mod pair;
 mod plan;
@@ -13,16 +14,21 @@ mod volume;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use config::Mode;
 use error::AppError;
 
 #[derive(Parser)]
-#[command(name = "vibesync", version, about = "One-way file sync with SafetyNet")]
+#[command(
+    name = "vibesync",
+    version,
+    about = "One-way file sync with SafetyNet",
+    subcommand_required = false
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -101,6 +107,11 @@ enum PairCommand {
 }
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if banner::is_idle_surface(&args) {
+        banner::print_if_enabled();
+    }
+
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -115,9 +126,15 @@ fn main() -> ExitCode {
         }
     };
 
+    let Some(command) = cli.command else {
+        Cli::command().print_help().ok();
+        println!();
+        return ExitCode::from(error::EXIT_OK as u8);
+    };
+
     let config_path = config::config_path();
 
-    let result = run(&cli.command, &config_path);
+    let result = run(&command, &config_path);
     match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
