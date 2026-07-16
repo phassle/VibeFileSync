@@ -163,7 +163,7 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             pair,
             yes,
             json,
-            permanent_delete: _,
+            permanent_delete,
             allow_empty_source: _,
             ignore_space_check: _,
             exclude,
@@ -171,11 +171,11 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             if *json {
                 return Ok(not_yet_implemented("run --json", pair));
             }
-            run::run(config_path, pair, *yes, exclude)
+            run::run(config_path, pair, *yes, *permanent_delete, exclude)
         }
         Command::Status { pair } => Ok(not_yet_implemented("status", pair)),
         Command::History { pair, .. } => Ok(not_yet_implemented("history", pair)),
-        Command::Prune { pair } => Ok(not_yet_implemented("prune", pair)),
+        Command::Prune { pair } => run::prune(config_path, pair),
         Command::Tui { pair } => Ok(not_yet_implemented(
             "tui",
             pair.as_deref().unwrap_or("<all pairs>"),

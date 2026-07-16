@@ -1,6 +1,6 @@
-//! The first destination-mutating slice: new-file COPY actions travel from a
-//! sibling dot-temp through durability and verification before Publish.
-//! Replacements and removals intentionally remain later SafetyNet slices.
+//! Destination mutation: a sibling dot-temp passes durability and verification
+//! before SafetyNet archives any old destination object and Publish renames the
+//! verified temp into place (ADR-0001 and ADR-0008).
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -31,12 +31,11 @@ extern "C" {
     ) -> isize;
 }
 
-/// Executes only COPY rows. This is deliberately narrow: an UPDATE/DELETE is
-/// displayed in the review but is never allowed to bypass SafetyNet.
 pub fn run(
     config_path: &Path,
     pair_name: &str,
     yes: bool,
+    permanent_delete: bool,
     excludes: &[String],
 ) -> Result<i32, AppError> {
     let (pair, plan) = plan::build(config_path, pair_name, excludes)?;
@@ -57,15 +56,41 @@ pub fn run(
 
     let (run_id, run_lock) = allocate_run_id(&pair.destination).map_err(io_error)?;
     let mut failed = 0;
-    for action in &plan.copies {
+    for (operation, action) in plan
+        .copies
+        .iter()
+        .map(|action| ("COPY", action))
+        .chain(plan.updates.iter().map(|action| ("UPDATE", action)))
+    {
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
-        if let Err(error) = copy_new_file(&source, &destination, action, &run_id) {
+        if let Err(error) = copy_file(
+            &pair.destination,
+            &source,
+            &destination,
+            action,
+            &run_id,
+            permanent_delete,
+        ) {
             failed += 1;
             eprintln!(
-                "vibesync: COPY {} failed: {error}",
+                "vibesync: {} {} failed: {error}",
+                operation,
                 action.rel_path.display()
             );
+        }
+    }
+    for action in &plan.deletes {
+        let destination = pair.destination.join(&action.rel_path);
+        if let Err(error) = remove_file(
+            &pair.destination,
+            &destination,
+            &action.rel_path,
+            &run_id,
+            permanent_delete,
+        ) {
+            failed += 1;
+            eprintln!("vibesync: DELETE {} failed: {error}", action.rel_path.display());
         }
     }
 
@@ -88,11 +113,13 @@ fn confirm() -> Result<bool, AppError> {
     ))
 }
 
-fn copy_new_file(
+fn copy_file(
+    destination_root: &Path,
     source: &Path,
     destination: &Path,
     action: &Action,
     run_id: &str,
+    permanent_delete: bool,
 ) -> io::Result<()> {
     let source_before = fs::metadata(source)?;
     let parent = destination
@@ -105,14 +132,13 @@ fn copy_new_file(
         copyfile_all_but_acls(source, &temp)?;
         fully_sync(&temp)?;
         let warnings = verify(source, &source_before, &temp, action.bytes)?;
-        // New-file-only slice: the plan promised this path did not exist.
-        // Refuse to replace an intervening write until SafetyNet exists.
-        if destination.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination appeared during copy",
-            ));
-        }
+        remove_file(
+            destination_root,
+            destination,
+            &action.rel_path,
+            run_id,
+            permanent_delete,
+        )?;
         fs::rename(&temp, destination)?;
         sync_directory(parent)?;
         for warning in warnings {
@@ -128,6 +154,77 @@ fn copy_new_file(
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Removes a final destination object only after the copy gate has passed,
+/// either by SafetyNet rename or by the deliberate per-run bypass. A missing
+/// path is harmless: a concurrent removal cannot be made safer by failing a
+/// verified Publish.
+fn remove_file(
+    destination_root: &Path,
+    destination: &Path,
+    relative_path: &Path,
+    run_id: &str,
+    permanent_delete: bool,
+) -> io::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_dir() => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination path is a directory",
+        )),
+        Ok(_) if permanent_delete => fs::remove_file(destination),
+        Ok(_) => archive_by_rename(destination_root, destination, relative_path, run_id),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Makes the old version visible in SafetyNet with its relative path kept
+/// intact. It is a same-volume rename rooted at the destination, never a
+/// copy, so the prior version remains independently restorable with Finder
+/// or `cp` alone.
+fn archive_by_rename(
+    destination_root: &Path,
+    destination: &Path,
+    relative_path: &Path,
+    run_id: &str,
+) -> io::Result<()> {
+    let archive = destination_root
+        .join("_SafetyNet")
+        .join(run_id)
+        .join(relative_path);
+    let archive_parent = archive.parent().expect("archive relative path has a parent");
+    fs::create_dir_all(archive_parent)?;
+    fs::rename(destination, &archive)?;
+    sync_directory(archive_parent)?;
+    if let Some(destination_parent) = destination.parent() {
+        sync_directory(destination_parent)?;
+    }
+    Ok(())
+}
+
+/// Deletes only direct, real Run folders below this pair's visible
+/// `_SafetyNet/` root. No run path is pruned automatically.
+pub fn prune(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
+    let config = crate::config::load(config_path)?;
+    let pair = config
+        .pairs
+        .get(pair_name)
+        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+    let safety_net = pair.destination.join("_SafetyNet");
+    let entries = match fs::read_dir(&safety_net) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(EXIT_OK),
+        Err(error) => return Err(io_error(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+        if metadata.file_type().is_dir() {
+            fs::remove_dir_all(entry.path()).map_err(io_error)?;
+        }
+    }
+    Ok(EXIT_OK)
 }
 
 fn temporary_path(destination: &Path, run_id: &str) -> PathBuf {
@@ -362,7 +459,14 @@ mod tests {
             reason: "new".to_string(),
         };
 
-        let result = copy_new_file(&source, &destination, &action, "20260716T120000Z");
+        let result = copy_file(
+            destination_dir.path(),
+            &source,
+            &destination,
+            &action,
+            "20260716T120000Z",
+            false,
+        );
 
         assert!(result.is_err());
         assert!(!destination.exists(), "an unverified file must not publish");
@@ -372,6 +476,37 @@ mod tests {
                 .next()
                 .is_none(),
             "failed copy leaves no temp behind"
+        );
+    }
+
+    #[test]
+    fn gate_failure_on_replacement_leaves_old_file_outside_safetynet() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("report.txt");
+        let destination = destination_dir.path().join("report.txt");
+        fs::write(&source, "new version").unwrap();
+        fs::write(&destination, "old version").unwrap();
+        let action = Action {
+            rel_path: PathBuf::from("report.txt"),
+            bytes: 1,
+            reason: "size differs".to_string(),
+        };
+
+        let result = copy_file(
+            destination_dir.path(),
+            &source,
+            &destination,
+            &action,
+            "20260716T120000Z",
+            false,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "old version");
+        assert!(
+            !destination_dir.path().join("_SafetyNet").exists(),
+            "archive is strictly after the verification gate"
         );
     }
 }
