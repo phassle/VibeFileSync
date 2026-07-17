@@ -4,10 +4,11 @@ Dynamic Implement turns one spec-level tracker issue into planned, tested, indep
 
 ## Install
 
-Install both portable skill directories for the harnesses used by the team:
+Install these portable skill directories for the harnesses used by the team:
 
 - `dynamic-implement`
 - `setup-dynamic-skills`
+- `calibrate-dynamic-models`
 
 Also install Matt Pocock's official engineering skills. `implement`, `tdd`, `code-review`, and `setup-matt-pocock-skills` are mandatory. Dynamic Implement stops before mutation when they are unavailable.
 
@@ -21,21 +22,31 @@ Common personal locations:
 | OpenCode | `~/.config/opencode/skills/` or `~/.agents/skills/` |
 | Pi | `~/.pi/agent/skills/` or `~/.agents/skills/` |
 
-Keep capability profiles, credentials, calibration caches, and run ledgers outside the repository. The default capability profile is `~/.agents/dynamic-skills/capabilities.json`.
+Keep credentials, the machine-local capability profile, disposable caches, and run ledgers outside the repository. The default capability profile is `~/.agents/dynamic-skills/capabilities.json`.
+
+Keep learned model/effort outcomes in the repository at `.agents/dynamic-implement/model-calibration.json`. This tracked file belongs to the team and survives skill installation or upgrades. Never store learned findings inside `.agents/skills/`, `~/.agents/skills/`, or `~/.codex/skills/`.
 
 ## Set up capabilities
 
-Run `setup-dynamic-skills` on first use, after authentication/harness changes, when a selected route fails, or after the model catalog expires.
+Run `setup-dynamic-skills` manually on first use, after authentication/harness changes, when a selected route fails, or after the model catalog expires. Dynamic Implement never starts setup automatically: it stops before mutation, reports the exact missing/stale evidence, and tells the user which setup command to invoke. After setup succeeds, invoke Dynamic Implement again.
+
+| Harness | Manual setup entry |
+| --- | --- |
+| Codex | `$setup-dynamic-skills` or select it through `/skills` |
+| Claude Code | `/setup-dynamic-skills` |
+| GitHub Copilot | `/setup-dynamic-skills` |
+| OpenCode | `/setup-dynamic-skills` through its command adapter |
+| Pi | `/skill:setup-dynamic-skills` |
 
 Setup performs three separate jobs:
 
-1. Research current selectable models from installed harness surfaces and official documentation.
-2. Live-verify only the routes the user approves and can actually call.
-3. Map verified routes to Small/Luna, Medium/Terra, and Large/Sol.
+1. Research current selectable models and every native reasoning-effort value from installed harness surfaces and official documentation.
+2. Show the complete model/effort probe matrix and expected paid ceiling, then live-verify only combinations the user approves and can actually call.
+3. Map verified routes to Small/Luna, Medium/Terra, and Large/Sol and build one deterministic flat escalation ladder.
 
-The researched catalog expires after 14 days. A refresh researches the current model surface again before extending the expiry. Catalog freshness is separate from outcome calibration: the catalog says which models exist now; issue telemetry teaches which tier comparable work needed.
+The researched catalog expires after 14 days. A refresh researches the complete model/effort surface again before extending the expiry. Catalog freshness is separate from outcome calibration: the local catalog says which exact combinations this installation can call now; issue telemetry and the tracked team profile teach which combination comparable work needed.
 
-A tier bump is real only when it maps to a distinct verified route. Setup records no-op tier mappings explicitly. Paid probes require prior disclosure and approval.
+A ladder step is usable only when its exact harness, model, and effort combination passed a live probe. Setup orders all verified effort steps within a model before moving to the next genuinely stronger model, then deduplicates no-op tier mappings. Advertised or declined combinations remain candidates and are never selected automatically. Paid probes require prior disclosure and approval.
 
 ## Invoke explicitly
 
@@ -74,9 +85,11 @@ The fresh planner decomposes the full issue graph, orders dependencies, identifi
 
 Implementers invoke Matt's `implement`, use TDD at agreed public seams, run focused and full checks, run Matt's two-axis review, and commit before handoff.
 
-Escalation begins at the smallest suitable verified tier. Two valid material non-clean review/fix passes trigger a bump even if the later pass reveals different findings. A higher-tier replacement receives an artifact handoff—SHAs, diffs, failing commands, raw reports, acceptance rows, and cited scope decisions—so it learns from prior attempts without inheriting conversation or private reasoning.
+The start is selected by planner triage plus the repository-owned calibration profile, not by always beginning at the cheapest step. Escalation first raises effort on the current model and changes model only after its verified effort steps are exhausted. A valid material non-clean review/fix pass may raise effort early. A replacement receives an artifact handoff—SHAs, diffs, failing commands, raw reports, acceptance rows, and cited scope decisions—so it learns from prior attempts without inheriting conversation or private reasoning.
 
-Per-issue telemetry records triage, routes, escalation, reported cost/usage, review outcome, and integration evidence in a managed issue-body section. Unknown cost remains `null`; it is never estimated. Before the feature PR, calibration reads all completed child issues and prepares routing feedback for the next root run.
+Calibration may schedule at most one controlled, low-risk boundary probe one verified step below a predicted start for a comparable group. It is never repeated on every issue and never used for reviewers. A lower-step capability failure followed by success at the predicted step is useful boundary evidence; it does not bypass the multi-issue threshold for changing the team default.
+
+Per-issue telemetry records triage, exact model and effort, ladder step, boundary-probe purpose, escalation, reported cost/usage, review outcome, and integration evidence in a managed issue-body section. Unknown cost or effort remains `null`/`unknown`; historical values are never guessed. Before the feature PR, calibration reads all completed child issues and atomically updates `.agents/dynamic-implement/model-calibration.json` on the feature branch for the next root run.
 
 ## Independent review
 
@@ -86,7 +99,7 @@ Matt's `code-review` remains mandatory and keeps Standards and Spec separate. Wh
 
 ## Observe and resume
 
-Every role writes structured English events to its private directory. The coordinator announces the run-state path. Follow live activity with:
+Every role writes structured English events to its private directory. Schema-v2 events always record model and effort together. The coordinator announces the run-state path. Follow live activity with:
 
 ```sh
 tail -F <run-state>/activity/*/activity.log
