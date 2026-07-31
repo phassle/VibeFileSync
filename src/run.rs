@@ -134,8 +134,9 @@ pub fn run(
                 );
                 if error.raw_os_error() == Some(libc::ENOSPC) {
                     eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
-                    break;
                 }
+                journal.summary(&stats).map_err(journal_runtime_error)?;
+                return Ok(1);
             }
         }
     }

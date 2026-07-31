@@ -798,22 +798,27 @@ fn run_publishes_no_temp_files_after_a_successful_copy() {
 }
 
 #[test]
-fn a_failed_copy_never_replaces_the_final_path_and_other_copies_continue() {
+fn a_failed_copy_stops_remaining_mutations() {
     let fx = Fixture::new();
     fx.write_source("blocked.txt", "would be partial if published");
     fx.write_source("good.txt", "this copy should still finish");
     // Directories are not plan entries, so this models a destination object
     // appearing after the fresh scan; Slice 3 must refuse to replace it.
     fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    fx.write_dest("would-be-deleted.txt", "keep me");
     fx.add_photos_pair();
 
     let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
 
     assert_eq!(output.status.code(), Some(1));
     assert!(fx.destination.path().join("blocked.txt").is_dir());
-    assert_eq!(
-        fs::read_to_string(fx.destination.path().join("good.txt")).unwrap(),
-        "this copy should still finish"
+    assert!(
+        !fx.destination.path().join("good.txt").exists(),
+        "a copy failure must stop later copies"
+    );
+    assert!(
+        fx.destination.path().join("would-be-deleted.txt").exists(),
+        "a copy failure must stop Mirror deletions"
     );
     assert!(
         fs::read_dir(fx.destination.path())
@@ -1078,6 +1083,7 @@ fn injected_enospc_discards_temp_retains_commits_and_exits_nonzero() {
     let fx = Fixture::new();
     fx.write_source("a-committed.txt", "first");
     fx.write_source("z-full.txt", "second");
+    fx.write_dest("would-be-deleted.txt", "keep me");
     fx.add_photos_pair();
 
     let output = fx
@@ -1093,6 +1099,10 @@ fn injected_enospc_discards_temp_retains_commits_and_exits_nonzero() {
         "first"
     );
     assert!(!fx.destination.path().join("z-full.txt").exists());
+    assert!(
+        fx.destination.path().join("would-be-deleted.txt").exists(),
+        "a copy failure must stop remaining Mirror deletions"
+    );
     let names: Vec<_> = fs::read_dir(fx.destination.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
