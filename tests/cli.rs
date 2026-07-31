@@ -14,10 +14,11 @@ use std::path::Path;
 use std::process::Command as ProcessCommand;
 
 const EXIT_OK: i32 = 0;
+const EXIT_PARTIAL: i32 = 1;
 const EXIT_PRECONDITION: i32 = 2;
+const EXIT_BLOCKED_PLAN: i32 = 3;
 const EXIT_INTERRUPTED: i32 = 4;
 const EXIT_USAGE: i32 = 64;
-const EXIT_UNIMPLEMENTED: i32 = 69;
 
 fn vibesync(config_home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("vibesync").expect("binary builds");
@@ -375,7 +376,7 @@ fn bad_config_aborts_before_an_unimplemented_verb_runs() {
 }
 
 #[test]
-fn run_stub_accepts_the_adr_0004_per_run_flags() {
+fn run_accepts_the_adr_0004_per_run_flags() {
     let fx = Fixture::new();
     fx.cmd()
         .args([
@@ -386,30 +387,191 @@ fn run_stub_accepts_the_adr_0004_per_run_flags() {
             "--permanent-delete",
             "--allow-empty-source",
             "--ignore-space-check",
+            "--verify",
             "--exclude",
             "some/relative/path",
         ])
         .assert()
-        .code(EXIT_UNIMPLEMENTED);
+        .code(EXIT_USAGE);
 }
 
 #[test]
-fn plan_json_is_not_yet_implemented() {
-    // The human `plan` diff ships in this slice; the NDJSON
-    // `vibefilesync.plan/v1` stream is a later one.
+fn plan_json_stream_has_versioned_rows_in_contract_order_and_pure_stdout() {
     let fx = Fixture::new();
+    fx.write_source("new.txt", "new");
+    fx.write_source("changed.txt", "new value");
+    fx.write_dest("changed.txt", "old");
+    fx.write_dest("removed.txt", "gone");
     fx.add_photos_pair();
 
     let output = fx
         .cmd()
-        .args(["plan", "photos", "--json", "--exclude", "a/b"])
+        .args(["plan", "photos", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_UNIMPLEMENTED));
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
     assert!(
-        stderr.contains("not yet implemented"),
-        "plan --json should say not yet implemented: {stderr}"
+        output.stderr.is_empty(),
+        "JSON plan must not log: {:?}",
+        output.stderr
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(rows.first().unwrap()["type"], "plan_start");
+    assert_eq!(rows.last().unwrap()["type"], "summary");
+    assert!(rows[1..rows.len() - 1]
+        .iter()
+        .all(|row| row["type"] == "action"));
+    assert!(rows
+        .iter()
+        .all(|row| row["schema"] == "vibefilesync.plan/v1"));
+    assert_eq!(rows[0]["pair"], "photos");
+    assert_eq!(rows[0]["mode"], "mirror");
+    assert_eq!(rows[0]["dry_run"], true);
+    let update = rows.iter().find(|row| row["op"] == "update").unwrap();
+    assert_eq!(update["path"], "changed.txt");
+    assert_eq!(update["bytes"], 9);
+    assert_eq!(update["old_bytes"], 3);
+    assert!(update["safety_net"]
+        .as_str()
+        .unwrap()
+        .contains("_SafetyNet/"));
+    let delete = rows.iter().find(|row| row["op"] == "delete").unwrap();
+    assert_eq!(delete["old_bytes"], 4);
+    assert!(delete.get("bytes").is_none());
+    assert_eq!(rows.last().unwrap()["counts"]["copy"], 1);
+}
+
+#[test]
+fn run_json_stream_reports_execution_order_verification_and_safetynet() {
+    let fx = Fixture::new();
+    fx.write_source("created.txt", "created");
+    fx.write_source("updated.txt", "new value");
+    fx.write_dest("updated.txt", "old");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--json", "--yes", "--verify"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert!(
+        output.stderr.is_empty(),
+        "JSON run must not log: {:?}",
+        output.stderr
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line is JSON"))
+        .collect();
+    assert!(rows
+        .iter()
+        .all(|row| row["schema"] == "vibefilesync.run/v1"));
+    assert_eq!(rows.first().unwrap()["type"], "run_start");
+    assert_eq!(rows.last().unwrap()["type"], "summary");
+    assert!(rows[0]["degradations"].is_array());
+    for path in ["created.txt", "updated.txt"] {
+        let events: Vec<_> = rows.iter().filter(|row| row["path"] == path).collect();
+        assert_eq!(events.first().unwrap()["type"], "action_start");
+        assert_eq!(events.last().unwrap()["type"], "action_done");
+        assert_eq!(events.last().unwrap()["result"], "done");
+        assert_eq!(events.last().unwrap()["verified"], "full");
+    }
+    let updated = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "updated.txt")
+        .unwrap();
+    assert!(updated["safety_net"]
+        .as_str()
+        .unwrap()
+        .contains("_SafetyNet/"));
+    assert_eq!(rows.last().unwrap()["warnings"], 0);
+}
+
+#[test]
+fn run_json_progress_is_large_file_only_and_bounded() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.source.path().join("large.bin"),
+        vec![7_u8; 8 * 1024 * 1024],
+    )
+    .unwrap();
+    fx.write_source("small.txt", "small");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let progress: Vec<_> = rows
+        .iter()
+        .filter(|row| row["type"] == "progress")
+        .collect();
+    assert_eq!(
+        progress.len(),
+        2,
+        "start and completion updates stay bounded"
+    );
+    assert_eq!(progress[0]["path"], "large.bin");
+    assert_eq!(progress[0]["bytes"], 0);
+    assert_eq!(progress[1]["bytes"], 8 * 1024 * 1024);
+    assert!(!progress.iter().any(|row| row["path"] == "small.txt"));
+}
+
+#[test]
+fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
+    let fx = Fixture::new();
+    fx.write_source("blocked.txt", "contents");
+    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    fx.add_photos_pair();
+    assert_eq!(
+        fx.cmd()
+            .args(["run", "photos", "--json", "--yes"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(EXIT_PARTIAL)
+    );
+
+    let missing = Fixture::new();
+    missing.add_photos_pair();
+    fs::remove_dir_all(missing.source.path()).unwrap();
+    assert_eq!(
+        missing
+            .cmd()
+            .args(["run", "photos", "--json", "--yes"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(EXIT_PRECONDITION)
+    );
+
+    assert_eq!(
+        fx.cmd()
+            .args(["run", "photos", "--json", "--unknown"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(EXIT_USAGE)
+    );
+    assert_eq!(
+        EXIT_BLOCKED_PLAN, 3,
+        "blocked-plan taxonomy is reserved for included error rows"
     );
 }
 

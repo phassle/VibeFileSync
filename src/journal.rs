@@ -149,7 +149,12 @@ impl Journal {
         action: &Action,
         safety_net: Option<&Path>,
         warnings: &[String],
+        verified: Option<&str>,
     ) -> io::Result<()> {
+        let warnings: Vec<_> = warnings
+            .iter()
+            .map(|detail| json!({"code":"metadata_mismatch","detail":detail}))
+            .collect();
         self.append(
             json!({
                 "schema": SCHEMA,
@@ -159,7 +164,7 @@ impl Journal {
                 "path": path_text(&action.rel_path),
                 "result": "done",
                 "bytes": action.bytes,
-                "verified": if matches!(operation, Operation::Delete) { Value::Null } else { json!("standard") },
+                "verified": verified.map_or(Value::Null, |tier| json!(tier)),
                 "safety_net": safety_net.map(path_text),
                 "warnings": warnings,
             }),
@@ -182,7 +187,7 @@ impl Journal {
                 "path": path_text(&action.rel_path),
                 "result": "failed",
                 "bytes": action.bytes,
-                "reason": reason,
+                "reason": normalized_reason(reason),
                 "warnings": [],
             }),
             false,
@@ -211,6 +216,39 @@ impl Journal {
             self.file.sync_all()?;
         }
         Ok(())
+    }
+}
+
+fn normalized_reason(reason: &str) -> &str {
+    if reason.contains("source changed") {
+        "source_changed"
+    } else if reason.contains("verify mismatch") {
+        "verify_mismatch"
+    } else {
+        reason
+    }
+}
+
+pub fn available_run_id(pair_name: &str, destination_root: &Path) -> io::Result<String> {
+    let directory = pair_directory(pair_name);
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    let base = utc_basic(seconds);
+    let mut suffix = 1_u32;
+    loop {
+        let run_id = if suffix == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{suffix}")
+        };
+        if !destination_root.join("_SafetyNet").join(&run_id).exists()
+            && !directory.join(format!("{run_id}.ndjson")).exists()
+        {
+            return Ok(run_id);
+        }
+        suffix = next_suffix(suffix)?;
     }
 }
 

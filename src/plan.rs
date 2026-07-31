@@ -43,6 +43,7 @@ pub struct Entry {
 pub struct Action {
     pub rel_path: PathBuf,
     pub bytes: u64,
+    pub old_bytes: Option<u64>,
     pub reason: String,
 }
 
@@ -94,6 +95,13 @@ fn is_machinery(name: &OsStr) -> bool {
 /// deterministically sorted. Symlinks are recorded via `symlink_metadata`
 /// (never followed), so a symlinked directory is one entry, not a subtree.
 fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
+    scan_with(root, |_, _| Ok(()))
+}
+
+fn scan_with(
+    root: &Path,
+    mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
+) -> io::Result<BTreeMap<PathBuf, Entry>> {
     let mut map = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
 
@@ -117,14 +125,13 @@ fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
                 .strip_prefix(root)
                 .expect("read_dir path is under root")
                 .to_path_buf();
-            map.insert(
-                rel,
-                Entry {
-                    size: meta.len(),
-                    mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    is_symlink: file_type.is_symlink(),
-                },
-            );
+            let scanned = Entry {
+                size: meta.len(),
+                mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                is_symlink: file_type.is_symlink(),
+            };
+            visit(&rel, &scanned)?;
+            map.insert(rel, scanned);
         }
     }
 
@@ -183,6 +190,7 @@ pub fn compute(
             None => plan.copies.push(Action {
                 rel_path: rel.clone(),
                 bytes: src.size,
+                old_bytes: None,
                 reason: "new".to_string(),
             }),
             Some(dst) => {
@@ -190,6 +198,7 @@ pub fn compute(
                     plan.updates.push(Action {
                         rel_path: rel.clone(),
                         bytes: src.size,
+                        old_bytes: Some(dst.size),
                         reason: reason.to_string(),
                     });
                 } else {
@@ -213,6 +222,7 @@ pub fn compute(
             plan.deletes.push(Action {
                 rel_path: rel.clone(),
                 bytes: dst.size,
+                old_bytes: Some(dst.size),
                 reason: "not in source".to_string(),
             });
         }
@@ -359,6 +369,118 @@ pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i
     let (pair, plan) = build(config_path, pair_name, excludes)?;
     print!("{}", render(&plan, pair_name, pair.mode));
     Ok(crate::error::EXIT_OK)
+}
+
+/// Streams the versioned Dry-run contract as one flushed JSON object per
+/// line. Rows are emitted individually and never assembled into a JSON
+/// document, keeping the public wire format incremental and constant-space.
+pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
+    let cfg = config::load(config_path)?;
+    let configured = cfg
+        .pairs
+        .get(pair_name)
+        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+    let (header_pair, _) = crate::preconditions::resolve_pair(configured)?;
+    if !header_pair.source.is_dir() {
+        return Err(AppError::Precondition(format!(
+            "{}: source directory not found (is the volume mounted?)",
+            header_pair.source.display()
+        )));
+    }
+    let run_id = crate::journal::available_run_id(pair_name, &header_pair.destination)
+        .map_err(scan_error_for_json)?;
+    emit(serde_json::json!({
+        "schema": "vibefilesync.plan/v1", "type": "plan_start", "run_id": run_id,
+        "pair": pair_name, "mode": header_pair.mode, "dry_run": true
+    }))?;
+    let destination = if header_pair.destination.is_dir() {
+        scan(&header_pair.destination).map_err(|e| scan_error(&header_pair.destination, e))?
+    } else {
+        BTreeMap::new()
+    };
+    let supports_symlinks = volume::filesystem_type(&header_pair.destination)
+        .map(|kind| !kind.eq_ignore_ascii_case("exfat"))
+        .unwrap_or(true);
+    let mut plan = Plan {
+        destination_entries: destination.len(),
+        ..Plan::default()
+    };
+    let source = scan_with(&header_pair.source, |path, entry| {
+        plan.scanned += 1;
+        if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+            plan.excluded += 1;
+            return Ok(());
+        }
+        let row = if entry.is_symlink && !supports_symlinks {
+            plan.errors.push(PlanError { rel_path: path.to_path_buf(), message: "symlink not supported on exFAT destination".into() });
+            serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","run_id":run_id,"op":"error","path":path.to_string_lossy(),"reason":"symlink not supported on exFAT destination"})
+        } else if let Some(old) = destination.get(path) {
+            match change_reason(entry, old) {
+                Some(reason) => {
+                    let action = Action { rel_path: path.to_path_buf(), bytes: entry.size, old_bytes: Some(old.size), reason: reason.into() };
+                    let row = plan_action_row(&run_id, "update", &action);
+                    plan.updates.push(action);
+                    row
+                }
+                None => { plan.unchanged += 1; return Ok(()); }
+            }
+        } else {
+            let action = Action { rel_path: path.to_path_buf(), bytes: entry.size, old_bytes: None, reason: "new".into() };
+            let row = plan_action_row(&run_id, "copy", &action);
+            plan.copies.push(action);
+            row
+        };
+        crate::ndjson::stdout(&row).map_err(io::Error::other)
+    }).map_err(|e| scan_error(&header_pair.source, e))?;
+    plan.source_entries = source.len();
+    if header_pair.mode == Mode::Mirror {
+        for (path, entry) in &destination {
+            if source.contains_key(path) {
+                continue;
+            }
+            plan.scanned += 1;
+            if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+                plan.excluded += 1;
+                continue;
+            }
+            let action = Action {
+                rel_path: path.clone(),
+                bytes: entry.size,
+                old_bytes: Some(entry.size),
+                reason: "not in source".into(),
+            };
+            emit(plan_action_row(&run_id, "delete", &action))?;
+            plan.deletes.push(action);
+        }
+    }
+    emit(serde_json::json!({
+        "schema": "vibefilesync.plan/v1", "type": "summary", "run_id": run_id,
+        "counts": {"copy": plan.copies.len(), "update": plan.updates.len(), "delete": plan.deletes.len(), "error": plan.errors.len()},
+        "scanned": plan.scanned, "unchanged": plan.unchanged, "excluded": plan.excluded
+    }))?;
+    Ok(crate::error::EXIT_OK)
+}
+
+fn plan_action_row(run_id: &str, op: &str, action: &Action) -> serde_json::Value {
+    let mut row = serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","run_id":run_id,"op":op,"path":action.rel_path.to_string_lossy(),"reason":action.reason});
+    if op != "delete" {
+        row["bytes"] = action.bytes.into();
+    }
+    if let Some(bytes) = action.old_bytes {
+        row["old_bytes"] = bytes.into();
+    }
+    if op == "update" || op == "delete" {
+        row["safety_net"] = format!("_SafetyNet/{run_id}/{}", action.rel_path.display()).into();
+    }
+    row
+}
+
+fn emit(value: serde_json::Value) -> Result<(), AppError> {
+    crate::ndjson::stdout(&value)
+}
+
+fn scan_error_for_json(error: io::Error) -> AppError {
+    AppError::Precondition(error.to_string())
 }
 
 /// Builds a fresh plan for the CLI edges which need to render it and then

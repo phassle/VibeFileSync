@@ -4,7 +4,7 @@
 
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use crate::plan::{self, Action};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
 const F_FULLFSYNC: libc::c_int = 51;
+const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
 
 extern "C" {
     fn copyfile(
@@ -32,39 +33,58 @@ extern "C" {
     ) -> isize;
 }
 
-pub fn run(
-    config_path: &Path,
-    pair_name: &str,
-    yes: bool,
-    permanent_delete: bool,
-    allow_empty_source: bool,
-    ignore_space_check: bool,
-    excludes: &[String],
-) -> Result<i32, AppError> {
+pub struct RunOptions<'a> {
+    pub yes: bool,
+    pub permanent_delete: bool,
+    pub allow_empty_source: bool,
+    pub ignore_space_check: bool,
+    pub json_output: bool,
+    pub full_verify: bool,
+    pub excludes: &'a [String],
+}
+
+pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
+    let RunOptions {
+        yes,
+        permanent_delete,
+        allow_empty_source,
+        ignore_space_check,
+        json_output,
+        full_verify,
+        excludes,
+    } = options;
     let config = crate::config::load(config_path)?;
     if !config.pairs.contains_key(pair_name) {
         return Err(AppError::Usage(format!("pair '{pair_name}' not found")));
     }
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, plan) = plan::build(config_path, pair_name, excludes)?;
-    print!("{}", plan::render(&plan, pair_name, pair.mode));
+    if !json_output {
+        print!("{}", plan::render(&plan, pair_name, pair.mode));
+    }
 
     let run_warnings =
         crate::preconditions::check_run(&pair, &plan, allow_empty_source, ignore_space_check)?;
     for warning in &run_warnings {
-        eprintln!("{warning}");
+        if !json_output {
+            eprintln!("{warning}");
+        }
     }
 
     if !plan.errors.is_empty() {
-        eprintln!(
-            "vibesync: run blocked by {} plan error(s)",
-            plan.errors.len()
-        );
+        if !json_output {
+            eprintln!(
+                "vibesync: run blocked by {} plan error(s)",
+                plan.errors.len()
+            );
+        }
         return Ok(EXIT_BLOCKED_PLAN);
     }
 
-    if !yes && !confirm()? {
-        println!("Run cancelled; destination unchanged.");
+    if !yes && !confirm(json_output)? {
+        if !json_output {
+            println!("Run cancelled; destination unchanged.");
+        }
         return Ok(EXIT_OK);
     }
 
@@ -72,6 +92,14 @@ pub fn run(
     journal
         .run_start(pair_name, &plan, &run_warnings)
         .map_err(io_error)?;
+    if json_output {
+        emit_run(serde_json::json!({
+            "schema": "vibefilesync.run/v1", "type": "run_start", "run_id": journal.run_id(),
+                "pair": pair_name, "mode": pair.mode, "degradations": expected_degradations(&pair.destination),
+                "warnings": run_warnings,
+            "planned": plan.copies.len() + plan.updates.len() + plan.deletes.len()
+        }))?;
+    }
     let mut stats = RunStats {
         counts: Counts {
             planned: plan.copies.len() + plan.updates.len() + plan.deletes.len(),
@@ -85,25 +113,52 @@ pub fn run(
             bytes: fs::metadata(pair.destination.join(stray))
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
+            old_bytes: None,
             reason: "abandoned temp".to_string(),
         };
         journal
             .action_start(Operation::Cleanup, &action, None, None)
             .map_err(journal_runtime_error)?;
+        if json_output {
+            emit_action_start(journal.run_id(), Operation::Cleanup, &action)?;
+        }
         match fs::remove_file(pair.destination.join(stray)) {
             Ok(()) => {
                 journal
-                    .action_done(Operation::Cleanup, &action, None, &[])
+                    .action_done(Operation::Cleanup, &action, None, &[], None)
                     .map_err(journal_runtime_error)?;
-                println!("Cleaned stray temp: {}", stray.display());
+                if json_output {
+                    emit_action_done(
+                        journal.run_id(),
+                        Operation::Cleanup,
+                        &action,
+                        None,
+                        &[],
+                        false,
+                    )?;
+                } else {
+                    println!("Cleaned stray temp: {}", stray.display());
+                }
             }
             Err(error) => {
                 stats.counts.failed += 1;
                 journal
                     .action_failed(Operation::Cleanup, &action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                eprintln!("vibesync: cleanup {} failed: {error}", stray.display());
+                if json_output {
+                    emit_action_failed(
+                        journal.run_id(),
+                        Operation::Cleanup,
+                        &action,
+                        &error.to_string(),
+                    )?;
+                } else {
+                    eprintln!("vibesync: cleanup {} failed: {error}", stray.display());
+                }
                 journal.summary(&stats).map_err(journal_runtime_error)?;
+                if json_output {
+                    emit_summary(journal.run_id(), &stats)?;
+                }
                 return Ok(1);
             }
         }
@@ -124,27 +179,54 @@ pub fn run(
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
+        if json_output {
+            emit_action_start(journal.run_id(), operation, action)?;
+            if action.bytes >= PROGRESS_THRESHOLD {
+                emit_run(
+                    serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":journal.run_id(),"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":0,"total_bytes":action.bytes}),
+                )?;
+            }
+        }
         match copy_file(
             &pair.destination,
             &source,
             &destination,
             &temp,
             action,
-            journal.run_id(),
-            permanent_delete,
+            CopyOptions {
+                run_id: journal.run_id(),
+                permanent_delete,
+                full_verify,
+            },
         ) {
             Ok(outcome) => {
+                if json_output && action.bytes >= PROGRESS_THRESHOLD {
+                    emit_run(
+                        serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":journal.run_id(),"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":action.bytes,"total_bytes":action.bytes}),
+                    )?;
+                }
                 journal
                     .action_done(
                         operation,
                         action,
                         outcome.safety_net.as_deref(),
                         &outcome.warnings,
+                        Some(if full_verify { "full" } else { "standard" }),
                     )
                     .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
                 stats.bytes += action.bytes;
                 stats.warnings += outcome.warnings.len();
+                if json_output {
+                    emit_action_done(
+                        journal.run_id(),
+                        operation,
+                        action,
+                        outcome.safety_net.as_deref(),
+                        &outcome.warnings,
+                        full_verify,
+                    )?;
+                }
                 match operation {
                     Operation::Copy => stats.counts.copied += 1,
                     Operation::Update => stats.counts.updated += 1,
@@ -158,16 +240,30 @@ pub fn run(
                 journal
                     .action_failed(operation, action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                eprintln!(
-                    "vibesync: {} {} failed: {error}",
-                    operation.as_str().to_ascii_uppercase(),
-                    action.rel_path.display()
-                );
-                if error.raw_os_error() == Some(libc::ENOSPC) {
+                if json_output {
+                    emit_action_failed(
+                        journal.run_id(),
+                        operation,
+                        action,
+                        &failure_reason(&error),
+                    )?;
+                } else {
+                    eprintln!(
+                        "vibesync: {} {} failed: {error}",
+                        operation.as_str().to_ascii_uppercase(),
+                        action.rel_path.display()
+                    );
+                }
+                if !json_output && error.raw_os_error() == Some(libc::ENOSPC) {
                     eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
                 }
-                journal.summary(&stats).map_err(journal_runtime_error)?;
-                return Ok(1);
+                if error.kind() != io::ErrorKind::InvalidData {
+                    journal.summary(&stats).map_err(journal_runtime_error)?;
+                    if json_output {
+                        emit_summary(journal.run_id(), &stats)?;
+                    }
+                    return Ok(1);
+                }
             }
         }
     }
@@ -176,6 +272,9 @@ pub fn run(
         journal
             .action_start(Operation::Delete, action, None, None)
             .map_err(journal_runtime_error)?;
+        if json_output {
+            emit_action_start(journal.run_id(), Operation::Delete, action)?;
+        }
         match remove_file(
             &pair.destination,
             &destination,
@@ -185,26 +284,48 @@ pub fn run(
         ) {
             Ok(safety_net) => {
                 journal
-                    .action_done(Operation::Delete, action, safety_net.as_deref(), &[])
+                    .action_done(Operation::Delete, action, safety_net.as_deref(), &[], None)
                     .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
                 stats.counts.deleted += 1;
                 stats.bytes += action.bytes;
+                if json_output {
+                    emit_action_done(
+                        journal.run_id(),
+                        Operation::Delete,
+                        action,
+                        safety_net.as_deref(),
+                        &[],
+                        false,
+                    )?;
+                }
             }
             Err(error) => {
                 stats.counts.failed += 1;
                 journal
                     .action_failed(Operation::Delete, action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                eprintln!(
-                    "vibesync: DELETE {} failed: {error}",
-                    action.rel_path.display()
-                );
+                if json_output {
+                    emit_action_failed(
+                        journal.run_id(),
+                        Operation::Delete,
+                        action,
+                        &error.to_string(),
+                    )?;
+                } else {
+                    eprintln!(
+                        "vibesync: DELETE {} failed: {error}",
+                        action.rel_path.display()
+                    );
+                }
             }
         }
     }
 
     journal.summary(&stats).map_err(journal_runtime_error)?;
+    if json_output {
+        emit_summary(journal.run_id(), &stats)?;
+    }
     if stats.counts.failed == 0 {
         Ok(EXIT_OK)
     } else {
@@ -212,9 +333,14 @@ pub fn run(
     }
 }
 
-fn confirm() -> Result<bool, AppError> {
-    print!("Proceed with COPY actions? [y/N] ");
-    io::stdout().flush().map_err(io_error)?;
+fn confirm(json_output: bool) -> Result<bool, AppError> {
+    if json_output {
+        eprint!("Proceed with COPY actions? [y/N] ");
+        io::stderr().flush().map_err(io_error)?;
+    } else {
+        print!("Proceed with COPY actions? [y/N] ");
+        io::stdout().flush().map_err(io_error)?;
+    }
     let mut response = String::new();
     io::stdin().read_line(&mut response).map_err(io_error)?;
     Ok(matches!(
@@ -223,15 +349,31 @@ fn confirm() -> Result<bool, AppError> {
     ))
 }
 
+fn expected_degradations(destination: &Path) -> Vec<&'static str> {
+    match crate::volume::filesystem_type(destination) {
+        Ok(kind) if kind.eq_ignore_ascii_case("exfat") => vec![
+            "posix_permissions",
+            "acls",
+            "bsd_flags",
+            "timestamp_granularity",
+        ],
+        _ => Vec::new(),
+    }
+}
+
 fn copy_file(
     destination_root: &Path,
     source: &Path,
     destination: &Path,
     temp: &Path,
     action: &Action,
-    run_id: &str,
-    permanent_delete: bool,
+    options: CopyOptions<'_>,
 ) -> io::Result<ActionOutcome> {
+    let CopyOptions {
+        run_id,
+        permanent_delete,
+        full_verify,
+    } = options;
     let source_before = fs::metadata(source)?;
     let parent = destination
         .parent()
@@ -247,7 +389,7 @@ fn copy_file(
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
         fully_sync(temp)?;
-        let warnings = verify(source, &source_before, temp, action.bytes)?;
+        let warnings = verify(source, &source_before, temp, action.bytes, full_verify)?;
         let safety_net = remove_file(
             destination_root,
             destination,
@@ -273,6 +415,12 @@ fn copy_file(
         let _ = fs::remove_file(temp);
     }
     result
+}
+
+struct CopyOptions<'a> {
+    run_id: &'a str,
+    permanent_delete: bool,
+    full_verify: bool,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -426,6 +574,7 @@ fn verify(
     source_before: &fs::Metadata,
     temp: &Path,
     planned_size: u64,
+    full_verify: bool,
 ) -> io::Result<Vec<String>> {
     let source_after = fs::metadata(source)?;
     if source_after.len() != source_before.len()
@@ -441,6 +590,12 @@ fn verify(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "verify mismatch: size differs",
+        ));
+    }
+    if full_verify && !files_equal(source, temp)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verify mismatch: content differs",
         ));
     }
     let source_mtime = source_after.modified()?;
@@ -472,6 +627,86 @@ fn verify(
         warnings.push("xattr names differ".to_string());
     }
     Ok(warnings)
+}
+
+fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    let mut a = [0_u8; 64 * 1024];
+    let mut b = [0_u8; 64 * 1024];
+    loop {
+        let an = left.read(&mut a)?;
+        let bn = right.read(&mut b)?;
+        if an != bn || a[..an] != b[..bn] {
+            return Ok(false);
+        }
+        if an == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn emit_run(value: serde_json::Value) -> Result<(), AppError> {
+    crate::ndjson::stdout(&value)
+}
+
+fn emit_action_start(run_id: &str, operation: Operation, action: &Action) -> Result<(), AppError> {
+    emit_run(
+        serde_json::json!({"schema":"vibefilesync.run/v1","type":"action_start","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":action.bytes}),
+    )
+}
+
+fn emit_action_done(
+    run_id: &str,
+    operation: Operation,
+    action: &Action,
+    safety_net: Option<&Path>,
+    warnings: &[String],
+    full_verify: bool,
+) -> Result<(), AppError> {
+    let structured: Vec<_> = warnings
+        .iter()
+        .map(|detail| serde_json::json!({"code":"metadata_mismatch","detail":detail}))
+        .collect();
+    let mut row = serde_json::json!({"schema":"vibefilesync.run/v1","type":"action_done","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"result":"done","bytes":action.bytes});
+    if !matches!(operation, Operation::Delete) {
+        row["verified"] = (if full_verify { "full" } else { "standard" }).into();
+    }
+    if let Some(path) = safety_net {
+        row["safety_net"] = path.to_string_lossy().into_owned().into();
+    }
+    if !structured.is_empty() {
+        row["warnings"] = structured.into();
+    }
+    emit_run(row)
+}
+
+fn emit_action_failed(
+    run_id: &str,
+    operation: Operation,
+    action: &Action,
+    reason: &str,
+) -> Result<(), AppError> {
+    emit_run(
+        serde_json::json!({"schema":"vibefilesync.run/v1","type":"action_failed","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"reason":reason}),
+    )
+}
+
+fn failure_reason(error: &io::Error) -> String {
+    let text = error.to_string();
+    if text.contains("source changed") {
+        "source_changed".into()
+    } else if text.contains("verify mismatch") {
+        "verify_mismatch".into()
+    } else {
+        text
+    }
+}
+
+fn emit_summary(run_id: &str, stats: &RunStats) -> Result<(), AppError> {
+    emit_run(
+        serde_json::json!({"schema":"vibefilesync.run/v1","type":"summary","run_id":run_id,"result":if stats.counts.failed == 0 {"success"} else {"partial"},"counts":stats.counts,"bytes":stats.bytes,"warnings":stats.warnings}),
+    )
 }
 
 fn xattr_names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
@@ -545,6 +780,7 @@ mod tests {
         let action = Action {
             rel_path: PathBuf::from("photo.jpg"),
             bytes: 1, // independent planned expectation forces gate failure
+            old_bytes: None,
             reason: "new".to_string(),
         };
         let temp = temporary_path(&destination, "20260716T120000Z");
@@ -555,8 +791,11 @@ mod tests {
             &destination,
             &temp,
             &action,
-            "20260716T120000Z",
-            false,
+            CopyOptions {
+                run_id: "20260716T120000Z",
+                permanent_delete: false,
+                full_verify: false,
+            },
         );
 
         assert!(result.is_err());
@@ -581,6 +820,7 @@ mod tests {
         let action = Action {
             rel_path: PathBuf::from("report.txt"),
             bytes: 1,
+            old_bytes: Some(11),
             reason: "size differs".to_string(),
         };
         let temp = temporary_path(&destination, "20260716T120000Z");
@@ -591,8 +831,11 @@ mod tests {
             &destination,
             &temp,
             &action,
-            "20260716T120000Z",
-            false,
+            CopyOptions {
+                run_id: "20260716T120000Z",
+                permanent_delete: false,
+                full_verify: false,
+            },
         );
 
         assert!(result.is_err());

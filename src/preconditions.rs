@@ -247,16 +247,19 @@ mod tests {
             copies: vec![crate::plan::Action {
                 rel_path: PathBuf::from("new"),
                 bytes: 10,
+                old_bytes: None,
                 reason: String::new(),
             }],
             updates: vec![crate::plan::Action {
                 rel_path: PathBuf::from("changed"),
                 bytes: 20,
+                old_bytes: Some(5),
                 reason: String::new(),
             }],
             deletes: vec![crate::plan::Action {
                 rel_path: PathBuf::from("removed"),
                 bytes: 9_999,
+                old_bytes: Some(9_999),
                 reason: String::new(),
             }],
             ..Plan::default()
