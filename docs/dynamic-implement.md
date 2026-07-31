@@ -4,6 +4,8 @@ Dynamic Implement turns one spec-level tracker issue into planned, tested, indep
 
 ## Install
 
+For complete GitHub, skills CLI, manual, and per-harness installation instructions, see the [Dynamic Implement skill bundle README](dynamic-skills/README.md).
+
 Install these portable skill directories for the harnesses used by the team:
 
 - `dynamic-implement`
