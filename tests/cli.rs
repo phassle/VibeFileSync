@@ -14,10 +14,10 @@ use std::path::Path;
 use std::process::Command as ProcessCommand;
 
 const EXIT_OK: i32 = 0;
+const EXIT_PARTIAL: i32 = 1;
 const EXIT_PRECONDITION: i32 = 2;
 const EXIT_INTERRUPTED: i32 = 4;
 const EXIT_USAGE: i32 = 64;
-const EXIT_UNIMPLEMENTED: i32 = 69;
 
 fn vibesync(config_home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("vibesync").expect("binary builds");
@@ -375,42 +375,108 @@ fn bad_config_aborts_before_an_unimplemented_verb_runs() {
 }
 
 #[test]
-fn run_stub_accepts_the_adr_0004_per_run_flags() {
+fn run_json_emits_a_pure_versioned_event_stream() {
     let fx = Fixture::new();
-    fx.cmd()
-        .args([
-            "run",
-            "photos",
-            "--yes",
-            "--json",
-            "--permanent-delete",
-            "--allow-empty-source",
-            "--ignore-space-check",
-            "--exclude",
-            "some/relative/path",
-        ])
-        .assert()
-        .code(EXIT_UNIMPLEMENTED);
-}
-
-#[test]
-fn plan_json_is_not_yet_implemented() {
-    // The human `plan` diff ships in this slice; the NDJSON
-    // `vibefilesync.plan/v1` stream is a later one.
-    let fx = Fixture::new();
+    fx.write_source("report.txt", "new report contents");
+    fx.write_dest("report.txt", "old");
     fx.add_photos_pair();
 
     let output = fx
         .cmd()
-        .args(["plan", "photos", "--json", "--exclude", "a/b"])
+        .args(["run", "photos", "--yes", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_UNIMPLEMENTED));
-    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let events = ndjson(&output.stdout);
+    assert_eq!(events[0]["schema"], "vibefilesync.run/v1");
+    assert_eq!(events[0]["type"], "run_start");
+    assert_eq!(events[1]["type"], "action_start");
+    assert_eq!(events[1]["op"], "update");
+    assert_eq!(events[2]["type"], "action_done");
+    assert_eq!(events[2]["result"], "done");
+    assert_eq!(events[2]["verified"], "standard");
+    assert!(events[2]["safety_net"].is_string());
+    assert_eq!(events[3]["type"], "summary");
+    assert!(events[3]["warnings"].is_number());
     assert!(
-        stderr.contains("not yet implemented"),
-        "plan --json should say not yet implemented: {stderr}"
+        events
+            .iter()
+            .all(|event| event["schema"] == "vibefilesync.run/v1"),
+        "every output line belongs to the run schema: {events:#?}"
     );
+}
+
+#[test]
+fn run_json_reports_partial_failures_without_non_json_stdout() {
+    let fx = Fixture::new();
+    fx.write_source("blocked.txt", "would be partial");
+    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    let events = ndjson(&output.stdout);
+    assert_eq!(events[0]["type"], "run_start");
+    assert_eq!(events[1]["type"], "action_start");
+    assert_eq!(events[2]["type"], "action_failed");
+    assert!(events[2]["reason"].is_string());
+    assert_eq!(events[3]["type"], "summary");
+    assert_eq!(events[3]["result"], "partial");
+}
+
+#[test]
+fn plan_json_streams_versioned_actions_between_start_and_summary() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "new");
+    fx.write_source("changed.txt", "new contents");
+    fx.write_dest("changed.txt", "old");
+    fx.write_dest("gone.txt", "gone");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let events = ndjson(&output.stdout);
+    assert!(
+        events.len() >= 5,
+        "start, three actions, and summary expected: {events:#?}"
+    );
+    assert_eq!(events.first().unwrap()["schema"], "vibefilesync.plan/v1");
+    assert_eq!(events.first().unwrap()["type"], "plan_start");
+    assert!(events.first().unwrap()["plan_id"].is_string());
+    assert_eq!(events.last().unwrap()["type"], "summary");
+    assert!(events[1..events.len() - 1]
+        .iter()
+        .all(|event| event["type"] == "action"));
+    assert!(events
+        .iter()
+        .all(|event| event["schema"] == "vibefilesync.plan/v1"));
+    assert!(events[1..events.len() - 1]
+        .iter()
+        .any(|event| event["op"] == "copy" && event["bytes"].is_number()));
+    assert!(events[1..events.len() - 1]
+        .iter()
+        .any(|event| event["op"] == "update" && event["old_bytes"].is_number()));
+    assert!(events[1..events.len() - 1]
+        .iter()
+        .any(|event| event["op"] == "delete" && event["safety_net"].is_string()));
+}
+
+fn ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
+    let text = std::str::from_utf8(stdout).expect("JSON stdout is UTF-8");
+    assert!(!text.is_empty(), "JSON command emitted no events");
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("every stdout line is JSON"))
+        .collect()
 }
 
 #[test]
@@ -810,7 +876,7 @@ fn a_failed_copy_stops_remaining_mutations() {
 
     let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
     assert!(fx.destination.path().join("blocked.txt").is_dir());
     assert!(
         !fx.destination.path().join("good.txt").exists(),
@@ -1093,7 +1159,7 @@ fn injected_enospc_discards_temp_retains_commits_and_exits_nonzero() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
     assert_eq!(
         fs::read_to_string(fx.destination.path().join("a-committed.txt")).unwrap(),
         "first"

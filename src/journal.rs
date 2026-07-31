@@ -106,6 +106,7 @@ impl Journal {
                 &Action {
                     rel_path: stray.clone(),
                     bytes: 0,
+                    old_bytes: None,
                     reason: "abandoned temp".to_string(),
                 },
             )

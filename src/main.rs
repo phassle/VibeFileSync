@@ -158,10 +158,8 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             json,
             exclude,
         } => {
-            // The NDJSON `vibefilesync.plan/v1` stream is a later slice;
-            // only the human diff is implemented here.
             if *json {
-                return Ok(not_yet_implemented("plan --json", pair));
+                return plan::run_json(config_path, pair, exclude);
             }
             plan::run(config_path, pair, exclude)
         }
@@ -175,7 +173,15 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             exclude,
         } => {
             if *json {
-                return Ok(not_yet_implemented("run --json", pair));
+                return run::run_json(
+                    config_path,
+                    pair,
+                    *yes,
+                    *permanent_delete,
+                    *allow_empty_source,
+                    *ignore_space_check,
+                    exclude,
+                );
             }
             run::run(
                 config_path,

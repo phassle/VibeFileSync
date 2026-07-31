@@ -11,12 +11,15 @@
 //! Everything here is strictly read-only — `plan` never writes to the
 //! source or destination.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
 
 use crate::config::{self, Mode};
 use crate::error::AppError;
@@ -43,6 +46,8 @@ pub struct Entry {
 pub struct Action {
     pub rel_path: PathBuf,
     pub bytes: u64,
+    /// Size of the destination version being replaced or archived, if any.
+    pub old_bytes: Option<u64>,
     pub reason: String,
 }
 
@@ -131,6 +136,45 @@ fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
     Ok(map)
 }
 
+/// Walks user content without retaining it.  This is the streaming seam for
+/// `plan --json`; callers receive each source entry before the next one is
+/// read, while the scanner keeps machinery invisible on both surfaces.
+fn walk_entries(
+    root: &Path,
+    mut visit: impl FnMut(PathBuf, Entry) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|error| scan_error(root, error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| scan_error(root, error))?;
+            if is_machinery(&entry.file_name()) {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| scan_error(root, error))?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel_path = path
+                .strip_prefix(root)
+                .expect("read_dir path is under root")
+                .to_path_buf();
+            visit(
+                rel_path,
+                Entry {
+                    size: metadata.len(),
+                    mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    is_symlink: file_type.is_symlink(),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Computes the Dry-run diff. Pure over the two scanned trees:
 ///
 /// - source-only file → COPY;
@@ -183,6 +227,7 @@ pub fn compute(
             None => plan.copies.push(Action {
                 rel_path: rel.clone(),
                 bytes: src.size,
+                old_bytes: None,
                 reason: "new".to_string(),
             }),
             Some(dst) => {
@@ -190,6 +235,7 @@ pub fn compute(
                     plan.updates.push(Action {
                         rel_path: rel.clone(),
                         bytes: src.size,
+                        old_bytes: Some(dst.size),
                         reason: reason.to_string(),
                     });
                 } else {
@@ -213,6 +259,7 @@ pub fn compute(
             plan.deletes.push(Action {
                 rel_path: rel.clone(),
                 bytes: dst.size,
+                old_bytes: Some(dst.size),
                 reason: "not in source".to_string(),
             });
         }
@@ -359,6 +406,227 @@ pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i
     let (pair, plan) = build(config_path, pair_name, excludes)?;
     print!("{}", render(&plan, pair_name, pair.mode));
     Ok(crate::error::EXIT_OK)
+}
+
+/// Emits the agent-facing Dry-run stream.  Each record is written and
+/// flushed independently so consumers can process rows as soon as planning
+/// has produced them; stdout contains NDJSON only (ADR-0003/0004).
+///
+/// A plan is deliberately not a Run: it gets an ephemeral `plan_id` rather
+/// than a journal/SafetyNet Run id.
+pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
+    let cfg = config::load(config_path)?;
+    let configured_pair = cfg
+        .pairs
+        .get(pair_name)
+        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+    let (pair, notices) = crate::preconditions::resolve_pair(configured_pair)?;
+    for notice in notices {
+        eprintln!("{notice}");
+    }
+    if !pair.source.is_dir() {
+        return Err(AppError::Precondition(format!(
+            "{}: source directory not found (is the volume mounted?)",
+            pair.source.display()
+        )));
+    }
+
+    let plan_id = plan_id();
+    let mut stdout = io::stdout().lock();
+
+    emit(
+        &mut stdout,
+        json!({
+            "schema": "vibefilesync.plan/v1",
+            "type": "plan_start",
+            "plan_id": plan_id,
+            "pair": pair_name,
+            "mode": pair.mode.to_string(),
+            "dry_run": true,
+        }),
+    )?;
+
+    let dest_exists = pair.destination.is_dir();
+    let destination = if dest_exists {
+        scan(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?
+    } else {
+        BTreeMap::new()
+    };
+    let supports_symlinks = if dest_exists {
+        match volume::filesystem_type(&pair.destination) {
+            Ok(filesystem) => !filesystem.eq_ignore_ascii_case("exfat"),
+            Err(_) => true,
+        }
+    } else {
+        true
+    };
+
+    // Hold only the destination index and the source paths already seen.
+    // Source actions are emitted by the walk itself rather than collected in
+    // a Plan, so an agent can consume a large source tree incrementally.
+    let mut source_paths = BTreeSet::new();
+    let mut source_entries = 0_usize;
+    let mut copies = 0_usize;
+    let mut updates = 0_usize;
+    let mut deletes = 0_usize;
+    let mut errors = 0_usize;
+    let mut unchanged = 0_usize;
+    let mut excluded = 0_usize;
+    walk_entries(&pair.source, |rel_path, source| {
+        source_entries += 1;
+        source_paths.insert(rel_path.clone());
+        if excludes
+            .iter()
+            .any(|exclude| Path::new(exclude) == rel_path)
+        {
+            excluded += 1;
+            return Ok(());
+        }
+        if source.is_symlink && !supports_symlinks {
+            errors += 1;
+            return emit(
+                &mut stdout,
+                json!({
+                    "schema": "vibefilesync.plan/v1",
+                    "type": "action",
+                    "plan_id": plan_id,
+                    "op": "error",
+                    "path": path_text(&rel_path),
+                    "reason": "symlink not supported on exFAT destination",
+                }),
+            );
+        }
+        match destination.get(&rel_path) {
+            None => {
+                copies += 1;
+                emit(
+                    &mut stdout,
+                    json!({
+                        "schema": "vibefilesync.plan/v1",
+                        "type": "action",
+                        "plan_id": plan_id,
+                        "op": "copy",
+                        "path": path_text(&rel_path),
+                        "reason": "new",
+                        "bytes": source.size,
+                    }),
+                )
+            }
+            Some(destination) => match change_reason(&source, destination) {
+                Some(reason) => {
+                    updates += 1;
+                    emit(
+                        &mut stdout,
+                        json!({
+                            "schema": "vibefilesync.plan/v1",
+                            "type": "action",
+                            "plan_id": plan_id,
+                            "op": "update",
+                            "path": path_text(&rel_path),
+                            "reason": reason,
+                            "bytes": source.size,
+                            "old_bytes": destination.size,
+                            "safety_net": format!("_SafetyNet/<run-id>/{}", path_text(&rel_path)),
+                        }),
+                    )
+                }
+                None => {
+                    unchanged += 1;
+                    Ok(())
+                }
+            },
+        }
+    })?;
+
+    let mut destination_only = 0_usize;
+    if pair.mode == Mode::Mirror {
+        for (rel_path, destination) in &destination {
+            if source_paths.contains(rel_path) {
+                continue;
+            }
+            destination_only += 1;
+            if excludes
+                .iter()
+                .any(|exclude| Path::new(exclude) == rel_path)
+            {
+                excluded += 1;
+                continue;
+            }
+            deletes += 1;
+            emit(
+                &mut stdout,
+                json!({
+                    "schema": "vibefilesync.plan/v1",
+                    "type": "action",
+                    "plan_id": plan_id,
+                    "op": "delete",
+                    "path": path_text(rel_path),
+                    "reason": "not in source",
+                    "bytes": destination.size,
+                    "old_bytes": destination.size,
+                    "safety_net": format!("_SafetyNet/<run-id>/{}", path_text(rel_path)),
+                }),
+            )?;
+        }
+    }
+
+    let strays =
+        stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
+    for stray in &strays {
+        emit(
+            &mut stdout,
+            json!({
+                "schema": "vibefilesync.plan/v1",
+                "type": "action",
+                "plan_id": plan_id,
+                "op": "cleanup",
+                "path": path_text(stray),
+                "reason": "abandoned temp",
+                "bytes": fs::metadata(pair.destination.join(stray)).map(|metadata| metadata.len()).unwrap_or(0),
+            }),
+        )?;
+    }
+    emit(
+        &mut stdout,
+        json!({
+            "schema": "vibefilesync.plan/v1",
+            "type": "summary",
+            "plan_id": plan_id,
+            "counts": {
+                "copy": copies,
+                "update": updates,
+                "delete": deletes,
+                "error": errors,
+                "cleanup": strays.len(),
+                "scanned": source_entries + destination_only,
+                "unchanged": unchanged,
+                "excluded": excluded,
+            },
+        }),
+    )?;
+    Ok(crate::error::EXIT_OK)
+}
+
+fn plan_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch");
+    format!("plan-{}-{:09}", now.as_secs(), now.subsec_nanos())
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn emit(output: &mut impl Write, event: serde_json::Value) -> Result<(), AppError> {
+    serde_json::to_writer(&mut *output, &event)
+        .map_err(|error| AppError::Precondition(error.to_string()))?;
+    output.write_all(b"\n").map_err(scan_error_for_stdout)?;
+    output.flush().map_err(scan_error_for_stdout)
+}
+
+fn scan_error_for_stdout(error: io::Error) -> AppError {
+    AppError::Precondition(format!("could not write JSON output: {error}"))
 }
 
 /// Builds a fresh plan for the CLI edges which need to render it and then
