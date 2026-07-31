@@ -46,19 +46,23 @@ pub fn run(
         return Err(AppError::Usage(format!("pair '{pair_name}' not found")));
     }
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
-    let (pair, plan) = plan::build(config_path, pair_name, excludes)?;
-    print!("{}", plan::render(&plan, pair_name, pair.mode));
+    let (pair, initial_plan) = plan::build(config_path, pair_name, excludes)?;
+    print!("{}", plan::render(&initial_plan, pair_name, pair.mode));
 
-    let run_warnings =
-        crate::preconditions::check_run(&pair, &plan, allow_empty_source, ignore_space_check)?;
+    let run_warnings = crate::preconditions::check_run(
+        &pair,
+        &initial_plan,
+        allow_empty_source,
+        ignore_space_check,
+    )?;
     for warning in &run_warnings {
         eprintln!("{warning}");
     }
 
-    if !plan.errors.is_empty() {
+    if !initial_plan.errors.is_empty() {
         eprintln!(
             "vibesync: run blocked by {} plan error(s)",
-            plan.errors.len()
+            initial_plan.errors.len()
         );
         return Ok(EXIT_BLOCKED_PLAN);
     }
@@ -70,16 +74,19 @@ pub fn run(
 
     let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
     journal
-        .run_start(pair_name, &plan, &run_warnings)
+        .run_start(pair_name, &initial_plan, &run_warnings)
         .map_err(io_error)?;
     let mut stats = RunStats {
         counts: Counts {
-            planned: plan.copies.len() + plan.updates.len() + plan.deletes.len(),
+            planned: initial_plan.copies.len()
+                + initial_plan.updates.len()
+                + initial_plan.deletes.len()
+                + initial_plan.strays.len(),
             ..Counts::default()
         },
         ..RunStats::default()
     };
-    for stray in &plan.strays {
+    for stray in &initial_plan.strays {
         let action = Action {
             rel_path: stray.clone(),
             bytes: fs::metadata(pair.destination.join(stray))
@@ -95,6 +102,7 @@ pub fn run(
                 journal
                     .action_done(Operation::Cleanup, &action, None, &[])
                     .map_err(journal_runtime_error)?;
+                stats.counts.done += 1;
                 println!("Cleaned stray temp: {}", stray.display());
             }
             Err(error) => {
@@ -108,6 +116,41 @@ pub fn run(
             }
         }
     }
+    // Cleanup changes the destination, so the action set below must come from
+    // a new scan rather than from the scan that discovered the abandoned temp.
+    let (pair, mut plan) = plan::build(config_path, pair_name, excludes)?;
+    if !plan.errors.is_empty() {
+        eprintln!(
+            "vibesync: run blocked by {} plan error(s)",
+            plan.errors.len()
+        );
+        stats.counts.failed += plan.errors.len();
+        journal.summary(&stats).map_err(journal_runtime_error)?;
+        return Ok(EXIT_BLOCKED_PLAN);
+    }
+    for (operation, action) in missing_reviewed_actions(&initial_plan, &plan) {
+        let source = match operation {
+            Operation::Copy | Operation::Update => Some(pair.source.join(&action.rel_path)),
+            Operation::Delete | Operation::Cleanup => None,
+        };
+        journal
+            .action_start(operation, action, source.as_deref(), None)
+            .map_err(journal_runtime_error)?;
+        journal
+            .action_failed(
+                operation,
+                action,
+                "changed during reconciliation; rerun required",
+            )
+            .map_err(journal_runtime_error)?;
+        stats.counts.failed += 1;
+        eprintln!(
+            "vibesync: {} {} changed during reconciliation; rerun required",
+            operation.as_str().to_ascii_uppercase(),
+            action.rel_path.display()
+        );
+    }
+    retain_reviewed_actions(&mut plan, &initial_plan);
     for (operation, action) in plan
         .copies
         .iter()
@@ -210,6 +253,48 @@ pub fn run(
     } else {
         Ok(1)
     }
+}
+
+/// A reconciliation scan is authoritative about the destination, but it must
+/// not broaden a reviewed run when source or destination content changes
+/// between the review and the cleanup. Newly discovered work waits for the
+/// next `plan`/`run` invocation.
+fn retain_reviewed_actions(fresh: &mut plan::Plan, reviewed: &plan::Plan) {
+    fresh
+        .copies
+        .retain(|action| reviewed.copies.contains(action));
+    fresh
+        .updates
+        .retain(|action| reviewed.updates.contains(action));
+    fresh
+        .deletes
+        .retain(|action| reviewed.deletes.contains(action));
+}
+
+fn missing_reviewed_actions<'a>(
+    reviewed: &'a plan::Plan,
+    fresh: &plan::Plan,
+) -> Vec<(Operation, &'a Action)> {
+    reviewed
+        .copies
+        .iter()
+        .filter(|action| !fresh.copies.contains(*action))
+        .map(|action| (Operation::Copy, action))
+        .chain(
+            reviewed
+                .updates
+                .iter()
+                .filter(|action| !fresh.updates.contains(*action))
+                .map(|action| (Operation::Update, action)),
+        )
+        .chain(
+            reviewed
+                .deletes
+                .iter()
+                .filter(|action| !fresh.deletes.contains(*action))
+                .map(|action| (Operation::Delete, action)),
+        )
+        .collect()
 }
 
 fn confirm() -> Result<bool, AppError> {
@@ -533,6 +618,59 @@ mod tests {
             temporary_path(&destination, "20260716T120000Z"),
             dir.path().join(".photo.jpg.vibesync-tmp-20260716T120000Z")
         );
+    }
+
+    #[test]
+    fn reconciliation_scan_cannot_expand_reviewed_actions() {
+        let reviewed = plan::Plan {
+            copies: vec![Action {
+                rel_path: PathBuf::from("reviewed.txt"),
+                bytes: 1,
+                reason: "new".to_string(),
+            }],
+            ..plan::Plan::default()
+        };
+        let mut fresh = plan::Plan {
+            copies: vec![
+                reviewed.copies[0].clone(),
+                Action {
+                    rel_path: PathBuf::from("arrived-later.txt"),
+                    bytes: 2,
+                    reason: "new".to_string(),
+                },
+            ],
+            ..plan::Plan::default()
+        };
+
+        retain_reviewed_actions(&mut fresh, &reviewed);
+
+        assert_eq!(fresh.copies, reviewed.copies);
+    }
+
+    #[test]
+    fn changed_reviewed_action_is_reported_as_missing() {
+        let reviewed = plan::Plan {
+            copies: vec![Action {
+                rel_path: PathBuf::from("photo.txt"),
+                bytes: 1,
+                reason: "new".to_string(),
+            }],
+            ..plan::Plan::default()
+        };
+        let fresh = plan::Plan {
+            copies: vec![Action {
+                rel_path: PathBuf::from("photo.txt"),
+                bytes: 2,
+                reason: "new".to_string(),
+            }],
+            ..plan::Plan::default()
+        };
+
+        let missing = missing_reviewed_actions(&reviewed, &fresh);
+
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0.as_str(), "copy");
+        assert_eq!(missing[0].1.rel_path, PathBuf::from("photo.txt"));
     }
 
     #[test]
