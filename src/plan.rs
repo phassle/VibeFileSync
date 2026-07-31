@@ -71,6 +71,9 @@ pub struct Plan {
     /// counts are precondition inputs, not presentation rows.
     pub source_entries: usize,
     pub destination_entries: usize,
+    /// Sibling dot-temps left by an interrupted run. They are never sync
+    /// content, but read commands report them and a real run cleans them.
+    pub strays: Vec<PathBuf>,
 }
 
 /// Is `name` sync machinery the scanner must never treat as content?
@@ -283,12 +286,21 @@ pub fn render(plan: &Plan, pair_name: &str, mode: Mode) -> String {
         path_width,
     );
     push_errors(&mut out, &plan.errors, path_width);
+    push_strays(&mut out, &plan.strays);
 
     out.push_str(&format!(
         "Scanned {} · unchanged {} · excluded {}\n",
         plan.scanned, plan.unchanged, plan.excluded
     ));
     out
+}
+
+fn push_strays(out: &mut String, strays: &[PathBuf]) {
+    out.push_str(&format!("Stray temps ({})\n", strays.len()));
+    for stray in strays {
+        out.push_str(&format!("  {}\n", stray.display()));
+    }
+    out.push('\n');
 }
 
 fn push_actions(out: &mut String, name: &str, rows: &[Action], note: Option<&str>, width: usize) {
@@ -396,8 +408,46 @@ pub(crate) fn build(
         true
     };
 
-    let plan = compute(&source, &dest, pair.mode, supports_symlinks, excludes);
+    let mut plan = compute(&source, &dest, pair.mode, supports_symlinks, excludes);
+    plan.strays = stray_temps(&pair.destination).map_err(|e| scan_error(&pair.destination, e))?;
     Ok((pair, plan))
+}
+
+/// Lists abandoned sibling Publish temps without treating them as sync
+/// content. This is intentionally read-only so `plan` and `status` are safe
+/// at any time; only a real run removes the returned paths.
+pub(crate) fn stray_temps(root: &Path) -> io::Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut strays = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_name() == "_SafetyNet" {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                stack.push(path);
+            } else if is_stray_temp(&entry.file_name()) {
+                strays.push(
+                    path.strip_prefix(root)
+                        .expect("entry is under root")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    strays.sort();
+    Ok(strays)
+}
+
+fn is_stray_temp(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') && name.contains(".vibesync-tmp-")
 }
 
 fn scan_error(path: &Path, source: io::Error) -> AppError {

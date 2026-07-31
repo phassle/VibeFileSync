@@ -24,6 +24,7 @@ pub enum Operation {
     Copy,
     Update,
     Delete,
+    Cleanup,
 }
 
 impl Operation {
@@ -32,6 +33,7 @@ impl Operation {
             Operation::Copy => "copy",
             Operation::Update => "update",
             Operation::Delete => "delete",
+            Operation::Cleanup => "cleanup",
         }
     }
 }
@@ -281,7 +283,7 @@ pub fn pair_directory(pair_name: &str) -> PathBuf {
 }
 
 pub fn status(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
-    configured_pair(config_path, pair_name)?;
+    let pair = configured_pair(config_path, pair_name)?;
     match latest_record(pair_name).map_err(journal_error)? {
         Some(record) => {
             println!("Latest run for '{pair_name}': {}", record.run_id);
@@ -294,6 +296,11 @@ pub fn status(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
             println!("Bytes: {} · warnings: {}", record.bytes, record.warnings);
         }
         None => println!("No runs recorded for '{pair_name}'."),
+    }
+    let strays = crate::plan::stray_temps(&pair.destination).map_err(journal_error)?;
+    println!("Stray temps ({})", strays.len());
+    for stray in strays {
+        println!("  {}", stray.display());
     }
     Ok(EXIT_OK)
 }
