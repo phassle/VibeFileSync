@@ -118,7 +118,7 @@ pub fn run(
     }
     // Cleanup changes the destination, so the action set below must come from
     // a new scan rather than from the scan that discovered the abandoned temp.
-    let (pair, plan) = plan::build(config_path, pair_name, excludes)?;
+    let (pair, mut plan) = plan::build(config_path, pair_name, excludes)?;
     if !plan.errors.is_empty() {
         eprintln!(
             "vibesync: run blocked by {} plan error(s)",
@@ -127,6 +127,7 @@ pub fn run(
         journal.summary(&stats).map_err(journal_runtime_error)?;
         return Ok(EXIT_BLOCKED_PLAN);
     }
+    retain_reviewed_actions(&mut plan, &initial_plan);
     for (operation, action) in plan
         .copies
         .iter()
@@ -229,6 +230,22 @@ pub fn run(
     } else {
         Ok(1)
     }
+}
+
+/// A reconciliation scan is authoritative about the destination, but it must
+/// not broaden a reviewed run when source or destination content changes
+/// between the review and the cleanup. Newly discovered work waits for the
+/// next `plan`/`run` invocation.
+fn retain_reviewed_actions(fresh: &mut plan::Plan, reviewed: &plan::Plan) {
+    fresh
+        .copies
+        .retain(|action| reviewed.copies.contains(action));
+    fresh
+        .updates
+        .retain(|action| reviewed.updates.contains(action));
+    fresh
+        .deletes
+        .retain(|action| reviewed.deletes.contains(action));
 }
 
 fn confirm() -> Result<bool, AppError> {
@@ -552,6 +569,33 @@ mod tests {
             temporary_path(&destination, "20260716T120000Z"),
             dir.path().join(".photo.jpg.vibesync-tmp-20260716T120000Z")
         );
+    }
+
+    #[test]
+    fn reconciliation_scan_cannot_expand_reviewed_actions() {
+        let reviewed = plan::Plan {
+            copies: vec![Action {
+                rel_path: PathBuf::from("reviewed.txt"),
+                bytes: 1,
+                reason: "new".to_string(),
+            }],
+            ..plan::Plan::default()
+        };
+        let mut fresh = plan::Plan {
+            copies: vec![
+                reviewed.copies[0].clone(),
+                Action {
+                    rel_path: PathBuf::from("arrived-later.txt"),
+                    bytes: 2,
+                    reason: "new".to_string(),
+                },
+            ],
+            ..plan::Plan::default()
+        };
+
+        retain_reviewed_actions(&mut fresh, &reviewed);
+
+        assert_eq!(fresh.copies, reviewed.copies);
     }
 
     #[test]
