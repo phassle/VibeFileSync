@@ -169,7 +169,7 @@ impl Journal {
                 "path": path_text(&action.rel_path),
                 "result": "done",
                 "bytes": action.bytes,
-                "verified": if matches!(operation, Operation::Delete) { Value::Null } else { json!("standard") },
+                "verified": if matches!(operation, Operation::Copy | Operation::Update) { json!("standard") } else { Value::Null },
                 "safety_net": safety_net.map(path_text),
                 "warnings": warnings,
             }),

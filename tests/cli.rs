@@ -1491,6 +1491,9 @@ fn rerun_cleans_strays_journals_cleanup_and_scans_fresh() {
                 .as_str()
                 .is_some_and(|path| path.starts_with(".interrupted.txt.vibesync-tmp-"))
     }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "action_done" && event["op"] == "cleanup" && event["verified"].is_null()
+    }));
     let planned = events
         .iter()
         .find(|event| event["type"] == "run_start")
@@ -1513,5 +1516,12 @@ fn rerun_cleans_strays_journals_cleanup_and_scans_fresh() {
             .iter()
             .any(|action| { action["op"] == "copy" && action["path"] == "interrupted.txt" }),
         "fresh scan must not replay published work"
+    );
+
+    let status = fx.cmd().args(["status", "photos"]).output().unwrap();
+    assert_eq!(status.status.code(), Some(EXIT_OK));
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("Actions: 2 done · 0 failed · 2 planned"),
+        "status must retain the journal's cleanup action in its counts"
     );
 }

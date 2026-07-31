@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
-use crate::journal::{Journal, Operation, PairLock, RunStats};
+use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
@@ -76,7 +76,16 @@ pub fn run(
     journal
         .run_start(pair_name, &initial_plan, &run_warnings)
         .map_err(io_error)?;
-    let mut stats = RunStats::default();
+    let mut stats = RunStats {
+        counts: Counts {
+            planned: initial_plan.copies.len()
+                + initial_plan.updates.len()
+                + initial_plan.deletes.len()
+                + initial_plan.strays.len(),
+            ..Counts::default()
+        },
+        ..RunStats::default()
+    };
     for stray in &initial_plan.strays {
         let action = Action {
             rel_path: stray.clone(),
@@ -93,6 +102,7 @@ pub fn run(
                 journal
                     .action_done(Operation::Cleanup, &action, None, &[])
                     .map_err(journal_runtime_error)?;
+                stats.counts.done += 1;
                 println!("Cleaned stray temp: {}", stray.display());
             }
             Err(error) => {
@@ -117,7 +127,6 @@ pub fn run(
         journal.summary(&stats).map_err(journal_runtime_error)?;
         return Ok(EXIT_BLOCKED_PLAN);
     }
-    stats.counts.planned = plan.copies.len() + plan.updates.len() + plan.deletes.len();
     for (operation, action) in plan
         .copies
         .iter()
