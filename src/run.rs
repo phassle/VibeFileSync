@@ -239,7 +239,7 @@ fn copy_file(
     fs::create_dir_all(parent)?;
     let result = (|| {
         copyfile_all_but_acls(source, temp)?;
-        crash_at("temp_created");
+        crash_at("copy_complete");
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
             .is_some_and(|path| Path::new(&path) == action.rel_path)

@@ -1420,7 +1420,7 @@ fn rerun_cleans_strays_journals_cleanup_and_scans_fresh() {
     fx.write_source("interrupted.txt", "must be recopied");
     let crashed = fx
         .cmd()
-        .env("VIBESYNC_TEST_CRASH_AT", "temp_created")
+        .env("VIBESYNC_TEST_CRASH_AT", "copy_complete")
         .args(["run", "photos", "--yes"])
         .output()
         .unwrap();
