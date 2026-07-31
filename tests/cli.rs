@@ -1499,8 +1499,19 @@ fn rerun_cleans_strays_journals_cleanup_and_scans_fresh() {
         .unwrap();
     assert_eq!(
         planned.len(),
-        1,
+        2,
+        "cleanup is part of the declared run intent"
+    );
+    assert!(planned.iter().any(|action| {
+        action["op"] == "cleanup"
+            && action["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(".interrupted.txt.vibesync-tmp-"))
+    }));
+    assert!(
+        planned
+            .iter()
+            .any(|action| { action["op"] == "copy" && action["path"] == "interrupted.txt" }),
         "fresh scan must not replay published work"
     );
-    assert_eq!(planned[0]["path"], "interrupted.txt");
 }

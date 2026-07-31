@@ -100,6 +100,16 @@ impl Journal {
                 .iter()
                 .map(|action| planned(Operation::Delete, action)),
         );
+        actions.extend(plan.strays.iter().map(|stray| {
+            planned(
+                Operation::Cleanup,
+                &Action {
+                    rel_path: stray.clone(),
+                    bytes: 0,
+                    reason: "abandoned temp".to_string(),
+                },
+            )
+        }));
         self.append(
             json!({
                 "schema": SCHEMA,
