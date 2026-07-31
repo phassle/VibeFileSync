@@ -431,12 +431,58 @@ fn run_json_reports_partial_failures_without_non_json_stdout() {
 }
 
 #[test]
+fn run_json_confirmation_and_cancellation_stay_on_stderr() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "would copy if approved");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--json"])
+        .write_stdin("n\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert!(output.stdout.is_empty(), "stdout must remain NDJSON-only");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Proceed with COPY actions?"), "{stderr}");
+    assert!(stderr.contains("Run cancelled"), "{stderr}");
+    assert!(!fx.destination.path().join("photo.txt").exists());
+}
+
+#[test]
+fn json_verbs_keep_usage_and_precondition_exit_classes_without_stdout_noise() {
+    let unknown_pair = Fixture::new();
+    let usage = unknown_pair
+        .cmd()
+        .args(["plan", "missing", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(usage.status.code(), Some(EXIT_USAGE));
+    assert!(usage.stdout.is_empty());
+
+    let bad_config = Fixture::new();
+    let path = config_file(bad_config.xdg.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, "version = 1\nbogus = true\n").unwrap();
+    let precondition = bad_config
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(precondition.status.code(), Some(EXIT_PRECONDITION));
+    assert!(precondition.stdout.is_empty());
+}
+
+#[test]
 fn plan_json_streams_versioned_actions_between_start_and_summary() {
     let fx = Fixture::new();
     fx.write_source("new.txt", "new");
     fx.write_source("changed.txt", "new contents");
     fx.write_dest("changed.txt", "old");
     fx.write_dest("gone.txt", "gone");
+    fx.write_dest(".abandoned.vibesync-tmp-old-run", "temp");
     fx.add_photos_pair();
 
     let output = fx
@@ -447,8 +493,8 @@ fn plan_json_streams_versioned_actions_between_start_and_summary() {
     assert_eq!(output.status.code(), Some(EXIT_OK));
     let events = ndjson(&output.stdout);
     assert!(
-        events.len() >= 5,
-        "start, three actions, and summary expected: {events:#?}"
+        events.len() >= 6,
+        "start, four actions, and summary expected: {events:#?}"
     );
     assert_eq!(events.first().unwrap()["schema"], "vibefilesync.plan/v1");
     assert_eq!(events.first().unwrap()["type"], "plan_start");
@@ -469,6 +515,9 @@ fn plan_json_streams_versioned_actions_between_start_and_summary() {
     assert!(events[1..events.len() - 1]
         .iter()
         .any(|event| event["op"] == "delete" && event["safety_net"].is_string()));
+    assert!(events[1..events.len() - 1]
+        .iter()
+        .any(|event| event["op"] == "cleanup" && event["reason"] == "abandoned temp"));
 }
 
 fn ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {

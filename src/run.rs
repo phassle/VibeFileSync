@@ -130,8 +130,12 @@ fn run_impl(
         return Ok(EXIT_BLOCKED_PLAN);
     }
 
-    if !options.yes && !confirm()? {
-        println!("Run cancelled; destination unchanged.");
+    if !options.yes && !confirm(json_output)? {
+        if json_output {
+            eprintln!("Run cancelled; destination unchanged.");
+        } else {
+            println!("Run cancelled; destination unchanged.");
+        }
         return Ok(EXIT_OK);
     }
 
@@ -444,9 +448,14 @@ fn missing_reviewed_actions<'a>(
         .collect()
 }
 
-fn confirm() -> Result<bool, AppError> {
-    print!("Proceed with COPY actions? [y/N] ");
-    io::stdout().flush().map_err(io_error)?;
+fn confirm(json_output: bool) -> Result<bool, AppError> {
+    if json_output {
+        eprint!("Proceed with COPY actions? [y/N] ");
+        io::stderr().flush().map_err(io_error)?;
+    } else {
+        print!("Proceed with COPY actions? [y/N] ");
+        io::stdout().flush().map_err(io_error)?;
+    }
     let mut response = String::new();
     io::stdin().read_line(&mut response).map_err(io_error)?;
     Ok(matches!(

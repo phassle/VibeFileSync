@@ -11,7 +11,7 @@
 //! Everything here is strictly read-only — `plan` never writes to the
 //! source or destination.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -134,45 +134,6 @@ fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
     }
 
     Ok(map)
-}
-
-/// Walks user content without retaining it.  This is the streaming seam for
-/// `plan --json`; callers receive each source entry before the next one is
-/// read, while the scanner keeps machinery invisible on both surfaces.
-fn walk_entries(
-    root: &Path,
-    mut visit: impl FnMut(PathBuf, Entry) -> Result<(), AppError>,
-) -> Result<(), AppError> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir).map_err(|error| scan_error(root, error))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| scan_error(root, error))?;
-            if is_machinery(&entry.file_name()) {
-                continue;
-            }
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|error| scan_error(root, error))?;
-            let file_type = metadata.file_type();
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let rel_path = path
-                .strip_prefix(root)
-                .expect("read_dir path is under root")
-                .to_path_buf();
-            visit(
-                rel_path,
-                Entry {
-                    size: metadata.len(),
-                    mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    is_symlink: file_type.is_symlink(),
-                },
-            )?;
-        }
-    }
-    Ok(())
 }
 
 /// Computes the Dry-run diff. Pure over the two scanned trees:
@@ -446,13 +407,7 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         }),
     )?;
 
-    let dest_exists = pair.destination.is_dir();
-    let destination = if dest_exists {
-        scan(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?
-    } else {
-        BTreeMap::new()
-    };
-    let supports_symlinks = if dest_exists {
+    let supports_symlinks = if pair.destination.is_dir() {
         match volume::filesystem_type(&pair.destination) {
             Ok(filesystem) => !filesystem.eq_ignore_ascii_case("exfat"),
             Err(_) => true,
@@ -461,114 +416,22 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         true
     };
 
-    // Hold only the destination index and the source paths already seen.
-    // Source actions are emitted by the walk itself rather than collected in
-    // a Plan, so an agent can consume a large source tree incrementally.
-    let mut source_paths = BTreeSet::new();
-    let mut source_entries = 0_usize;
-    let mut copies = 0_usize;
-    let mut updates = 0_usize;
-    let mut deletes = 0_usize;
-    let mut errors = 0_usize;
-    let mut unchanged = 0_usize;
-    let mut excluded = 0_usize;
-    walk_entries(&pair.source, |rel_path, source| {
-        source_entries += 1;
-        source_paths.insert(rel_path.clone());
-        if excludes
-            .iter()
-            .any(|exclude| Path::new(exclude) == rel_path)
-        {
-            excluded += 1;
-            return Ok(());
-        }
-        if source.is_symlink && !supports_symlinks {
-            errors += 1;
-            return emit(
-                &mut stdout,
-                json!({
-                    "schema": "vibefilesync.plan/v1",
-                    "type": "action",
-                    "plan_id": plan_id,
-                    "op": "error",
-                    "path": path_text(&rel_path),
-                    "reason": "symlink not supported on exFAT destination",
-                }),
-            );
-        }
-        match destination.get(&rel_path) {
-            None => {
-                copies += 1;
-                emit(
-                    &mut stdout,
-                    json!({
-                        "schema": "vibefilesync.plan/v1",
-                        "type": "action",
-                        "plan_id": plan_id,
-                        "op": "copy",
-                        "path": path_text(&rel_path),
-                        "reason": "new",
-                        "bytes": source.size,
-                    }),
-                )
-            }
-            Some(destination) => match change_reason(&source, destination) {
-                Some(reason) => {
-                    updates += 1;
-                    emit(
-                        &mut stdout,
-                        json!({
-                            "schema": "vibefilesync.plan/v1",
-                            "type": "action",
-                            "plan_id": plan_id,
-                            "op": "update",
-                            "path": path_text(&rel_path),
-                            "reason": reason,
-                            "bytes": source.size,
-                            "old_bytes": destination.size,
-                            "safety_net": format!("_SafetyNet/<run-id>/{}", path_text(&rel_path)),
-                        }),
-                    )
-                }
-                None => {
-                    unchanged += 1;
-                    Ok(())
-                }
-            },
-        }
-    })?;
-
-    let mut destination_only = 0_usize;
-    if pair.mode == Mode::Mirror {
-        for (rel_path, destination) in &destination {
-            if source_paths.contains(rel_path) {
-                continue;
-            }
-            destination_only += 1;
-            if excludes
-                .iter()
-                .any(|exclude| Path::new(exclude) == rel_path)
-            {
-                excluded += 1;
-                continue;
-            }
-            deletes += 1;
-            emit(
-                &mut stdout,
-                json!({
-                    "schema": "vibefilesync.plan/v1",
-                    "type": "action",
-                    "plan_id": plan_id,
-                    "op": "delete",
-                    "path": path_text(rel_path),
-                    "reason": "not in source",
-                    "bytes": destination.size,
-                    "old_bytes": destination.size,
-                    "safety_net": format!("_SafetyNet/<run-id>/{}", path_text(rel_path)),
-                }),
-            )?;
-        }
-    }
+    // Compare only matching directory entries, retaining at most one
+    // directory's entries. No whole-tree Plan, source set, or destination
+    // index exists in JSON mode (ADR-0003's constant-memory contract).
+    let mut counts = JsonPlanCounts::default();
+    stream_directory(
+        Some(&pair.source),
+        pair.destination
+            .is_dir()
+            .then_some(pair.destination.as_path()),
+        Path::new(""),
+        pair.mode,
+        supports_symlinks,
+        excludes,
+        &mut counts,
+        &mut |action| emit_plan_action(&mut stdout, &plan_id, action),
+    )?;
 
     let strays =
         stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
@@ -593,18 +456,384 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
             "type": "summary",
             "plan_id": plan_id,
             "counts": {
-                "copy": copies,
-                "update": updates,
-                "delete": deletes,
-                "error": errors,
+                "copy": counts.copies,
+                "update": counts.updates,
+                "delete": counts.deletes,
+                "error": counts.errors,
                 "cleanup": strays.len(),
-                "scanned": source_entries + destination_only,
-                "unchanged": unchanged,
-                "excluded": excluded,
+                "scanned": counts.scanned,
+                "unchanged": counts.unchanged,
+                "excluded": counts.excluded,
             },
         }),
     )?;
     Ok(crate::error::EXIT_OK)
+}
+
+#[derive(Default)]
+struct JsonPlanCounts {
+    copies: usize,
+    updates: usize,
+    deletes: usize,
+    errors: usize,
+    scanned: usize,
+    unchanged: usize,
+    excluded: usize,
+}
+
+enum JsonPlanAction {
+    Copy {
+        path: PathBuf,
+        bytes: u64,
+    },
+    Update {
+        path: PathBuf,
+        bytes: u64,
+        old_bytes: u64,
+        reason: &'static str,
+    },
+    Delete {
+        path: PathBuf,
+        bytes: u64,
+    },
+    Error {
+        path: PathBuf,
+        reason: &'static str,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_directory(
+    source: Option<&Path>,
+    destination: Option<&Path>,
+    relative: &Path,
+    mode: Mode,
+    supports_symlinks: bool,
+    excludes: &[String],
+    counts: &mut JsonPlanCounts,
+    emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let source_entries = source.map(sorted_entries).transpose()?.unwrap_or_default();
+    let destination_entries = destination
+        .map(sorted_entries)
+        .transpose()?
+        .unwrap_or_default();
+    let mut source_index = 0;
+    let mut destination_index = 0;
+
+    while source_index < source_entries.len() || destination_index < destination_entries.len() {
+        let source_entry = source_entries.get(source_index);
+        let destination_entry = destination_entries.get(destination_index);
+        match (source_entry, destination_entry) {
+            (Some(source_entry), Some(destination_entry)) => {
+                match source_entry.file_name().cmp(&destination_entry.file_name()) {
+                    std::cmp::Ordering::Less => {
+                        stream_source_entry(
+                            source_entry.path(),
+                            None,
+                            &relative.join(source_entry.file_name()),
+                            mode,
+                            supports_symlinks,
+                            excludes,
+                            counts,
+                            emit,
+                        )?;
+                        source_index += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        stream_destination_entry(
+                            destination_entry.path(),
+                            &relative.join(destination_entry.file_name()),
+                            mode,
+                            excludes,
+                            counts,
+                            emit,
+                        )?;
+                        destination_index += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let source_path = source_entry.path();
+                        let destination_path = destination_entry.path();
+                        let child_relative = relative.join(source_entry.file_name());
+                        let source_metadata = fs::symlink_metadata(&source_path)
+                            .map_err(|error| scan_error(&source_path, error))?;
+                        let destination_metadata = fs::symlink_metadata(&destination_path)
+                            .map_err(|error| scan_error(&destination_path, error))?;
+                        match (
+                            source_metadata.file_type().is_dir(),
+                            destination_metadata.file_type().is_dir(),
+                        ) {
+                            (true, true) => stream_directory(
+                                Some(&source_path),
+                                Some(&destination_path),
+                                &child_relative,
+                                mode,
+                                supports_symlinks,
+                                excludes,
+                                counts,
+                                emit,
+                            )?,
+                            (true, false) => {
+                                stream_source_entry(
+                                    source_path,
+                                    None,
+                                    &child_relative,
+                                    mode,
+                                    supports_symlinks,
+                                    excludes,
+                                    counts,
+                                    emit,
+                                )?;
+                                stream_destination_entry(
+                                    destination_path,
+                                    &child_relative,
+                                    mode,
+                                    excludes,
+                                    counts,
+                                    emit,
+                                )?;
+                            }
+                            (false, true) => {
+                                stream_source_entry(
+                                    source_path,
+                                    None,
+                                    &child_relative,
+                                    mode,
+                                    supports_symlinks,
+                                    excludes,
+                                    counts,
+                                    emit,
+                                )?;
+                                stream_destination_entry(
+                                    destination_path,
+                                    &child_relative,
+                                    mode,
+                                    excludes,
+                                    counts,
+                                    emit,
+                                )?;
+                            }
+                            (false, false) => stream_source_entry(
+                                source_path,
+                                Some(destination_path),
+                                &child_relative,
+                                mode,
+                                supports_symlinks,
+                                excludes,
+                                counts,
+                                emit,
+                            )?,
+                        }
+                        source_index += 1;
+                        destination_index += 1;
+                    }
+                }
+            }
+            (Some(source_entry), None) => {
+                stream_source_entry(
+                    source_entry.path(),
+                    None,
+                    &relative.join(source_entry.file_name()),
+                    mode,
+                    supports_symlinks,
+                    excludes,
+                    counts,
+                    emit,
+                )?;
+                source_index += 1;
+            }
+            (None, Some(destination_entry)) => {
+                stream_destination_entry(
+                    destination_entry.path(),
+                    &relative.join(destination_entry.file_name()),
+                    mode,
+                    excludes,
+                    counts,
+                    emit,
+                )?;
+                destination_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_source_entry(
+    source: PathBuf,
+    destination: Option<PathBuf>,
+    relative: &Path,
+    mode: Mode,
+    supports_symlinks: bool,
+    excludes: &[String],
+    counts: &mut JsonPlanCounts,
+    emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let source_metadata =
+        fs::symlink_metadata(&source).map_err(|error| scan_error(&source, error))?;
+    if source_metadata.file_type().is_dir() {
+        return stream_directory(
+            Some(&source),
+            destination.as_deref(),
+            relative,
+            mode,
+            supports_symlinks,
+            excludes,
+            counts,
+            emit,
+        );
+    }
+
+    counts.scanned += 1;
+    if excludes
+        .iter()
+        .any(|exclude| Path::new(exclude) == relative)
+    {
+        counts.excluded += 1;
+        return Ok(());
+    }
+    if source_metadata.file_type().is_symlink() && !supports_symlinks {
+        counts.errors += 1;
+        return emit(JsonPlanAction::Error {
+            path: relative.to_path_buf(),
+            reason: "symlink not supported on exFAT destination",
+        });
+    }
+    match destination {
+        None => {
+            counts.copies += 1;
+            emit(JsonPlanAction::Copy {
+                path: relative.to_path_buf(),
+                bytes: source_metadata.len(),
+            })
+        }
+        Some(destination) => {
+            let destination_metadata = fs::symlink_metadata(&destination)
+                .map_err(|error| scan_error(&destination, error))?;
+            let source_entry = Entry {
+                size: source_metadata.len(),
+                mtime: source_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                is_symlink: source_metadata.file_type().is_symlink(),
+            };
+            let destination_entry = Entry {
+                size: destination_metadata.len(),
+                mtime: destination_metadata
+                    .modified()
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+                is_symlink: destination_metadata.file_type().is_symlink(),
+            };
+            match change_reason(&source_entry, &destination_entry) {
+                Some(reason) => {
+                    counts.updates += 1;
+                    emit(JsonPlanAction::Update {
+                        path: relative.to_path_buf(),
+                        bytes: source_entry.size,
+                        old_bytes: destination_entry.size,
+                        reason,
+                    })
+                }
+                None => {
+                    counts.unchanged += 1;
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn stream_destination_entry(
+    destination: PathBuf,
+    relative: &Path,
+    mode: Mode,
+    excludes: &[String],
+    counts: &mut JsonPlanCounts,
+    emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    if mode != Mode::Mirror {
+        return Ok(());
+    }
+    let metadata =
+        fs::symlink_metadata(&destination).map_err(|error| scan_error(&destination, error))?;
+    if metadata.file_type().is_dir() {
+        return stream_directory(
+            None,
+            Some(&destination),
+            relative,
+            mode,
+            true,
+            excludes,
+            counts,
+            emit,
+        );
+    }
+
+    counts.scanned += 1;
+    if excludes
+        .iter()
+        .any(|exclude| Path::new(exclude) == relative)
+    {
+        counts.excluded += 1;
+        return Ok(());
+    }
+    counts.deletes += 1;
+    emit(JsonPlanAction::Delete {
+        path: relative.to_path_buf(),
+        bytes: metadata.len(),
+    })
+}
+
+fn sorted_entries(directory: &Path) -> Result<Vec<fs::DirEntry>, AppError> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| scan_error(directory, error))?
+        .map(|entry| entry.map_err(|error| scan_error(directory, error)))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.retain(|entry| !is_machinery(&entry.file_name()));
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+fn emit_plan_action(
+    output: &mut impl Write,
+    plan_id: &str,
+    action: JsonPlanAction,
+) -> Result<(), AppError> {
+    let (op, path, reason, bytes, old_bytes, safety_net) = match action {
+        JsonPlanAction::Copy { path, bytes } => ("copy", path, "new", Some(bytes), None, false),
+        JsonPlanAction::Update {
+            path,
+            bytes,
+            old_bytes,
+            reason,
+        } => ("update", path, reason, Some(bytes), Some(old_bytes), true),
+        JsonPlanAction::Delete { path, bytes } => (
+            "delete",
+            path,
+            "not in source",
+            Some(bytes),
+            Some(bytes),
+            true,
+        ),
+        JsonPlanAction::Error { path, reason } => ("error", path, reason, None, None, false),
+    };
+    let mut event = json!({
+        "schema": "vibefilesync.plan/v1",
+        "type": "action",
+        "plan_id": plan_id,
+        "op": op,
+        "path": path_text(&path),
+        "reason": reason,
+    });
+    if let Some(bytes) = bytes {
+        event["bytes"] = json!(bytes);
+    }
+    if let Some(old_bytes) = old_bytes {
+        event["old_bytes"] = json!(old_bytes);
+    }
+    if safety_net {
+        event["safety_net"] = json!(format!("_SafetyNet/<run-id>/{}", path_text(&path)));
+    }
+    emit(output, event)
 }
 
 fn plan_id() -> String {
