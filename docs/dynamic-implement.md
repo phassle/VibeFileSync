@@ -12,7 +12,7 @@ Install these portable skill directories for the harnesses used by the team:
 - `setup-dynamic-skills`
 - `calibrate-dynamic-models`
 
-Also install Matt Pocock's official engineering skills. `implement`, `tdd`, `code-review`, and `setup-matt-pocock-skills` are mandatory. Dynamic Implement stops before mutation when they are unavailable.
+Also install Matt Pocock's official engineering skills. `wayfinder`, `implement`, `tdd`, `code-review`, and `setup-matt-pocock-skills` are mandatory; install `to-tickets` when large specs may need decomposition. Dynamic Implement stops before mutation when a mode's required skill is unavailable.
 
 Common personal locations:
 
@@ -56,11 +56,13 @@ Root runs are slash/skill-entry only; ordinary prose cannot start implementation
 
 | Harness | Entry |
 | --- | --- |
-| Codex | `$dynamic-implement <issue>` or select it through `/skills` |
-| Claude Code | `/dynamic-implement <issue>` |
-| GitHub Copilot | `/dynamic-implement <issue>` |
-| OpenCode | `/dynamic-implement <issue>` through its command adapter |
-| Pi | `/skill:dynamic-implement <issue>` |
+| Codex | `$dynamic-implement [<issue>]` or select it through `/skills` |
+| Claude Code | `/dynamic-implement [<issue>]` |
+| GitHub Copilot | `/dynamic-implement [<issue>]` |
+| OpenCode | `/dynamic-implement [<issue>]` through its command adapter |
+| Pi | `/skill:dynamic-implement [<issue>]` |
+
+With no issue, the explicit command runs a read-only orientation. It applies Wayfinder's map/frontier semantics to tracker, Git, PR, worktree, dependency, and completed-work evidence, then returns one proposed next flow and stops. It never claims a Wayfinder ticket, runs model setup, creates a Goal/branch, or starts implementation. If the actionable frontier is empty, it offers to shape a new feature together by naming a destination and charting its first decisions. Run the command again with the chosen issue to implement it.
 
 Use one coordinator per root issue. Never run the same issue concurrently in two harnesses. To move from Codex to Claude, stop at a safe checkpoint and invoke the same root issue in Claude; it reconciles the tracker, ledger, Git branches, worktrees, tests, and reviews before continuing.
 

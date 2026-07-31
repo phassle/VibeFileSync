@@ -8,7 +8,7 @@ Install all three directories as one compatible set:
 
 | Skill | Purpose | Normal entry |
 | --- | --- | --- |
-| `dynamic-implement` | Plan and execute an issue through integration and tracker updates | Explicit issue invocation |
+| `dynamic-implement` | Orient current work without an argument, or execute one issue through integration | Explicit invocation |
 | `setup-dynamic-skills` | Research and live-verify available model and reasoning-effort steps | Manual setup only |
 | `calibrate-dynamic-models` | Convert completed issue telemetry into repository-owned routing knowledge | Invoked before a feature PR or manually |
 
@@ -19,7 +19,7 @@ Do not copy only `SKILL.md`. Each complete directory is required because Dynamic
 - Git and the repository's configured issue-tracker client. GitHub repositories normally require an authenticated `gh` CLI.
 - Python 3 for the structured agent activity logger.
 - At least one supported coding harness: Codex, Claude Code, GitHub Copilot, OpenCode, or Pi.
-- [Matt Pocock's engineering skills](https://github.com/mattpocock/skills). Dynamic Implement requires `implement`, `tdd`, `code-review`, and `setup-matt-pocock-skills`; install `to-tickets` as well when large specs may need decomposition.
+- [Matt Pocock's engineering skills](https://github.com/mattpocock/skills). Dynamic Implement requires `wayfinder`, `implement`, `tdd`, `code-review`, and `setup-matt-pocock-skills`; install `to-tickets` as well when large specs may need decomposition.
 
 Install Matt Pocock's current skills with the interactive installer:
 
@@ -108,7 +108,7 @@ description: Run or smoke-test dynamic implementation
 
 DYNAMIC_IMPLEMENT_SLASH_ENTRY=1
 
-Load the installed `dynamic-implement` skill through the native skill tool and execute it for this issue or URL: $ARGUMENTS
+Load the installed `dynamic-implement` skill through the native skill tool. With no arguments, run its read-only Wayfinder-based orientation mode and stop. Otherwise execute it for this issue, URL, or smoke-test flag: $ARGUMENTS
 ```
 
 Create `setup-dynamic-skills.md` with:
@@ -151,9 +151,23 @@ Setup researches the current models and native reasoning-effort values, shows th
 
 The model catalog expires after 14 days. Dynamic Implement never runs setup automatically; it stops safely and reports the exact manual command when setup is absent, stale, or incomplete.
 
+The no-issue orientation mode does not require this model capability setup because it creates no model session or implementation state. It still requires `wayfinder` and the repository configuration produced by `setup-matt-pocock-skills`.
+
 ## Verify the installation
 
-Confirm that the harness lists all three skills, then run the structural smoke test:
+Confirm that the harness lists all three skills. First test read-only orientation by invoking Dynamic Implement with no argument:
+
+| Harness | Orientation entry |
+| --- | --- |
+| Codex | `$dynamic-implement` |
+| Claude Code | `/dynamic-implement` |
+| GitHub Copilot | `/dynamic-implement` |
+| OpenCode | `/dynamic-implement` |
+| Pi | `/skill:dynamic-implement` |
+
+It should summarize completed, active, blocked, and ready work; apply Wayfinder frontier semantics; propose a dependency-safe next flow; and stop without mutations. If nothing is actionable, it should offer to shape a new feature together.
+
+Then run the structural smoke test:
 
 ```text
 $dynamic-implement --smoke-test
