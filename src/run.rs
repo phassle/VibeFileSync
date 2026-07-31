@@ -79,6 +79,35 @@ pub fn run(
         },
         ..RunStats::default()
     };
+    for stray in &plan.strays {
+        let action = Action {
+            rel_path: stray.clone(),
+            bytes: fs::metadata(pair.destination.join(stray))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            reason: "abandoned temp".to_string(),
+        };
+        journal
+            .action_start(Operation::Cleanup, &action, None, None)
+            .map_err(journal_runtime_error)?;
+        match fs::remove_file(pair.destination.join(stray)) {
+            Ok(()) => {
+                journal
+                    .action_done(Operation::Cleanup, &action, None, &[])
+                    .map_err(journal_runtime_error)?;
+                println!("Cleaned stray temp: {}", stray.display());
+            }
+            Err(error) => {
+                stats.counts.failed += 1;
+                journal
+                    .action_failed(Operation::Cleanup, &action, &error.to_string())
+                    .map_err(journal_runtime_error)?;
+                eprintln!("vibesync: cleanup {} failed: {error}", stray.display());
+                journal.summary(&stats).map_err(journal_runtime_error)?;
+                return Ok(1);
+            }
+        }
+    }
     for (operation, action) in plan
         .copies
         .iter()
@@ -119,7 +148,9 @@ pub fn run(
                 match operation {
                     Operation::Copy => stats.counts.copied += 1,
                     Operation::Update => stats.counts.updated += 1,
-                    Operation::Delete => unreachable!("deletes use their own execution loop"),
+                    Operation::Delete | Operation::Cleanup => {
+                        unreachable!("deletes and cleanup use their own execution loops")
+                    }
                 }
             }
             Err(error) => {
@@ -208,6 +239,7 @@ fn copy_file(
     fs::create_dir_all(parent)?;
     let result = (|| {
         copyfile_all_but_acls(source, temp)?;
+        crash_at("temp_created");
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
             .is_some_and(|path| Path::new(&path) == action.rel_path)
@@ -242,6 +274,16 @@ fn copy_file(
     }
     result
 }
+
+#[cfg(feature = "fault-injection")]
+fn crash_at(transition: &str) {
+    if std::env::var("VIBESYNC_TEST_CRASH_AT").ok().as_deref() == Some(transition) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn crash_at(_: &str) {}
 
 struct ActionOutcome {
     safety_net: Option<PathBuf>,

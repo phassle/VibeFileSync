@@ -655,8 +655,8 @@ fn plan_never_shows_or_deletes_machinery() {
         "SafetyNet run folder must never appear: {stdout}"
     );
     assert!(
-        !stdout.contains("vibesync-tmp"),
-        "Publish temps must never appear: {stdout}"
+        stdout.contains("Stray temps (1)") && stdout.contains(".real.txt.vibesync-tmp-abc123"),
+        "strays are reported separately, never as sync content: {stdout}"
     );
     // The only planned action is the real source file (a COPY); nothing is
     // planned for deletion even though the destination is non-empty.
@@ -1375,4 +1375,132 @@ fn journal_failure_after_publish_is_an_interrupted_run_not_a_precondition_abort(
     assert_eq!(output.status.code(), Some(EXIT_INTERRUPTED));
     let status = fx.cmd().args(["status", "limited"]).output().unwrap();
     assert!(String::from_utf8_lossy(&status.stdout).contains("interrupted"));
+}
+
+// --- Slice 7: convergence (issue #21) ---
+
+#[test]
+fn plan_and_status_report_stray_temps_without_destination_writes() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "published source");
+    fx.write_dest(
+        ".photo.txt.vibesync-tmp-20260731T120000Z",
+        "interrupted temp",
+    );
+    fx.add_photos_pair();
+    let before = Fixture::snapshot(fx.destination.path());
+
+    let plan = fx.cmd().args(["plan", "photos"]).output().unwrap();
+    assert_eq!(plan.status.code(), Some(EXIT_OK));
+    assert!(String::from_utf8_lossy(&plan.stdout).contains("Stray temps (1)"));
+    assert_eq!(
+        Fixture::snapshot(fx.destination.path()),
+        before,
+        "plan wrote to destination"
+    );
+
+    let status = fx.cmd().args(["status", "photos"]).output().unwrap();
+    assert_eq!(status.status.code(), Some(EXIT_OK));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("Stray temps (1)"));
+    assert_eq!(
+        Fixture::snapshot(fx.destination.path()),
+        before,
+        "status wrote to destination"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn rerun_cleans_strays_journals_cleanup_and_scans_fresh() {
+    let fx = Fixture::new();
+    fx.write_source("published.txt", "already published");
+    fx.add_photos_pair();
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    fx.write_source("interrupted.txt", "must be recopied");
+    let crashed = fx
+        .cmd()
+        .env("VIBESYNC_TEST_CRASH_AT", "temp_created")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        !crashed.status.success(),
+        "fault injection kills the real binary"
+    );
+    assert!(fs::read_dir(fx.destination.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".interrupted.txt.vibesync-tmp-")
+    }));
+    let crashed_journal = fs::read_dir(fx.journal_dir("photos"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("ndjson"))
+        .find(|path| !fs::read_to_string(path).unwrap().contains("\"summary\""))
+        .unwrap();
+    assert!(
+        !fs::read_to_string(crashed_journal)
+            .unwrap()
+            .contains("\"summary\""),
+        "a killed run remains summary-less"
+    );
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("published.txt")).unwrap(),
+        "already published"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("interrupted.txt")).unwrap(),
+        "must be recopied"
+    );
+    assert!(
+        fs::read_dir(fx.destination.path())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".vibesync-tmp-")),
+        "the rerun removes the abandoned sibling temp"
+    );
+
+    let journal = fs::read_dir(fx.journal_dir("photos"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("ndjson"))
+        .find(|path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("\"op\":\"cleanup\"")
+        })
+        .unwrap();
+    let events: Vec<serde_json::Value> = fs::read_to_string(journal)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["type"] == "action_done"
+            && event["op"] == "cleanup"
+            && event["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(".interrupted.txt.vibesync-tmp-"))
+    }));
+    let planned = events
+        .iter()
+        .find(|event| event["type"] == "run_start")
+        .unwrap()["planned_actions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        planned.len(),
+        1,
+        "fresh scan must not replay published work"
+    );
+    assert_eq!(planned[0]["path"], "interrupted.txt");
 }
