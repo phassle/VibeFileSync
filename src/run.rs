@@ -124,6 +124,7 @@ pub fn run(
             "vibesync: run blocked by {} plan error(s)",
             plan.errors.len()
         );
+        stats.counts.failed += plan.errors.len();
         journal.summary(&stats).map_err(journal_runtime_error)?;
         return Ok(EXIT_BLOCKED_PLAN);
     }
