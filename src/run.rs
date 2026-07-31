@@ -127,6 +127,28 @@ pub fn run(
         journal.summary(&stats).map_err(journal_runtime_error)?;
         return Ok(EXIT_BLOCKED_PLAN);
     }
+    for (operation, action) in missing_reviewed_actions(&initial_plan, &plan) {
+        let source = match operation {
+            Operation::Copy | Operation::Update => Some(pair.source.join(&action.rel_path)),
+            Operation::Delete | Operation::Cleanup => None,
+        };
+        journal
+            .action_start(operation, action, source.as_deref(), None)
+            .map_err(journal_runtime_error)?;
+        journal
+            .action_failed(
+                operation,
+                action,
+                "changed during reconciliation; rerun required",
+            )
+            .map_err(journal_runtime_error)?;
+        stats.counts.failed += 1;
+        eprintln!(
+            "vibesync: {} {} changed during reconciliation; rerun required",
+            operation.as_str().to_ascii_uppercase(),
+            action.rel_path.display()
+        );
+    }
     retain_reviewed_actions(&mut plan, &initial_plan);
     for (operation, action) in plan
         .copies
@@ -246,6 +268,32 @@ fn retain_reviewed_actions(fresh: &mut plan::Plan, reviewed: &plan::Plan) {
     fresh
         .deletes
         .retain(|action| reviewed.deletes.contains(action));
+}
+
+fn missing_reviewed_actions<'a>(
+    reviewed: &'a plan::Plan,
+    fresh: &plan::Plan,
+) -> Vec<(Operation, &'a Action)> {
+    reviewed
+        .copies
+        .iter()
+        .filter(|action| !fresh.copies.contains(*action))
+        .map(|action| (Operation::Copy, action))
+        .chain(
+            reviewed
+                .updates
+                .iter()
+                .filter(|action| !fresh.updates.contains(*action))
+                .map(|action| (Operation::Update, action)),
+        )
+        .chain(
+            reviewed
+                .deletes
+                .iter()
+                .filter(|action| !fresh.deletes.contains(*action))
+                .map(|action| (Operation::Delete, action)),
+        )
+        .collect()
 }
 
 fn confirm() -> Result<bool, AppError> {
@@ -596,6 +644,32 @@ mod tests {
         retain_reviewed_actions(&mut fresh, &reviewed);
 
         assert_eq!(fresh.copies, reviewed.copies);
+    }
+
+    #[test]
+    fn changed_reviewed_action_is_reported_as_missing() {
+        let reviewed = plan::Plan {
+            copies: vec![Action {
+                rel_path: PathBuf::from("photo.txt"),
+                bytes: 1,
+                reason: "new".to_string(),
+            }],
+            ..plan::Plan::default()
+        };
+        let fresh = plan::Plan {
+            copies: vec![Action {
+                rel_path: PathBuf::from("photo.txt"),
+                bytes: 2,
+                reason: "new".to_string(),
+            }],
+            ..plan::Plan::default()
+        };
+
+        let missing = missing_reviewed_actions(&reviewed, &fresh);
+
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0.as_str(), "copy");
+        assert_eq!(missing[0].1.rel_path, PathBuf::from("photo.txt"));
     }
 
     #[test]
