@@ -6,6 +6,8 @@
 mod banner;
 mod config;
 mod error;
+mod event;
+mod failure;
 mod journal;
 mod ndjson;
 mod pair;

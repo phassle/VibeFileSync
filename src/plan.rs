@@ -55,6 +55,23 @@ pub struct PlanError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PlanOperation {
+    Copy,
+    Update,
+    Delete,
+    Error,
+}
+
+#[derive(Debug)]
+enum SourceClassification {
+    Action(PlanOperation, Action),
+    Error(PlanError),
+    Excluded,
+    Unchanged,
+}
+
 /// The computed Dry-run diff for one Folder pair.
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
@@ -95,14 +112,16 @@ fn is_machinery(name: &OsStr) -> bool {
 /// deterministically sorted. Symlinks are recorded via `symlink_metadata`
 /// (never followed), so a symlinked directory is one entry, not a subtree.
 fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
-    scan_with(root, |_, _| Ok(()))
+    let mut entries = BTreeMap::new();
+    walk(root, |path, entry| {
+        entries.insert(path.to_path_buf(), entry.clone());
+        Ok(())
+    })?;
+    Ok(entries)
 }
 
-fn scan_with(
-    root: &Path,
-    mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
-) -> io::Result<BTreeMap<PathBuf, Entry>> {
-    let mut map = BTreeMap::new();
+fn walk(root: &Path, mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>) -> io::Result<usize> {
+    let mut count = 0;
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -131,11 +150,11 @@ fn scan_with(
                 is_symlink: file_type.is_symlink(),
             };
             visit(&rel, &scanned)?;
-            map.insert(rel, scanned);
+            count += 1;
         }
     }
 
-    Ok(map)
+    Ok(count)
 }
 
 /// Computes the Dry-run diff. Pure over the two scanned trees:
@@ -165,47 +184,16 @@ pub fn compute(
     // in Mirror mode.
     let dest_only = || dest.keys().filter(|p| !source.contains_key(*p)).count();
     let mut plan = Plan {
-        scanned: source.len() + if mode == Mode::Mirror { dest_only() } else { 0 },
+        scanned: if mode == Mode::Mirror { dest_only() } else { 0 },
         source_entries: source.len(),
         destination_entries: dest.len(),
         ..Plan::default()
     };
-    let is_excluded = |rel: &Path| excludes.iter().any(|e| Path::new(e) == rel);
-
     for (rel, src) in source {
-        if is_excluded(rel) {
-            plan.excluded += 1;
-            continue;
-        }
-
-        if src.is_symlink && !supports_symlinks {
-            plan.errors.push(PlanError {
-                rel_path: rel.clone(),
-                message: "symlink not supported on exFAT destination".to_string(),
-            });
-            continue;
-        }
-
-        match dest.get(rel) {
-            None => plan.copies.push(Action {
-                rel_path: rel.clone(),
-                bytes: src.size,
-                old_bytes: None,
-                reason: "new".to_string(),
-            }),
-            Some(dst) => {
-                if let Some(reason) = change_reason(src, dst) {
-                    plan.updates.push(Action {
-                        rel_path: rel.clone(),
-                        bytes: src.size,
-                        old_bytes: Some(dst.size),
-                        reason: reason.to_string(),
-                    });
-                } else {
-                    plan.unchanged += 1;
-                }
-            }
-        }
+        record_classification(
+            &mut plan,
+            classify_source_entry(rel, src, dest.get(rel), supports_symlinks, excludes),
+        );
     }
 
     // Removals are Mirror-only. In Update nothing at the destination is
@@ -215,7 +203,7 @@ pub fn compute(
             if source.contains_key(rel) {
                 continue;
             }
-            if is_excluded(rel) {
+            if excludes.iter().any(|excluded| Path::new(excluded) == rel) {
                 plan.excluded += 1;
                 continue;
             }
@@ -229,6 +217,63 @@ pub fn compute(
     }
 
     plan
+}
+
+/// Classifies and records one source entry for both buffered human plans and
+/// incremental JSON plans. Returning the row lets the streaming caller emit
+/// immediately without reimplementing the classification decision tree.
+fn classify_source_entry(
+    rel: &Path,
+    source: &Entry,
+    destination: Option<&Entry>,
+    supports_symlinks: bool,
+    excludes: &[String],
+) -> SourceClassification {
+    if excludes.iter().any(|excluded| Path::new(excluded) == rel) {
+        return SourceClassification::Excluded;
+    }
+    if source.is_symlink && !supports_symlinks {
+        let error = PlanError {
+            rel_path: rel.to_path_buf(),
+            message: "symlink not supported on exFAT destination".to_string(),
+        };
+        return SourceClassification::Error(error);
+    }
+    match destination {
+        None => SourceClassification::Action(
+            PlanOperation::Copy,
+            Action {
+                rel_path: rel.to_path_buf(),
+                bytes: source.size,
+                old_bytes: None,
+                reason: "new".to_string(),
+            },
+        ),
+        Some(old) => match change_reason(source, old) {
+            Some(reason) => SourceClassification::Action(
+                PlanOperation::Update,
+                Action {
+                    rel_path: rel.to_path_buf(),
+                    bytes: source.size,
+                    old_bytes: Some(old.size),
+                    reason: reason.to_string(),
+                },
+            ),
+            None => SourceClassification::Unchanged,
+        },
+    }
+}
+
+fn record_classification(plan: &mut Plan, classification: SourceClassification) {
+    plan.scanned += 1;
+    match classification {
+        SourceClassification::Action(PlanOperation::Copy, action) => plan.copies.push(action),
+        SourceClassification::Action(PlanOperation::Update, action) => plan.updates.push(action),
+        SourceClassification::Action(_, _) => unreachable!("source rows are copy/update only"),
+        SourceClassification::Error(error) => plan.errors.push(error),
+        SourceClassification::Excluded => plan.excluded += 1,
+        SourceClassification::Unchanged => plan.unchanged += 1,
+    }
 }
 
 /// Why a file present on both sides needs an UPDATE, or `None` if it is
@@ -375,101 +420,122 @@ pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i
 /// line. Rows are emitted individually and never assembled into a JSON
 /// document, keeping the public wire format incremental and constant-space.
 pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
-    let cfg = config::load(config_path)?;
-    let configured = cfg
-        .pairs
-        .get(pair_name)
-        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
-    let (header_pair, _) = crate::preconditions::resolve_pair(configured)?;
-    if !header_pair.source.is_dir() {
-        return Err(AppError::Precondition(format!(
-            "{}: source directory not found (is the volume mounted?)",
-            header_pair.source.display()
-        )));
-    }
+    let setup = prepare(config_path, pair_name)?;
+    let header_pair = setup.pair;
     let run_id = crate::journal::available_run_id(pair_name, &header_pair.destination)
         .map_err(scan_error_for_json)?;
     emit(serde_json::json!({
         "schema": "vibefilesync.plan/v1", "type": "plan_start", "run_id": run_id,
         "pair": pair_name, "mode": header_pair.mode, "dry_run": true
     }))?;
-    let destination = if header_pair.destination.is_dir() {
-        scan(&header_pair.destination).map_err(|e| scan_error(&header_pair.destination, e))?
-    } else {
-        BTreeMap::new()
-    };
-    let supports_symlinks = volume::filesystem_type(&header_pair.destination)
-        .map(|kind| !kind.eq_ignore_ascii_case("exfat"))
-        .unwrap_or(true);
-    let mut plan = Plan {
-        destination_entries: destination.len(),
-        ..Plan::default()
-    };
-    let source = scan_with(&header_pair.source, |path, entry| {
-        plan.scanned += 1;
-        if excludes.iter().any(|excluded| Path::new(excluded) == path) {
-            plan.excluded += 1;
-            return Ok(());
-        }
-        let row = if entry.is_symlink && !supports_symlinks {
-            plan.errors.push(PlanError { rel_path: path.to_path_buf(), message: "symlink not supported on exFAT destination".into() });
-            serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","run_id":run_id,"op":"error","path":path.to_string_lossy(),"reason":"symlink not supported on exFAT destination"})
-        } else if let Some(old) = destination.get(path) {
-            match change_reason(entry, old) {
-                Some(reason) => {
-                    let action = Action { rel_path: path.to_path_buf(), bytes: entry.size, old_bytes: Some(old.size), reason: reason.into() };
-                    let row = plan_action_row(&run_id, "update", &action);
-                    plan.updates.push(action);
-                    row
-                }
-                None => { plan.unchanged += 1; return Ok(()); }
+    let mut stats = StreamStats::default();
+    walk(&header_pair.source, |path, entry| {
+        stats.scanned += 1;
+        let old = entry_at(&header_pair.destination.join(path))?;
+        let row = match classify_source_entry(
+            path,
+            entry,
+            old.as_ref(),
+            setup.supports_symlinks,
+            excludes,
+        ) {
+            SourceClassification::Action(op, action) => {
+                stats.increment(op);
+                plan_action_row(&run_id, op, &action)
             }
-        } else {
-            let action = Action { rel_path: path.to_path_buf(), bytes: entry.size, old_bytes: None, reason: "new".into() };
-            let row = plan_action_row(&run_id, "copy", &action);
-            plan.copies.push(action);
-            row
+            SourceClassification::Error(error) => {
+                stats.errors += 1;
+                serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","run_id":run_id,"op":PlanOperation::Error,"path":error.rel_path.to_string_lossy(),"reason":error.message})
+            }
+            SourceClassification::Excluded => {
+                stats.excluded += 1;
+                return Ok(());
+            }
+            SourceClassification::Unchanged => {
+                stats.unchanged += 1;
+                return Ok(());
+            }
         };
         crate::ndjson::stdout(&row).map_err(io::Error::other)
-    }).map_err(|e| scan_error(&header_pair.source, e))?;
-    plan.source_entries = source.len();
-    if header_pair.mode == Mode::Mirror {
-        for (path, entry) in &destination {
-            if source.contains_key(path) {
-                continue;
+    })
+    .map_err(|e| scan_error(&header_pair.source, e))?;
+    if header_pair.mode == Mode::Mirror && header_pair.destination.is_dir() {
+        walk(&header_pair.destination, |path, entry| {
+            if entry_at(&header_pair.source.join(path))?.is_some() {
+                return Ok(());
             }
-            plan.scanned += 1;
+            stats.scanned += 1;
             if excludes.iter().any(|excluded| Path::new(excluded) == path) {
-                plan.excluded += 1;
-                continue;
+                stats.excluded += 1;
+                return Ok(());
             }
             let action = Action {
-                rel_path: path.clone(),
+                rel_path: path.to_path_buf(),
                 bytes: entry.size,
                 old_bytes: Some(entry.size),
                 reason: "not in source".into(),
             };
-            emit(plan_action_row(&run_id, "delete", &action))?;
-            plan.deletes.push(action);
-        }
+            crate::ndjson::stdout(&plan_action_row(&run_id, PlanOperation::Delete, &action))
+                .map_err(io::Error::other)?;
+            stats.deletes += 1;
+            Ok(())
+        })
+        .map_err(|error| scan_error(&header_pair.destination, error))?;
     }
+    let strays = stray_temps(&header_pair.destination)
+        .map_err(|error| scan_error(&header_pair.destination, error))?;
     emit(serde_json::json!({
         "schema": "vibefilesync.plan/v1", "type": "summary", "run_id": run_id,
-        "counts": {"copy": plan.copies.len(), "update": plan.updates.len(), "delete": plan.deletes.len(), "error": plan.errors.len()},
-        "scanned": plan.scanned, "unchanged": plan.unchanged, "excluded": plan.excluded
+        "counts": {"copy": stats.copies, "update": stats.updates, "delete": stats.deletes, "error": stats.errors},
+        "scanned": stats.scanned, "unchanged": stats.unchanged, "excluded": stats.excluded,
+        "strays": strays.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>()
     }))?;
     Ok(crate::error::EXIT_OK)
 }
 
-fn plan_action_row(run_id: &str, op: &str, action: &Action) -> serde_json::Value {
+fn entry_at(path: &Path) -> io::Result<Option<Entry>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(None),
+        Ok(metadata) => Ok(Some(Entry {
+            size: metadata.len(),
+            mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            is_symlink: metadata.file_type().is_symlink(),
+        })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Default)]
+struct StreamStats {
+    copies: usize,
+    updates: usize,
+    deletes: usize,
+    errors: usize,
+    scanned: usize,
+    unchanged: usize,
+    excluded: usize,
+}
+
+impl StreamStats {
+    fn increment(&mut self, operation: PlanOperation) {
+        match operation {
+            PlanOperation::Copy => self.copies += 1,
+            PlanOperation::Update => self.updates += 1,
+            _ => unreachable!("source actions are copy/update only"),
+        }
+    }
+}
+
+fn plan_action_row(run_id: &str, op: PlanOperation, action: &Action) -> serde_json::Value {
     let mut row = serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","run_id":run_id,"op":op,"path":action.rel_path.to_string_lossy(),"reason":action.reason});
-    if op != "delete" {
+    if op != PlanOperation::Delete {
         row["bytes"] = action.bytes.into();
     }
     if let Some(bytes) = action.old_bytes {
         row["old_bytes"] = bytes.into();
     }
-    if op == "update" || op == "delete" {
+    if matches!(op, PlanOperation::Update | PlanOperation::Delete) {
         row["safety_net"] = format!("_SafetyNet/{run_id}/{}", action.rel_path.display()).into();
     }
     row
@@ -483,6 +549,37 @@ fn scan_error_for_json(error: io::Error) -> AppError {
     AppError::Precondition(error.to_string())
 }
 
+struct PlanSetup {
+    pair: config::Pair,
+    supports_symlinks: bool,
+    notices: Vec<String>,
+}
+
+fn prepare(config_path: &Path, pair_name: &str) -> Result<PlanSetup, AppError> {
+    let cfg = config::load(config_path)?;
+    let configured = cfg
+        .pairs
+        .get(pair_name)
+        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+    let (pair, notices) = crate::preconditions::resolve_pair(configured)?;
+    if !pair.source.is_dir() {
+        return Err(AppError::Precondition(format!(
+            "{}: source directory not found (is the volume mounted?)",
+            pair.source.display()
+        )));
+    }
+    let destination_exists = pair.destination.is_dir();
+    let supports_symlinks = !destination_exists
+        || volume::filesystem_type(&pair.destination)
+            .map(|kind| !kind.eq_ignore_ascii_case("exfat"))
+            .unwrap_or(true);
+    Ok(PlanSetup {
+        pair,
+        supports_symlinks,
+        notices,
+    })
+}
+
 /// Builds a fresh plan for the CLI edges which need to render it and then
 /// act on exactly the reviewed COPY rows. The scan remains owned by this
 /// module; callers receive no filesystem internals.
@@ -491,47 +588,26 @@ pub(crate) fn build(
     pair_name: &str,
     excludes: &[String],
 ) -> Result<(config::Pair, Plan), AppError> {
-    let cfg = config::load(config_path)?;
-    let pair = cfg
-        .pairs
-        .get(pair_name)
-        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
-    let (pair, notices) = crate::preconditions::resolve_pair(pair)?;
-    for notice in notices {
+    let setup = prepare(config_path, pair_name)?;
+    for notice in setup.notices {
         eprintln!("{notice}");
     }
-
-    if !pair.source.is_dir() {
-        return Err(AppError::Precondition(format!(
-            "{}: source directory not found (is the volume mounted?)",
-            pair.source.display()
-        )));
-    }
-
-    let source = scan(&pair.source).map_err(|e| scan_error(&pair.source, e))?;
-
-    let dest_exists = pair.destination.is_dir();
-    let dest = if dest_exists {
-        scan(&pair.destination).map_err(|e| scan_error(&pair.destination, e))?
+    let pair = setup.pair;
+    let source = scan(&pair.source).map_err(|error| scan_error(&pair.source, error))?;
+    let destination = if pair.destination.is_dir() {
+        scan(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?
     } else {
         BTreeMap::new()
     };
-
-    // exFAT can't store symlinks; a source symlink bound for it is a
-    // per-file plan error. If the destination doesn't exist yet, or its
-    // filesystem can't be determined, assume symlinks are fine rather than
-    // manufacturing errors.
-    let supports_symlinks = if dest_exists {
-        match volume::filesystem_type(&pair.destination) {
-            Ok(fs) => !fs.eq_ignore_ascii_case("exfat"),
-            Err(_) => true,
-        }
-    } else {
-        true
-    };
-
-    let mut plan = compute(&source, &dest, pair.mode, supports_symlinks, excludes);
-    plan.strays = stray_temps(&pair.destination).map_err(|e| scan_error(&pair.destination, e))?;
+    let mut plan = compute(
+        &source,
+        &destination,
+        pair.mode,
+        setup.supports_symlinks,
+        excludes,
+    );
+    plan.strays =
+        stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
     Ok((pair, plan))
 }
 

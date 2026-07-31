@@ -8,15 +8,18 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
+const COPYFILE_METADATA_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2);
 const F_FULLFSYNC: libc::c_int = 51;
 const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const RUN_SCHEMA: &str = "vibefilesync.run/v1";
 
 extern "C" {
     fn copyfile(
@@ -43,6 +46,215 @@ pub struct RunOptions<'a> {
     pub excludes: &'a [String],
 }
 
+enum RunReporter {
+    Human,
+    Json,
+}
+
+impl RunReporter {
+    fn new(json: bool) -> Self {
+        if json {
+            Self::Json
+        } else {
+            Self::Human
+        }
+    }
+
+    fn is_json(&self) -> bool {
+        matches!(self, Self::Json)
+    }
+
+    fn plan(&self, plan: &plan::Plan, pair: &str, mode: crate::config::Mode) {
+        if matches!(self, Self::Human) {
+            print!("{}", plan::render(plan, pair, mode));
+        }
+    }
+
+    fn precondition_warnings(&self, warnings: &[String]) {
+        if matches!(self, Self::Human) {
+            for warning in warnings {
+                eprintln!("{warning}");
+            }
+        }
+    }
+
+    fn blocked(&self, errors: usize) {
+        if matches!(self, Self::Human) {
+            eprintln!("vibesync: run blocked by {errors} plan error(s)");
+        }
+    }
+
+    fn cancelled(&self) {
+        if matches!(self, Self::Human) {
+            println!("Run cancelled; destination unchanged.");
+        }
+    }
+
+    fn confirm(&self) -> Result<bool, AppError> {
+        match self {
+            Self::Json => {
+                eprint!("Proceed with COPY actions? [y/N] ");
+                io::stderr().flush().map_err(io_error)?;
+            }
+            Self::Human => {
+                print!("Proceed with COPY actions? [y/N] ");
+                io::stdout().flush().map_err(io_error)?;
+            }
+        }
+        let mut response = String::new();
+        io::stdin().read_line(&mut response).map_err(io_error)?;
+        Ok(matches!(
+            response.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+
+    fn run_start(
+        &self,
+        run_id: &str,
+        pair: &str,
+        mode: crate::config::Mode,
+        destination: &Path,
+        warnings: &[String],
+        planned: usize,
+    ) -> Result<(), AppError> {
+        let mut event = crate::event::run_start(
+            crate::event::Context {
+                schema: RUN_SCHEMA,
+                run_id,
+            },
+            pair,
+            warnings,
+            &crate::volume::expected_degradations(destination),
+        );
+        event["mode"] = serde_json::json!(mode);
+        event["planned"] = planned.into();
+        self.json(event)
+    }
+
+    fn action_start(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+    ) -> Result<(), AppError> {
+        self.json(crate::event::action_start(
+            crate::event::Context {
+                schema: RUN_SCHEMA,
+                run_id,
+            },
+            operation,
+            action,
+        ))?;
+        if action.bytes >= PROGRESS_THRESHOLD
+            && matches!(operation, Operation::Copy | Operation::Update)
+        {
+            self.progress(run_id, operation, action, 0)?;
+        }
+        Ok(())
+    }
+
+    fn progress(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+        bytes: u64,
+    ) -> Result<(), AppError> {
+        self.json(serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":bytes,"total_bytes":action.bytes}))
+    }
+
+    fn action_done(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+        safety_net: Option<&Path>,
+        warnings: &[String],
+        full_verify: bool,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Json => crate::ndjson::stdout(&crate::event::action_done(
+                crate::event::Context {
+                    schema: RUN_SCHEMA,
+                    run_id,
+                },
+                operation,
+                action,
+                safety_net,
+                warnings,
+                matches!(operation, Operation::Copy | Operation::Update)
+                    .then_some(if full_verify { "full" } else { "standard" }),
+                false,
+            )),
+            Self::Human => {
+                for warning in warnings {
+                    eprintln!(
+                        "vibesync: {} {} warning: {warning}",
+                        operation.as_str().to_ascii_uppercase(),
+                        action.rel_path.display()
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn action_failed(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+        error: &io::Error,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Json => crate::ndjson::stdout(&crate::event::action_failed(
+                crate::event::Context {
+                    schema: RUN_SCHEMA,
+                    run_id,
+                },
+                operation,
+                action,
+                &error.to_string(),
+            )),
+            Self::Human => {
+                eprintln!(
+                    "vibesync: {} {} failed: {error}",
+                    operation.as_str().to_ascii_uppercase(),
+                    action.rel_path.display()
+                );
+                if error.raw_os_error() == Some(libc::ENOSPC) {
+                    eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn cleaned(&self, path: &Path) {
+        if matches!(self, Self::Human) {
+            println!("Cleaned stray temp: {}", path.display());
+        }
+    }
+
+    fn summary(&self, run_id: &str, stats: &RunStats) -> Result<(), AppError> {
+        self.json(crate::event::summary(
+            crate::event::Context {
+                schema: RUN_SCHEMA,
+                run_id,
+            },
+            stats,
+        ))
+    }
+
+    fn json(&self, value: serde_json::Value) -> Result<(), AppError> {
+        if matches!(self, Self::Json) {
+            crate::ndjson::stdout(&value)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
     let RunOptions {
         yes,
@@ -53,53 +265,42 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
         full_verify,
         excludes,
     } = options;
+    let reporter = RunReporter::new(json_output);
     let config = crate::config::load(config_path)?;
     if !config.pairs.contains_key(pair_name) {
         return Err(AppError::Usage(format!("pair '{pair_name}' not found")));
     }
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, plan) = plan::build(config_path, pair_name, excludes)?;
-    if !json_output {
-        print!("{}", plan::render(&plan, pair_name, pair.mode));
-    }
+    reporter.plan(&plan, pair_name, pair.mode);
 
     let run_warnings =
         crate::preconditions::check_run(&pair, &plan, allow_empty_source, ignore_space_check)?;
-    for warning in &run_warnings {
-        if !json_output {
-            eprintln!("{warning}");
-        }
-    }
+    reporter.precondition_warnings(&run_warnings);
 
     if !plan.errors.is_empty() {
-        if !json_output {
-            eprintln!(
-                "vibesync: run blocked by {} plan error(s)",
-                plan.errors.len()
-            );
-        }
+        reporter.blocked(plan.errors.len());
         return Ok(EXIT_BLOCKED_PLAN);
     }
 
-    if !yes && !confirm(json_output)? {
-        if !json_output {
-            println!("Run cancelled; destination unchanged.");
-        }
+    if !yes && !reporter.confirm()? {
+        reporter.cancelled();
         return Ok(EXIT_OK);
     }
 
     let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
+    let degradations = crate::volume::expected_degradations(&pair.destination);
     journal
-        .run_start(pair_name, &plan, &run_warnings)
+        .run_start(pair_name, &plan, &run_warnings, &degradations)
         .map_err(io_error)?;
-    if json_output {
-        emit_run(serde_json::json!({
-            "schema": "vibefilesync.run/v1", "type": "run_start", "run_id": journal.run_id(),
-                "pair": pair_name, "mode": pair.mode, "degradations": expected_degradations(&pair.destination),
-                "warnings": run_warnings,
-            "planned": plan.copies.len() + plan.updates.len() + plan.deletes.len()
-        }))?;
-    }
+    reporter.run_start(
+        journal.run_id(),
+        pair_name,
+        pair.mode,
+        &pair.destination,
+        &run_warnings,
+        plan.copies.len() + plan.updates.len() + plan.deletes.len(),
+    )?;
     let mut stats = RunStats {
         counts: Counts {
             planned: plan.copies.len() + plan.updates.len() + plan.deletes.len(),
@@ -119,46 +320,30 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
         journal
             .action_start(Operation::Cleanup, &action, None, None)
             .map_err(journal_runtime_error)?;
-        if json_output {
-            emit_action_start(journal.run_id(), Operation::Cleanup, &action)?;
-        }
+        reporter.action_start(journal.run_id(), Operation::Cleanup, &action)?;
         match fs::remove_file(pair.destination.join(stray)) {
             Ok(()) => {
                 journal
                     .action_done(Operation::Cleanup, &action, None, &[], None)
                     .map_err(journal_runtime_error)?;
-                if json_output {
-                    emit_action_done(
-                        journal.run_id(),
-                        Operation::Cleanup,
-                        &action,
-                        None,
-                        &[],
-                        false,
-                    )?;
-                } else {
-                    println!("Cleaned stray temp: {}", stray.display());
-                }
+                reporter.action_done(
+                    journal.run_id(),
+                    Operation::Cleanup,
+                    &action,
+                    None,
+                    &[],
+                    false,
+                )?;
+                reporter.cleaned(stray);
             }
             Err(error) => {
                 stats.counts.failed += 1;
                 journal
                     .action_failed(Operation::Cleanup, &action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                if json_output {
-                    emit_action_failed(
-                        journal.run_id(),
-                        Operation::Cleanup,
-                        &action,
-                        &error.to_string(),
-                    )?;
-                } else {
-                    eprintln!("vibesync: cleanup {} failed: {error}", stray.display());
-                }
+                reporter.action_failed(journal.run_id(), Operation::Cleanup, &action, &error)?;
                 journal.summary(&stats).map_err(journal_runtime_error)?;
-                if json_output {
-                    emit_summary(journal.run_id(), &stats)?;
-                }
+                reporter.summary(journal.run_id(), &stats)?;
                 return Ok(1);
             }
         }
@@ -179,14 +364,17 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
-        if json_output {
-            emit_action_start(journal.run_id(), operation, action)?;
-            if action.bytes >= PROGRESS_THRESHOLD {
-                emit_run(
-                    serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":journal.run_id(),"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":0,"total_bytes":action.bytes}),
-                )?;
+        reporter.action_start(journal.run_id(), operation, action)?;
+        let mut last_progress = Instant::now();
+        let mut progress = |copied: u64| -> io::Result<()> {
+            if copied == action.bytes || last_progress.elapsed() >= PROGRESS_INTERVAL {
+                reporter
+                    .progress(journal.run_id(), operation, action, copied)
+                    .map_err(io::Error::other)?;
+                last_progress = Instant::now();
             }
-        }
+            Ok(())
+        };
         match copy_file(
             &pair.destination,
             &source,
@@ -197,14 +385,11 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
                 run_id: journal.run_id(),
                 permanent_delete,
                 full_verify,
+                report_progress: reporter.is_json(),
             },
+            &mut progress,
         ) {
             Ok(outcome) => {
-                if json_output && action.bytes >= PROGRESS_THRESHOLD {
-                    emit_run(
-                        serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":journal.run_id(),"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":action.bytes,"total_bytes":action.bytes}),
-                    )?;
-                }
                 journal
                     .action_done(
                         operation,
@@ -217,16 +402,14 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
                 stats.counts.done += 1;
                 stats.bytes += action.bytes;
                 stats.warnings += outcome.warnings.len();
-                if json_output {
-                    emit_action_done(
-                        journal.run_id(),
-                        operation,
-                        action,
-                        outcome.safety_net.as_deref(),
-                        &outcome.warnings,
-                        full_verify,
-                    )?;
-                }
+                reporter.action_done(
+                    journal.run_id(),
+                    operation,
+                    action,
+                    outcome.safety_net.as_deref(),
+                    &outcome.warnings,
+                    full_verify,
+                )?;
                 match operation {
                     Operation::Copy => stats.counts.copied += 1,
                     Operation::Update => stats.counts.updated += 1,
@@ -240,28 +423,10 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
                 journal
                     .action_failed(operation, action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                if json_output {
-                    emit_action_failed(
-                        journal.run_id(),
-                        operation,
-                        action,
-                        &failure_reason(&error),
-                    )?;
-                } else {
-                    eprintln!(
-                        "vibesync: {} {} failed: {error}",
-                        operation.as_str().to_ascii_uppercase(),
-                        action.rel_path.display()
-                    );
-                }
-                if !json_output && error.raw_os_error() == Some(libc::ENOSPC) {
-                    eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
-                }
+                reporter.action_failed(journal.run_id(), operation, action, &error)?;
                 if error.kind() != io::ErrorKind::InvalidData {
                     journal.summary(&stats).map_err(journal_runtime_error)?;
-                    if json_output {
-                        emit_summary(journal.run_id(), &stats)?;
-                    }
+                    reporter.summary(journal.run_id(), &stats)?;
                     return Ok(1);
                 }
             }
@@ -272,9 +437,7 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
         journal
             .action_start(Operation::Delete, action, None, None)
             .map_err(journal_runtime_error)?;
-        if json_output {
-            emit_action_start(journal.run_id(), Operation::Delete, action)?;
-        }
+        reporter.action_start(journal.run_id(), Operation::Delete, action)?;
         match remove_file(
             &pair.destination,
             &destination,
@@ -289,75 +452,31 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
                 stats.counts.done += 1;
                 stats.counts.deleted += 1;
                 stats.bytes += action.bytes;
-                if json_output {
-                    emit_action_done(
-                        journal.run_id(),
-                        Operation::Delete,
-                        action,
-                        safety_net.as_deref(),
-                        &[],
-                        false,
-                    )?;
-                }
+                reporter.action_done(
+                    journal.run_id(),
+                    Operation::Delete,
+                    action,
+                    safety_net.as_deref(),
+                    &[],
+                    false,
+                )?;
             }
             Err(error) => {
                 stats.counts.failed += 1;
                 journal
                     .action_failed(Operation::Delete, action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                if json_output {
-                    emit_action_failed(
-                        journal.run_id(),
-                        Operation::Delete,
-                        action,
-                        &error.to_string(),
-                    )?;
-                } else {
-                    eprintln!(
-                        "vibesync: DELETE {} failed: {error}",
-                        action.rel_path.display()
-                    );
-                }
+                reporter.action_failed(journal.run_id(), Operation::Delete, action, &error)?;
             }
         }
     }
 
     journal.summary(&stats).map_err(journal_runtime_error)?;
-    if json_output {
-        emit_summary(journal.run_id(), &stats)?;
-    }
+    reporter.summary(journal.run_id(), &stats)?;
     if stats.counts.failed == 0 {
         Ok(EXIT_OK)
     } else {
         Ok(1)
-    }
-}
-
-fn confirm(json_output: bool) -> Result<bool, AppError> {
-    if json_output {
-        eprint!("Proceed with COPY actions? [y/N] ");
-        io::stderr().flush().map_err(io_error)?;
-    } else {
-        print!("Proceed with COPY actions? [y/N] ");
-        io::stdout().flush().map_err(io_error)?;
-    }
-    let mut response = String::new();
-    io::stdin().read_line(&mut response).map_err(io_error)?;
-    Ok(matches!(
-        response.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
-fn expected_degradations(destination: &Path) -> Vec<&'static str> {
-    match crate::volume::filesystem_type(destination) {
-        Ok(kind) if kind.eq_ignore_ascii_case("exfat") => vec![
-            "posix_permissions",
-            "acls",
-            "bsd_flags",
-            "timestamp_granularity",
-        ],
-        _ => Vec::new(),
     }
 }
 
@@ -368,11 +487,13 @@ fn copy_file(
     temp: &Path,
     action: &Action,
     options: CopyOptions<'_>,
+    progress: &mut impl FnMut(u64) -> io::Result<()>,
 ) -> io::Result<ActionOutcome> {
     let CopyOptions {
         run_id,
         permanent_delete,
         full_verify,
+        report_progress,
     } = options;
     let source_before = fs::metadata(source)?;
     let parent = destination
@@ -380,7 +501,15 @@ fn copy_file(
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
     let result = (|| {
-        copyfile_all_but_acls(source, temp)?;
+        if report_progress
+            && action.bytes >= PROGRESS_THRESHOLD
+            && fs::symlink_metadata(source)?.is_file()
+        {
+            copy_data_with_progress(source, temp, progress)?;
+            copyfile_metadata_but_acls(source, temp)?;
+        } else {
+            copyfile_all_but_acls(source, temp)?;
+        }
         crash_at("copy_complete");
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
@@ -389,6 +518,21 @@ fn copy_file(
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
         fully_sync(temp)?;
+        // Narrow issue-22 process-seam injection. ADR-0009's generic
+        // EXEC_AT transition harness is owned by the later harness slice.
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("VIBESYNC_TEST_WARNING_PATH")
+            .is_some_and(|path| Path::new(&path) == action.rel_path)
+        {
+            let epoch = [libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            }; 2];
+            let path = c_path(temp)?;
+            if unsafe { libc::utimes(path.as_ptr(), epoch.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let warnings = verify(source, &source_before, temp, action.bytes, full_verify)?;
         let safety_net = remove_file(
             destination_root,
@@ -399,12 +543,6 @@ fn copy_file(
         )?;
         fs::rename(temp, destination)?;
         sync_directory(parent)?;
-        for warning in &warnings {
-            eprintln!(
-                "vibesync: COPY {} warning: {warning}",
-                action.rel_path.display()
-            );
-        }
         Ok(ActionOutcome {
             safety_net,
             warnings,
@@ -421,6 +559,7 @@ struct CopyOptions<'a> {
     run_id: &'a str,
     permanent_delete: bool,
     full_verify: bool,
+    report_progress: bool,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -534,6 +673,14 @@ fn temporary_path(destination: &Path, run_id: &str) -> PathBuf {
 }
 
 fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
+    copyfile_with_flags(source, destination, COPYFILE_ALL_WITHOUT_ACLS)
+}
+
+fn copyfile_metadata_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
+    copyfile_with_flags(source, destination, COPYFILE_METADATA_WITHOUT_ACLS)
+}
+
+fn copyfile_with_flags(source: &Path, destination: &Path, flags: u32) -> io::Result<()> {
     let source = c_path(source)?;
     let destination = c_path(destination)?;
     let result = unsafe {
@@ -541,7 +688,7 @@ fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
             source.as_ptr(),
             destination.as_ptr(),
             std::ptr::null_mut(),
-            COPYFILE_ALL_WITHOUT_ACLS,
+            flags,
         )
     };
     if result == 0 {
@@ -549,6 +696,33 @@ fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn copy_data_with_progress(
+    source: &Path,
+    destination: &Path,
+    progress: &mut impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut source = File::open(source)?;
+    let mut destination = File::create(destination)?;
+    let mut buffer = [0_u8; 256 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..count])?;
+        copied += count as u64;
+        progress(copied)?;
+        // Makes elapsed-time throttling deterministic at the process seam;
+        // the generic ADR-0009 EXEC_AT harness remains a later slice.
+        #[cfg(feature = "fault-injection")]
+        if let Ok(delay) = std::env::var("VIBESYNC_TEST_COPY_CHUNK_DELAY_MS") {
+            std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
+        }
+    }
+    Ok(())
 }
 
 fn fully_sync(path: &Path) -> io::Result<()> {
@@ -646,69 +820,6 @@ fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
     }
 }
 
-fn emit_run(value: serde_json::Value) -> Result<(), AppError> {
-    crate::ndjson::stdout(&value)
-}
-
-fn emit_action_start(run_id: &str, operation: Operation, action: &Action) -> Result<(), AppError> {
-    emit_run(
-        serde_json::json!({"schema":"vibefilesync.run/v1","type":"action_start","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":action.bytes}),
-    )
-}
-
-fn emit_action_done(
-    run_id: &str,
-    operation: Operation,
-    action: &Action,
-    safety_net: Option<&Path>,
-    warnings: &[String],
-    full_verify: bool,
-) -> Result<(), AppError> {
-    let structured: Vec<_> = warnings
-        .iter()
-        .map(|detail| serde_json::json!({"code":"metadata_mismatch","detail":detail}))
-        .collect();
-    let mut row = serde_json::json!({"schema":"vibefilesync.run/v1","type":"action_done","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"result":"done","bytes":action.bytes});
-    if !matches!(operation, Operation::Delete) {
-        row["verified"] = (if full_verify { "full" } else { "standard" }).into();
-    }
-    if let Some(path) = safety_net {
-        row["safety_net"] = path.to_string_lossy().into_owned().into();
-    }
-    if !structured.is_empty() {
-        row["warnings"] = structured.into();
-    }
-    emit_run(row)
-}
-
-fn emit_action_failed(
-    run_id: &str,
-    operation: Operation,
-    action: &Action,
-    reason: &str,
-) -> Result<(), AppError> {
-    emit_run(
-        serde_json::json!({"schema":"vibefilesync.run/v1","type":"action_failed","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"reason":reason}),
-    )
-}
-
-fn failure_reason(error: &io::Error) -> String {
-    let text = error.to_string();
-    if text.contains("source changed") {
-        "source_changed".into()
-    } else if text.contains("verify mismatch") {
-        "verify_mismatch".into()
-    } else {
-        text
-    }
-}
-
-fn emit_summary(run_id: &str, stats: &RunStats) -> Result<(), AppError> {
-    emit_run(
-        serde_json::json!({"schema":"vibefilesync.run/v1","type":"summary","run_id":run_id,"result":if stats.counts.failed == 0 {"success"} else {"partial"},"counts":stats.counts,"bytes":stats.bytes,"warnings":stats.warnings}),
-    )
-}
-
 fn xattr_names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
     let path = c_path(path)?;
     let length = unsafe { listxattr(path.as_ptr(), std::ptr::null_mut(), 0, 0) };
@@ -795,7 +906,9 @@ mod tests {
                 run_id: "20260716T120000Z",
                 permanent_delete: false,
                 full_verify: false,
+                report_progress: false,
             },
+            &mut |_| Ok(()),
         );
 
         assert!(result.is_err());
@@ -835,7 +948,9 @@ mod tests {
                 run_id: "20260716T120000Z",
                 permanent_delete: false,
                 full_verify: false,
+                report_progress: false,
             },
+            &mut |_| Ok(()),
         );
 
         assert!(result.is_err());

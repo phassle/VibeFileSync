@@ -93,6 +93,12 @@ pub fn volume_uuid(path: &Path) -> io::Result<String> {
 /// exFAT cannot, so a source symlink bound for it is a per-file plan error
 /// rather than a copy.
 pub fn filesystem_type(path: &Path) -> io::Result<String> {
+    // Deterministic issue-22 blocked-plan process seam; ADR-0009's generic
+    // filesystem acceptance harness is implemented by its downstream slice.
+    #[cfg(feature = "fault-injection")]
+    if let Ok(kind) = std::env::var("VIBESYNC_TEST_FILESYSTEM_TYPE") {
+        return Ok(kind);
+    }
     let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -112,6 +118,18 @@ pub fn filesystem_type(path: &Path) -> io::Result<String> {
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, raw.len()) };
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+pub fn expected_degradations(destination: &Path) -> Vec<&'static str> {
+    match filesystem_type(destination) {
+        Ok(kind) if kind.eq_ignore_ascii_case("exfat") => vec![
+            "posix_permissions",
+            "acls",
+            "bsd_flags",
+            "timestamp_granularity",
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// Finds the root of a currently mounted volume by its pinned UUID. This is
