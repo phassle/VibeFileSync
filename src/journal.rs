@@ -148,7 +148,7 @@ impl Journal {
         verified: Option<&str>,
     ) -> io::Result<()> {
         self.append(
-            crate::event::action_done(
+            crate::event::journal_action_done(
                 crate::event::Context {
                     schema: SCHEMA,
                     run_id: &self.run_id,
@@ -158,7 +158,6 @@ impl Journal {
                 safety_net,
                 warnings,
                 verified,
-                true,
             ),
             false,
         )
@@ -171,7 +170,7 @@ impl Journal {
         reason: &str,
     ) -> io::Result<()> {
         self.append(
-            crate::event::action_failed(
+            crate::event::journal_action_failed(
                 crate::event::Context {
                     schema: SCHEMA,
                     run_id: &self.run_id,

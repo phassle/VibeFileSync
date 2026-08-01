@@ -64,6 +64,23 @@ pub fn action_done(
     row
 }
 
+/// Retained `journal/v1` predates the public structured-warning shape. Keep
+/// its warning array as plain detail strings under the unchanged schema.
+pub fn journal_action_done(
+    context: Context<'_>,
+    operation: Operation,
+    action: &Action,
+    safety_net: Option<&Path>,
+    warnings: &[String],
+    verified: Option<&str>,
+) -> Value {
+    let mut row = action_done(
+        context, operation, action, safety_net, warnings, verified, true,
+    );
+    row["warnings"] = json!(warnings);
+    row
+}
+
 pub fn action_failed(
     context: Context<'_>,
     operation: Operation,
@@ -77,6 +94,19 @@ pub fn action_failed(
     })
 }
 
+/// `journal/v1` keeps forensic error text verbatim; only the public run
+/// stream maps it to stable agent-facing reason codes.
+pub fn journal_action_failed(
+    context: Context<'_>,
+    operation: Operation,
+    action: &Action,
+    reason: &str,
+) -> Value {
+    let mut row = action_failed(context, operation, action, reason);
+    row["reason"] = reason.into();
+    row
+}
+
 pub fn summary(context: Context<'_>, stats: &RunStats) -> Value {
     json!({
         "schema": context.schema, "type": "summary", "run_id": context.run_id,
@@ -87,4 +117,52 @@ pub fn summary(context: Context<'_>, stats: &RunStats) -> Value {
 
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn action() -> Action {
+        Action {
+            rel_path: PathBuf::from("photo.jpg"),
+            bytes: 42,
+            old_bytes: None,
+            reason: "new".to_string(),
+        }
+    }
+
+    fn journal_context() -> Context<'static> {
+        Context {
+            schema: "vibefilesync.journal/v1",
+            run_id: "20260801T120000Z",
+        }
+    }
+
+    #[test]
+    fn journal_done_preserves_plain_warning_strings() {
+        let row = journal_action_done(
+            journal_context(),
+            Operation::Copy,
+            &action(),
+            None,
+            &["modified time differs".to_string()],
+            Some("standard"),
+        );
+
+        assert_eq!(row["warnings"], json!(["modified time differs"]));
+    }
+
+    #[test]
+    fn journal_failure_preserves_raw_reason_text() {
+        let row = journal_action_failed(
+            journal_context(),
+            Operation::Copy,
+            &action(),
+            "verify mismatch: size differs",
+        );
+
+        assert_eq!(row["reason"], "verify mismatch: size differs");
+    }
 }
