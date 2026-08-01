@@ -93,6 +93,10 @@ pub fn volume_uuid(path: &Path) -> io::Result<String> {
 /// exFAT cannot, so a source symlink bound for it is a per-file plan error
 /// rather than a copy.
 pub fn filesystem_type(path: &Path) -> io::Result<String> {
+    #[cfg(feature = "fault-injection")]
+    if let Ok(kind) = std::env::var("VIBESYNC_TEST_FILESYSTEM_TYPE") {
+        return Ok(kind);
+    }
     let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
