@@ -216,6 +216,11 @@ impl Journal {
         }
         Ok(())
     }
+
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 pub fn available_run_id(pair_name: &str, destination_root: &Path) -> io::Result<String> {

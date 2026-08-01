@@ -485,6 +485,19 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
                         Some(if full_verify { "full" } else { "standard" }),
                     )
                     .map_err(journal_runtime_error)?;
+                #[cfg(all(feature = "fault-injection", debug_assertions))]
+                journal.flush().map_err(journal_runtime_error)?;
+                fault_at(
+                    FaultTransition::ActionDoneWritten,
+                    FaultContext {
+                        relative_path: &action.rel_path,
+                        source: Some(&source),
+                        temp: Some(&temp),
+                        destination: Some(&destination),
+                        safety_net: outcome.safety_net.as_deref(),
+                    },
+                )
+                .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
                 stats.bytes += action.bytes;
                 stats.warnings += outcome.warnings.len();
@@ -532,9 +545,35 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
             permanent_delete,
         ) {
             Ok(safety_net) => {
+                if let Some(archive) = safety_net.as_deref() {
+                    fault_at(
+                        FaultTransition::Archived,
+                        FaultContext {
+                            relative_path: &action.rel_path,
+                            source: None,
+                            temp: None,
+                            destination: Some(&destination),
+                            safety_net: Some(archive),
+                        },
+                    )
+                    .map_err(journal_runtime_error)?;
+                }
                 journal
                     .action_done(Operation::Delete, action, safety_net.as_deref(), &[], None)
                     .map_err(journal_runtime_error)?;
+                #[cfg(all(feature = "fault-injection", debug_assertions))]
+                journal.flush().map_err(journal_runtime_error)?;
+                fault_at(
+                    FaultTransition::ActionDoneWritten,
+                    FaultContext {
+                        relative_path: &action.rel_path,
+                        source: None,
+                        temp: None,
+                        destination: Some(&destination),
+                        safety_net: safety_net.as_deref(),
+                    },
+                )
+                .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
                 stats.counts.deleted += 1;
                 stats.bytes += action.bytes;
@@ -631,6 +670,16 @@ fn copy_file(
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
     let result = (|| {
+        #[cfg(all(feature = "fault-injection", debug_assertions))]
+        File::create(temp)?;
+        let context = || FaultContext {
+            relative_path: &action.rel_path,
+            source: Some(source),
+            temp: Some(temp),
+            destination: Some(destination),
+            safety_net: None,
+        };
+        fault_at(FaultTransition::TempCreated, context())?;
         if report_progress
             && action.bytes >= PROGRESS_THRESHOLD
             && fs::symlink_metadata(source)?.is_file()
@@ -639,8 +688,7 @@ fn copy_file(
         } else {
             copyfile_all_but_acls(source, temp)?;
         }
-        crash_at("copy_complete");
-        exec_at("copy_complete", &action.rel_path, source, temp)?;
+        fault_at(FaultTransition::CopyComplete, context())?;
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
             .is_some_and(|path| Path::new(&path) == action.rel_path)
@@ -663,13 +711,15 @@ fn copy_file(
                 return Err(io::Error::last_os_error());
             }
         }
-        let warnings = verify(
-            source,
-            planned_source_mtime,
-            temp,
-            action.bytes,
-            full_verify,
-        )?;
+        let verification = verify_temp(source, temp, action.bytes, full_verify)?;
+        if verification.has_data_mismatch() {
+            revalidate_source(source, planned_source_mtime, action.bytes)?;
+            return Err(verification.data_mismatch_error());
+        }
+        fault_at(FaultTransition::VerifyComplete, context())?;
+        revalidate_source(source, planned_source_mtime, action.bytes)?;
+        fault_at(FaultTransition::SourceRevalidated, context())?;
+        let warnings = verification.warnings;
         let safety_net = remove_file(
             destination_root,
             destination,
@@ -677,8 +727,18 @@ fn copy_file(
             run_id,
             permanent_delete,
         )?;
+        if let Some(archive) = safety_net.as_deref() {
+            fault_at(
+                FaultTransition::Archived,
+                FaultContext {
+                    safety_net: Some(archive),
+                    ..context()
+                },
+            )?;
+        }
         fs::rename(temp, destination)?;
         sync_directory(parent)?;
+        fault_at(FaultTransition::PublishComplete, context())?;
         Ok(ActionOutcome {
             safety_net,
             warnings,
@@ -698,50 +758,89 @@ struct CopyOptions<'a> {
     report_progress: bool,
 }
 
-#[cfg(feature = "fault-injection")]
-fn crash_at(transition: &str) {
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(all(feature = "fault-injection", debug_assertions)),
+    allow(dead_code)
+)]
+struct FaultContext<'a> {
+    relative_path: &'a Path,
+    source: Option<&'a Path>,
+    temp: Option<&'a Path>,
+    destination: Option<&'a Path>,
+    safety_net: Option<&'a Path>,
+}
+
+#[derive(Clone, Copy)]
+enum FaultTransition {
+    TempCreated,
+    CopyComplete,
+    VerifyComplete,
+    SourceRevalidated,
+    Archived,
+    PublishComplete,
+    ActionDoneWritten,
+}
+
+#[cfg(all(feature = "fault-injection", debug_assertions))]
+impl FaultTransition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TempCreated => "temp_created",
+            Self::CopyComplete => "copy_complete",
+            Self::VerifyComplete => "verify_complete",
+            Self::SourceRevalidated => "source_revalidated",
+            Self::Archived => "archived",
+            Self::PublishComplete => "publish_complete",
+            Self::ActionDoneWritten => "action_done_written",
+        }
+    }
+}
+
+#[cfg(all(feature = "fault-injection", debug_assertions))]
+fn fault_at(transition: FaultTransition, context: FaultContext<'_>) -> io::Result<()> {
+    let transition = transition.as_str();
     if std::env::var("VIBESYNC_TEST_CRASH_AT").ok().as_deref() == Some(transition) {
         std::process::abort();
     }
+    if let Some(specification) = std::env::var_os("VIBESYNC_TEST_EXEC_AT") {
+        let specification = specification.to_string_lossy();
+        let Some((requested, command)) = specification.split_once(':') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VIBESYNC_TEST_EXEC_AT must be <transition>:<command>",
+            ));
+        };
+        if requested == transition {
+            let mut process = std::process::Command::new("/bin/sh");
+            process
+                .arg("-c")
+                .arg(command)
+                .env("VIBESYNC_TEST_TRANSITION", transition)
+                .env("VIBESYNC_TEST_RELATIVE_PATH", context.relative_path);
+            for (name, value) in [
+                ("VIBESYNC_TEST_SOURCE", context.source),
+                ("VIBESYNC_TEST_TEMP", context.temp),
+                ("VIBESYNC_TEST_DESTINATION", context.destination),
+                ("VIBESYNC_TEST_SAFETY_NET", context.safety_net),
+            ] {
+                if let Some(value) = value {
+                    process.env(name, value);
+                }
+            }
+            let status = process.status()?;
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "fault-injection command exited with {status}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
-#[cfg(not(feature = "fault-injection"))]
-fn crash_at(_: &str) {}
-
-#[cfg(feature = "fault-injection")]
-fn exec_at(transition: &str, relative_path: &Path, source: &Path, temp: &Path) -> io::Result<()> {
-    let Some(specification) = std::env::var_os("VIBESYNC_TEST_EXEC_AT") else {
-        return Ok(());
-    };
-    let specification = specification.to_string_lossy();
-    let Some((requested, command)) = specification.split_once(':') else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "VIBESYNC_TEST_EXEC_AT must be <transition>:<command>",
-        ));
-    };
-    if requested != transition {
-        return Ok(());
-    }
-    let status = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .env("VIBESYNC_TEST_TRANSITION", transition)
-        .env("VIBESYNC_TEST_RELATIVE_PATH", relative_path)
-        .env("VIBESYNC_TEST_SOURCE", source)
-        .env("VIBESYNC_TEST_TEMP", temp)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "fault-injection command exited with {status}"
-        )))
-    }
-}
-
-#[cfg(not(feature = "fault-injection"))]
-fn exec_at(_: &str, _: &Path, _: &Path, _: &Path) -> io::Result<()> {
+#[cfg(not(all(feature = "fault-injection", debug_assertions)))]
+fn fault_at(_: FaultTransition, _: FaultContext<'_>) -> io::Result<()> {
     Ok(())
 }
 
@@ -1006,13 +1105,33 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 /// Data disagreement rejects the temp; metadata disagreement is reported as
 /// a warning after Publish so a deterministic metadata quirk never prevents
 /// the verified file contents from landing (ADR-0008).
-fn verify(
+struct TempVerification {
+    warnings: Vec<String>,
+    size_mismatch: bool,
+    content_mismatch: bool,
+}
+
+impl TempVerification {
+    fn has_data_mismatch(&self) -> bool {
+        self.size_mismatch || self.content_mismatch
+    }
+
+    fn data_mismatch_error(&self) -> io::Error {
+        let detail = if self.size_mismatch {
+            "verify mismatch: size differs"
+        } else {
+            "verify mismatch: content differs"
+        };
+        io::Error::new(io::ErrorKind::InvalidData, detail)
+    }
+}
+
+fn verify_temp(
     source: &Path,
-    planned_source_mtime: std::time::SystemTime,
     temp: &Path,
     planned_size: u64,
     full_verify: bool,
-) -> io::Result<Vec<String>> {
+) -> io::Result<TempVerification> {
     let copied = fs::metadata(temp)?;
     let size_mismatch = copied.len() != planned_size;
     let content_mismatch = full_verify && !files_equal(source, temp)?;
@@ -1041,10 +1160,18 @@ fn verify(
     {
         warnings.push("xattr names differ".to_string());
     }
-    // Re-stat after every temp check and optional full read-back. This is the
-    // last gate step before archive/Publish, so a moving source cannot make a
-    // copy of stale or mixed content look committed. Source movement wins
-    // over a consequential temp mismatch so agents receive the causal code.
+    Ok(TempVerification {
+        warnings,
+        size_mismatch,
+        content_mismatch,
+    })
+}
+
+fn revalidate_source(
+    source: &Path,
+    planned_source_mtime: std::time::SystemTime,
+    planned_size: u64,
+) -> io::Result<()> {
     let source_final = fs::metadata(source)?;
     if source_final.len() != planned_size || source_final.modified()? != planned_source_mtime {
         return Err(io::Error::new(
@@ -1052,19 +1179,7 @@ fn verify(
             "source changed during copy",
         ));
     }
-    if size_mismatch {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "verify mismatch: size differs",
-        ));
-    }
-    if content_mismatch {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "verify mismatch: content differs",
-        ));
-    }
-    Ok(warnings)
+    Ok(())
 }
 
 fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
