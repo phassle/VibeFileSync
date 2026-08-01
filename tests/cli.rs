@@ -9,6 +9,7 @@
 
 use assert_cmd::Command;
 use std::fs;
+use std::io::Write;
 #[cfg(feature = "fault-injection")]
 use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
@@ -49,6 +50,100 @@ fn vibesync_in_tty(config_home: &Path, args: &[&str], no_color: bool) -> std::pr
         command.env_remove("NO_COLOR");
     }
     command.output().expect("script starts a pseudo-terminal")
+}
+
+/// Run the real binary in a pseudo-terminal and feed raw key presses to its
+/// stdin. This is the thinnest practical boundary around a terminal UI: the
+/// test still observes only process exit and on-disk sync state.
+fn vibesync_in_tty_with_input(
+    config_home: &Path,
+    home: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> std::process::Output {
+    vibesync_in_tty_with_input_and_env(config_home, home, args, input, &[])
+}
+
+fn vibesync_in_tty_with_input_and_env(
+    config_home: &Path,
+    home: &Path,
+    args: &[&str],
+    input: &[u8],
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    vibesync_in_tty_with_input_after_start(config_home, home, args, input, extra_env, || {})
+}
+
+fn vibesync_in_tty_with_input_after_start(
+    config_home: &Path,
+    home: &Path,
+    args: &[&str],
+    input: &[u8],
+    extra_env: &[(&str, &str)],
+    before_input: impl FnOnce(),
+) -> std::process::Output {
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut command = ProcessCommand::new("script");
+    command
+        .args(["-q", "/dev/null"])
+        .arg(binary.get_program())
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("script starts a pseudo-terminal");
+    // Let the child switch the PTY to raw mode before sending key presses;
+    // otherwise the line discipline can retain a trailing confirmation key.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    before_input();
+    child
+        .stdin
+        .take()
+        .expect("script stdin is piped")
+        .write_all(input)
+        .expect("terminal input is written");
+
+    for _ in 0..100 {
+        if child
+            .try_wait()
+            .expect("TUI status can be polled")
+            .is_some()
+        {
+            return child.wait_with_output().expect("TUI output is collected");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // `script` and the TUI share this dedicated process group. Bound a bad
+    // key sequence without leaving a child PTY behind for later tests.
+    // SAFETY: the negative id targets only the dedicated process group we
+    // assigned above; the live child still owns that id during this branch.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if child
+            .try_wait()
+            .expect("terminated TUI can be polled")
+            .is_some()
+        {
+            panic!("TUI did not exit within five seconds for {args:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // SAFETY: same scoped process group; SIGKILL prevents a broken terminal
+    // teardown from hanging the test suite or leaving an orphaned PTY.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+    panic!("TUI did not exit within five seconds for {args:?}");
 }
 
 fn config_file(config_home: &Path) -> std::path::PathBuf {
@@ -1096,6 +1191,174 @@ fn bare_invocation_shows_help_and_exits_zero() {
 fn help_exits_zero() {
     let fx = Fixture::new();
     fx.cmd().arg("--help").assert().success();
+}
+
+// --- Slice 13: TUI review and confirmation (issue #27, ADR-0003) ---
+
+#[test]
+fn tui_confirmation_executes_the_reviewed_plan_through_the_run_engine() {
+    let fx = Fixture::new();
+    fx.write_source("changed.txt", "published by the shared engine");
+    fx.write_dest("changed.txt", "old destination version");
+    fx.add_photos_pair();
+
+    // Enter advances from action review to confirmation; y confirms.
+    let output =
+        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\ry");
+
+    assert!(
+        output.status.success(),
+        "TUI failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("changed.txt")).unwrap(),
+        "published by the shared engine"
+    );
+    let run_folder = fs::read_dir(fx.destination.path().join("_SafetyNet"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        fs::read_to_string(run_folder.join("changed.txt")).unwrap(),
+        "old destination version",
+        "TUI confirmation must retain replaced versions through SafetyNet"
+    );
+    assert_eq!(
+        fs::read_dir(fx.journal_dir("photos")).unwrap().count(),
+        2,
+        "the shared run engine writes one Journal plus its live lock file"
+    );
+    let journal = fs::read_dir(fx.journal_dir("photos"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "ndjson")
+        })
+        .unwrap();
+    let journal = fs::read_to_string(journal).unwrap();
+    assert!(journal.contains("\"type\":\"action_done\""));
+    assert!(journal.contains("\"safety_net\""));
+}
+
+#[test]
+fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
+    let fx = Fixture::new();
+    fx.write_source("later.txt", "still needs copying");
+    fx.add_photos_pair();
+
+    // Space excludes the selected row, Enter advances, y confirms.
+    let output =
+        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b" \ry");
+    assert!(output.status.success());
+    assert!(!fx.destination.path().join("later.txt").exists());
+
+    let next_plan = fx
+        .cmd()
+        .args(["plan", "photos"])
+        .output()
+        .expect("plan runs after TUI exclusion");
+    assert_eq!(next_plan.status.code(), Some(EXIT_OK));
+    assert!(
+        String::from_utf8(next_plan.stdout)
+            .unwrap()
+            .contains("later.txt"),
+        "TUI exclusions must never persist"
+    );
+}
+
+#[test]
+fn tui_does_not_execute_an_action_that_appears_after_review_started() {
+    let fx = Fixture::new();
+    fx.write_source("reviewed.txt", "reviewed before the TUI opened");
+    fx.add_photos_pair();
+
+    let output = vibesync_in_tty_with_input_after_start(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\ry",
+        &[],
+        || fx.write_source("unreviewed.txt", "appeared during review"),
+    );
+
+    assert!(output.status.success());
+    assert!(fx.destination.path().join("reviewed.txt").is_file());
+    assert!(
+        !fx.destination.path().join("unreviewed.txt").exists(),
+        "an action absent from the displayed plan must wait for another run"
+    );
+}
+
+#[test]
+fn cli_and_tui_can_both_exclude_a_reviewed_stray_cleanup_for_one_run() {
+    let fx = Fixture::new();
+    let stray = ".note.vibesync-tmp-stale-run";
+    fx.write_dest(stray, "retain for this reviewed run");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--yes", "--exclude", stray])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert!(fx.destination.path().join(stray).is_file());
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("exclude path not found"),
+        "a cleanup row printed by plan is an exact excludable plan path"
+    );
+}
+
+#[test]
+fn tui_without_a_pair_selects_from_configured_folder_pairs() {
+    let fx = Fixture::new();
+    fx.write_source("selected.txt", "from the selected pair");
+    fx.add_pair("photos", "mirror");
+    fx.add_pair("documents", "mirror");
+
+    // BTreeMap order puts documents first: select it, review, then confirm.
+    let output = vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"\r\ry");
+    assert!(
+        output.status.success(),
+        "pair selection failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(fx.destination.path().join("selected.txt").is_file());
+    assert!(fx.journal_dir("documents").is_dir());
+    assert!(!fx.journal_dir("photos").exists());
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tui_included_error_blocks_until_the_row_is_excluded() {
+    let fx = Fixture::new();
+    std::os::unix::fs::symlink("target", fx.source.path().join("link")).unwrap();
+    fx.add_photos_pair();
+
+    // Enter confirm; y is blocked; b returns; Space excludes the only row;
+    // Enter and y then run the now-valid reviewed subset.
+    let output = vibesync_in_tty_with_input_and_env(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\ryb \ry",
+        &[("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")],
+    );
+
+    assert!(output.status.success());
+    assert!(!fx.destination.path().join("link").exists());
+    assert!(
+        fs::read_dir(fx.journal_dir("photos")).unwrap().count() >= 2,
+        "execution after excluding the error must reach the shared Run engine"
+    );
 }
 
 // --- Slice 14: startup banner (issue #28, ADR-0005) ---

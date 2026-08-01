@@ -25,7 +25,7 @@ use crate::volume;
 /// Where archived old versions would go. A Dry-run has no Run id yet (a Run
 /// id is only minted when a run actually starts, per CONTEXT.md), so the
 /// annotation uses a placeholder rather than inventing a timestamp.
-const SAFETYNET_NOTE: &str = "→ _SafetyNet/<run-id>/";
+pub(crate) const SAFETYNET_NOTE: &str = "→ _SafetyNet/<run-id>/";
 
 /// A single scanned file (or symlink). Directories are traversed but never
 /// themselves an [`Entry`] — the plan operates at file granularity.
@@ -262,6 +262,31 @@ pub(crate) fn report_unknown_excludes(plan: &Plan) {
     }
 }
 
+/// Applies an interactive review's exact exclusions to the already-scanned
+/// plan. This preserves the plan identity the user saw; rebuilding here would
+/// allow newly discovered work to masquerade as reviewed work.
+pub(crate) fn apply_review_exclusions(mut plan: Plan, excludes: &[String]) -> Plan {
+    let before = plan.copies.len()
+        + plan.updates.len()
+        + plan.deletes.len()
+        + plan.errors.len()
+        + plan.strays.len();
+    let keep = |path: &Path| !excludes.iter().any(|excluded| Path::new(excluded) == path);
+    plan.copies.retain(|action| keep(&action.rel_path));
+    plan.updates.retain(|action| keep(&action.rel_path));
+    plan.deletes.retain(|action| keep(&action.rel_path));
+    plan.errors.retain(|error| keep(&error.rel_path));
+    plan.strays.retain(|path| keep(path));
+    let after = plan.copies.len()
+        + plan.updates.len()
+        + plan.deletes.len()
+        + plan.errors.len()
+        + plan.strays.len();
+    plan.excluded += before - after;
+    plan.unknown_excludes.clear();
+    plan
+}
+
 /// Classifies and records one source entry for both buffered human plans and
 /// incremental JSON plans. Returning the row lets the streaming caller emit
 /// immediately without reimplementing the classification decision tree.
@@ -459,7 +484,7 @@ fn push_errors(out: &mut String, rows: &[PlanError], width: usize) {
     out.push('\n');
 }
 
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -560,8 +585,16 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         )
         .map_err(|error| scan_error(&header_pair.destination, error))?;
     }
-    let stray_count = walk_stray_temps(&header_pair.destination, |_| Ok(()))
-        .map_err(|error| scan_error(&header_pair.destination, error))?;
+    let mut stray_count = 0;
+    walk_stray_temps(&header_pair.destination, |path| {
+        if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+            stats.excluded += 1;
+        } else {
+            stray_count += 1;
+        }
+        Ok(())
+    })
+    .map_err(|error| scan_error(&header_pair.destination, error))?;
     emit(serde_json::json!({
         "schema": "vibefilesync.plan/v1", "type": "summary", "run_id": run_id,
         "counts": {"copy": stats.copies, "update": stats.updates, "delete": stats.deletes, "error": stats.errors},
@@ -701,7 +734,18 @@ pub(crate) fn build(
     );
     plan.strays =
         stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
+    apply_stray_excludes(&mut plan, excludes);
     Ok((pair, plan))
+}
+
+fn apply_stray_excludes(plan: &mut Plan, excludes: &[String]) {
+    let known_strays: BTreeSet<_> = plan.strays.iter().cloned().collect();
+    plan.unknown_excludes
+        .retain(|excluded| !known_strays.contains(Path::new(excluded)));
+    let before = plan.strays.len();
+    plan.strays
+        .retain(|path| !excludes.iter().any(|excluded| Path::new(excluded) == path));
+    plan.excluded += before - plan.strays.len();
 }
 
 /// Lists abandoned sibling Publish temps without treating them as sync

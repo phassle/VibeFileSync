@@ -1,7 +1,7 @@
 //! `vibesync`: hot-path verbs top-level, management namespaced, per
 //! ADR-0004. Implemented so far: Folder-pair management, the human Dry-run,
 //! safe `run`/`prune`, Journal-backed `status`/`history`, and streaming
-//! NDJSON plan/run surfaces; the TUI remains a later slice.
+//! NDJSON plan/run surfaces, and the thin action-list TUI.
 
 mod banner;
 mod config;
@@ -14,6 +14,7 @@ mod pair;
 mod plan;
 mod preconditions;
 mod run;
+mod tui;
 mod volume;
 
 use std::path::PathBuf;
@@ -200,10 +201,7 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             }
         }
         Command::Prune { pair } => run::prune(config_path, pair),
-        Command::Tui { pair } => Ok(not_yet_implemented(
-            "tui",
-            pair.as_deref().unwrap_or("<all pairs>"),
-        )),
+        Command::Tui { pair } => tui::run(config_path, pair.as_deref()),
         Command::Pair { action } => run_pair(action, config_path),
     }
 }
@@ -233,9 +231,4 @@ fn run_pair(action: &PairCommand, config_path: &std::path::Path) -> Result<i32, 
             Ok(error::EXIT_OK)
         }
     }
-}
-
-fn not_yet_implemented(verb: &str, pair: &str) -> i32 {
-    eprintln!("vibesync {verb}: not yet implemented (pair: {pair})");
-    error::EXIT_UNIMPLEMENTED
 }
