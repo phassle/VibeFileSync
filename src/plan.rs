@@ -570,11 +570,18 @@ fn stream_source_tree(
                     Ok(metadata) => {
                         if mode == Mode::Mirror {
                             counts.scanned += 1;
-                            counts.deletes += 1;
-                            emit(JsonPlanAction::Delete {
-                                path: child_relative.clone(),
-                                bytes: metadata.len(),
-                            })?;
+                            if excludes
+                                .iter()
+                                .any(|exclude| Path::new(exclude) == child_relative)
+                            {
+                                counts.excluded += 1;
+                            } else {
+                                counts.deletes += 1;
+                                emit(JsonPlanAction::Delete {
+                                    path: child_relative.clone(),
+                                    bytes: metadata.len(),
+                                })?;
+                            }
                         }
                         None
                     }

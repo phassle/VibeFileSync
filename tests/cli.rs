@@ -649,6 +649,20 @@ fn plan_json_preserves_mirror_file_directory_conflict_actions() {
     assert!(events
         .iter()
         .any(|event| { event["op"] == "copy" && event["path"] == "docs/new.txt" }));
+    let excluded_events = ndjson(
+        &source_directory
+            .cmd()
+            .args(["plan", "photos", "--json", "--exclude", "docs"])
+            .output()
+            .unwrap()
+            .stdout,
+    );
+    assert!(
+        !excluded_events
+            .iter()
+            .any(|event| event["op"] == "delete" && event["path"] == "docs"),
+        "structural deletes honor the same exact exclusion as run"
+    );
     let output = source_directory
         .cmd()
         .args(["run", "photos", "--yes", "--json"])
@@ -698,11 +712,52 @@ fn plan_json_preserves_mirror_file_directory_conflict_actions() {
         .args(["run", "photos", "--yes", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_OK));
-    assert_eq!(
-        fs::read_to_string(empty_directory.destination.path().join("empty")).unwrap(),
-        "new file"
-    );
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    assert!(empty_directory.destination.path().join("empty").is_dir());
+
+    let unreviewed_directory = Fixture::new();
+    unreviewed_directory.write_source("node", "new file");
+    fs::create_dir_all(
+        unreviewed_directory
+            .destination
+            .path()
+            .join("node/unreviewed-empty"),
+    )
+    .unwrap();
+    unreviewed_directory.add_photos_pair();
+    let output = unreviewed_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    assert!(unreviewed_directory
+        .destination
+        .path()
+        .join("node/unreviewed-empty")
+        .is_dir());
+
+    let machinery_directory = Fixture::new();
+    machinery_directory.write_source("node", "new file");
+    fs::create_dir_all(
+        machinery_directory
+            .destination
+            .path()
+            .join("node/_SafetyNet"),
+    )
+    .unwrap();
+    machinery_directory.add_photos_pair();
+    let output = machinery_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    assert!(machinery_directory
+        .destination
+        .path()
+        .join("node/_SafetyNet")
+        .is_dir());
 }
 
 fn ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {

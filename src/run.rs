@@ -2,6 +2,7 @@
 //! before SafetyNet archives any old destination object and Publish renames the
 //! verified temp into place (ADR-0001 and ADR-0008).
 
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -336,6 +337,7 @@ fn run_impl(
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
         let temp = temporary_path(&destination, journal.run_id());
+        let reviewed_empty_directories = reviewed_empty_directories(action, &plan.deletes);
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
@@ -350,6 +352,7 @@ fn run_impl(
             action,
             journal.run_id(),
             options.permanent_delete,
+            &reviewed_empty_directories,
             json_output.then_some(ProgressDetails {
                 run_id: journal.run_id(),
                 operation,
@@ -555,6 +558,7 @@ fn copy_file(
     action: &Action,
     run_id: &str,
     permanent_delete: bool,
+    reviewed_empty_directories: &BTreeSet<PathBuf>,
     progress: Option<ProgressDetails<'_>>,
 ) -> io::Result<ActionOutcome> {
     let source_before = fs::metadata(source)?;
@@ -565,7 +569,11 @@ fn copy_file(
     let result = (|| {
         if source_before.file_type().is_file()
             && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir())
-            && !remove_empty_directory_tree(destination)?
+            && !remove_reviewed_empty_directories(
+                destination_root,
+                destination,
+                reviewed_empty_directories,
+            )?
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -920,11 +928,21 @@ fn remove_file(
 /// have been moved to SafetyNet. Any unplanned entry keeps the obstruction
 /// intact, so a COPY never broadens a reviewed deletion into recursive data
 /// removal.
-fn remove_empty_directory_tree(directory: &Path) -> io::Result<bool> {
+fn remove_reviewed_empty_directories(
+    destination_root: &Path,
+    directory: &Path,
+    reviewed: &BTreeSet<PathBuf>,
+) -> io::Result<bool> {
+    let relative = directory
+        .strip_prefix(destination_root)
+        .expect("destination directory is under destination root");
+    if !reviewed.contains(relative) {
+        return Ok(false);
+    }
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if fs::symlink_metadata(&path)?.file_type().is_dir() {
-            if !remove_empty_directory_tree(&path)? {
+            if !remove_reviewed_empty_directories(destination_root, &path, reviewed)? {
                 return Ok(false);
             }
         } else {
@@ -933,6 +951,24 @@ fn remove_empty_directory_tree(directory: &Path) -> io::Result<bool> {
     }
     fs::remove_dir(directory)?;
     Ok(true)
+}
+
+fn reviewed_empty_directories(copy: &Action, deletions: &[Action]) -> BTreeSet<PathBuf> {
+    let mut directories = BTreeSet::new();
+    for deletion in deletions
+        .iter()
+        .filter(|deletion| deletion.rel_path.starts_with(&copy.rel_path))
+    {
+        let mut parent = deletion.rel_path.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() || !directory.starts_with(&copy.rel_path) {
+                break;
+            }
+            directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    directories
 }
 
 /// Makes the old version visible in SafetyNet with its relative path kept
@@ -1245,6 +1281,7 @@ mod tests {
             &action,
             "20260716T120000Z",
             false,
+            &BTreeSet::new(),
             None,
         );
 
@@ -1283,6 +1320,7 @@ mod tests {
             &action,
             "20260716T120000Z",
             false,
+            &BTreeSet::new(),
             None,
         );
 
