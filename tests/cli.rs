@@ -1710,17 +1710,16 @@ fn plan_and_status_report_stray_temps_without_destination_writes() {
         .output()
         .unwrap();
     assert_eq!(json_plan.status.code(), Some(EXIT_OK));
-    let summary: serde_json::Value = String::from_utf8(json_plan.stdout)
+    let rows: Vec<serde_json::Value> = String::from_utf8(json_plan.stdout)
         .unwrap()
         .lines()
-        .rev()
         .map(|line| serde_json::from_str(line).unwrap())
-        .next()
-        .unwrap();
+        .collect();
     assert_eq!(
-        summary["strays"][0],
+        rows.iter().find(|row| row["type"] == "stray").unwrap()["path"],
         ".photo.txt.vibesync-tmp-20260731T120000Z"
     );
+    assert_eq!(rows.last().unwrap()["strays"], 1);
     assert_eq!(
         Fixture::snapshot(fx.destination.path()),
         before,

@@ -482,13 +482,19 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         })
         .map_err(|error| scan_error(&header_pair.destination, error))?;
     }
-    let strays = stray_temps(&header_pair.destination)
-        .map_err(|error| scan_error(&header_pair.destination, error))?;
+    let stray_count = walk_stray_temps(&header_pair.destination, |path| {
+        crate::ndjson::stdout(&serde_json::json!({
+            "schema": "vibefilesync.plan/v1", "type": "stray", "run_id": run_id,
+            "path": path.to_string_lossy(),
+        }))
+        .map_err(io::Error::other)
+    })
+    .map_err(|error| scan_error(&header_pair.destination, error))?;
     emit(serde_json::json!({
         "schema": "vibefilesync.plan/v1", "type": "summary", "run_id": run_id,
         "counts": {"copy": stats.copies, "update": stats.updates, "delete": stats.deletes, "error": stats.errors},
         "scanned": stats.scanned, "unchanged": stats.unchanged, "excluded": stats.excluded,
-        "strays": strays.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>()
+        "strays": stray_count
     }))?;
     Ok(crate::error::EXIT_OK)
 }
@@ -615,10 +621,23 @@ pub(crate) fn build(
 /// content. This is intentionally read-only so `plan` and `status` are safe
 /// at any time; only a real run removes the returned paths.
 pub(crate) fn stray_temps(root: &Path) -> io::Result<Vec<PathBuf>> {
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut strays = Vec::new();
+    walk_stray_temps(root, |path| {
+        strays.push(path.to_path_buf());
+        Ok(())
+    })?;
+    strays.sort();
+    Ok(strays)
+}
+
+fn walk_stray_temps(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<usize> {
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
@@ -631,16 +650,12 @@ pub(crate) fn stray_temps(root: &Path) -> io::Result<Vec<PathBuf>> {
             if metadata.file_type().is_dir() {
                 stack.push(path);
             } else if is_stray_temp(&entry.file_name()) {
-                strays.push(
-                    path.strip_prefix(root)
-                        .expect("entry is under root")
-                        .to_path_buf(),
-                );
+                visit(path.strip_prefix(root).expect("entry is under root"))?;
+                count += 1;
             }
         }
     }
-    strays.sort();
-    Ok(strays)
+    Ok(count)
 }
 
 fn is_stray_temp(name: &OsStr) -> bool {

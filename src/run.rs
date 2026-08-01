@@ -15,18 +15,47 @@ use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
-const COPYFILE_METADATA_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2);
 const F_FULLFSYNC: libc::c_int = 51;
 const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const RUN_SCHEMA: &str = "vibefilesync.run/v1";
+const COPYFILE_STATE_STATUS_CB: u32 = 6;
+const COPYFILE_STATE_STATUS_CTX: u32 = 7;
+const COPYFILE_STATE_COPIED: u32 = 8;
+const COPYFILE_STATE_BSIZE: u32 = 13;
+const COPYFILE_COPY_DATA: libc::c_int = 4;
+const COPYFILE_PROGRESS: libc::c_int = 4;
+const COPYFILE_CONTINUE: libc::c_int = 0;
+const COPYFILE_QUIT: libc::c_int = 2;
+
+type CopyfileState = *mut libc::c_void;
+type CopyfileCallback = unsafe extern "C" fn(
+    libc::c_int,
+    libc::c_int,
+    CopyfileState,
+    *const libc::c_char,
+    *const libc::c_char,
+    *mut libc::c_void,
+) -> libc::c_int;
 
 extern "C" {
     fn copyfile(
         from: *const libc::c_char,
         to: *const libc::c_char,
-        state: *mut libc::c_void,
+        state: CopyfileState,
         flags: u32,
+    ) -> libc::c_int;
+    fn copyfile_state_alloc() -> CopyfileState;
+    fn copyfile_state_free(state: CopyfileState) -> libc::c_int;
+    fn copyfile_state_get(
+        state: CopyfileState,
+        flag: u32,
+        destination: *mut libc::c_void,
+    ) -> libc::c_int;
+    fn copyfile_state_set(
+        state: CopyfileState,
+        flag: u32,
+        source: *const libc::c_void,
     ) -> libc::c_int;
     fn listxattr(
         path: *const libc::c_char,
@@ -365,13 +394,17 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
         reporter.action_start(journal.run_id(), operation, action)?;
-        let mut last_progress = Instant::now();
+        let mut last_progress: Option<Instant> = None;
         let mut progress = |copied: u64| -> io::Result<()> {
-            if copied == action.bytes || last_progress.elapsed() >= PROGRESS_INTERVAL {
+            let interval_elapsed = match last_progress {
+                Some(last) => last.elapsed() >= PROGRESS_INTERVAL,
+                None => true,
+            };
+            if copied == action.bytes || interval_elapsed {
                 reporter
                     .progress(journal.run_id(), operation, action, copied)
                     .map_err(io::Error::other)?;
-                last_progress = Instant::now();
+                last_progress = Some(Instant::now());
             }
             Ok(())
         };
@@ -505,8 +538,7 @@ fn copy_file(
             && action.bytes >= PROGRESS_THRESHOLD
             && fs::symlink_metadata(source)?.is_file()
         {
-            copy_data_with_progress(source, temp, progress)?;
-            copyfile_metadata_but_acls(source, temp)?;
+            copyfile_all_but_acls_with_progress(source, temp, action.bytes, progress)?;
         } else {
             copyfile_all_but_acls(source, temp)?;
         }
@@ -676,10 +708,6 @@ fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
     copyfile_with_flags(source, destination, COPYFILE_ALL_WITHOUT_ACLS)
 }
 
-fn copyfile_metadata_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
-    copyfile_with_flags(source, destination, COPYFILE_METADATA_WITHOUT_ACLS)
-}
-
 fn copyfile_with_flags(source: &Path, destination: &Path, flags: u32) -> io::Result<()> {
     let source = c_path(source)?;
     let destination = c_path(destination)?;
@@ -698,31 +726,118 @@ fn copyfile_with_flags(source: &Path, destination: &Path, flags: u32) -> io::Res
     }
 }
 
-fn copy_data_with_progress(
+fn copyfile_all_but_acls_with_progress<F>(
     source: &Path,
     destination: &Path,
-    progress: &mut impl FnMut(u64) -> io::Result<()>,
-) -> io::Result<()> {
-    let mut source = File::open(source)?;
-    let mut destination = File::create(destination)?;
-    let mut buffer = [0_u8; 256 * 1024];
-    let mut copied = 0_u64;
-    loop {
-        let count = source.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        destination.write_all(&buffer[..count])?;
-        copied += count as u64;
-        progress(copied)?;
-        // Makes elapsed-time throttling deterministic at the process seam;
-        // the generic ADR-0009 EXEC_AT harness remains a later slice.
-        #[cfg(feature = "fault-injection")]
-        if let Ok(delay) = std::env::var("VIBESYNC_TEST_COPY_CHUNK_DELAY_MS") {
-            std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
-        }
+    total: u64,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    let source = c_path(source)?;
+    let destination = c_path(destination)?;
+    let state = unsafe { copyfile_state_alloc() };
+    if state.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut context = CopyProgressContext {
+        progress,
+        error: None,
+        copied: 0,
+    };
+    let block_size: u32 = 256 * 1024;
+    let block_size_result = unsafe {
+        copyfile_state_set(
+            state,
+            COPYFILE_STATE_BSIZE,
+            (&block_size as *const u32).cast(),
+        )
+    };
+    let callback_result = unsafe {
+        copyfile_state_set(
+            state,
+            COPYFILE_STATE_STATUS_CB,
+            copyfile_progress_callback::<F> as CopyfileCallback as *const libc::c_void,
+        )
+    };
+    let context_result = unsafe {
+        copyfile_state_set(
+            state,
+            COPYFILE_STATE_STATUS_CTX,
+            (&mut context as *mut CopyProgressContext<'_, F>).cast(),
+        )
+    };
+    if block_size_result != 0 || callback_result != 0 || context_result != 0 {
+        let error = io::Error::last_os_error();
+        unsafe { copyfile_state_free(state) };
+        return Err(error);
+    }
+    let result = unsafe {
+        copyfile(
+            source.as_ptr(),
+            destination.as_ptr(),
+            state,
+            COPYFILE_ALL_WITHOUT_ACLS,
+        )
+    };
+    let copy_error = (result != 0).then(io::Error::last_os_error);
+    unsafe { copyfile_state_free(state) };
+    if let Some(error) = context.error {
+        return Err(error);
+    }
+    if let Some(error) = copy_error {
+        return Err(error);
+    }
+    if context.copied < total {
+        (context.progress)(total)?;
     }
     Ok(())
+}
+
+struct CopyProgressContext<'a, F> {
+    progress: &'a mut F,
+    error: Option<io::Error>,
+    copied: u64,
+}
+
+unsafe extern "C" fn copyfile_progress_callback<F>(
+    what: libc::c_int,
+    stage: libc::c_int,
+    state: CopyfileState,
+    _source: *const libc::c_char,
+    _destination: *const libc::c_char,
+    raw_context: *mut libc::c_void,
+) -> libc::c_int
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if what != COPYFILE_COPY_DATA || stage != COPYFILE_PROGRESS {
+        return COPYFILE_CONTINUE;
+    }
+    let context = &mut *raw_context.cast::<CopyProgressContext<'_, F>>();
+    let mut copied: libc::off_t = 0;
+    if copyfile_state_get(
+        state,
+        COPYFILE_STATE_COPIED,
+        (&mut copied as *mut libc::off_t).cast(),
+    ) != 0
+    {
+        context.error = Some(io::Error::last_os_error());
+        return COPYFILE_QUIT;
+    }
+    context.copied = copied.max(0) as u64;
+    if let Err(error) = (context.progress)(context.copied) {
+        context.error = Some(error);
+        return COPYFILE_QUIT;
+    }
+    // Makes elapsed-time throttling deterministic at the process seam while
+    // still exercising copyfile(3)'s real per-write callback.
+    #[cfg(feature = "fault-injection")]
+    if let Ok(delay) = std::env::var("VIBESYNC_TEST_COPY_CHUNK_DELAY_MS") {
+        std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
+    }
+    COPYFILE_CONTINUE
 }
 
 fn fully_sync(path: &Path) -> io::Result<()> {
