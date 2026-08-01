@@ -16,6 +16,8 @@ use std::process::Command as ProcessCommand;
 const EXIT_OK: i32 = 0;
 const EXIT_PARTIAL: i32 = 1;
 const EXIT_PRECONDITION: i32 = 2;
+#[cfg(feature = "fault-injection")]
+const EXIT_BLOCKED_PLAN: i32 = 3;
 const EXIT_INTERRUPTED: i32 = 4;
 const EXIT_USAGE: i32 = 64;
 
@@ -440,6 +442,25 @@ fn run_json_reports_partial_failures_without_non_json_stdout() {
     assert_eq!(events[3]["result"], "partial");
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn run_json_reports_blocked_plan_exit_without_mutating() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "would copy");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_BLOCK_PLAN", "1")
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_BLOCKED_PLAN));
+    assert!(output.stdout.is_empty(), "blocked runs have no run stream");
+    assert!(!fx.destination.path().join("photo.txt").exists());
+}
+
 #[test]
 fn run_json_records_cleanup_and_delete_actions() {
     let fx = Fixture::new();
@@ -621,6 +642,16 @@ fn plan_json_preserves_mirror_file_directory_conflict_actions() {
     assert!(events
         .iter()
         .any(|event| { event["op"] == "copy" && event["path"] == "docs/new.txt" }));
+    let output = source_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(source_directory.destination.path().join("docs/new.txt")).unwrap(),
+        "new"
+    );
 
     let source_file = Fixture::new();
     source_file.write_source("node", "new file");
@@ -640,6 +671,16 @@ fn plan_json_preserves_mirror_file_directory_conflict_actions() {
     assert!(events
         .iter()
         .any(|event| { event["op"] == "delete" && event["path"] == "node/old.txt" }));
+    let output = source_file
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(source_file.destination.path().join("node")).unwrap(),
+        "new file"
+    );
 }
 
 fn ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {

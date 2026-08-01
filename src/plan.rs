@@ -853,6 +853,13 @@ pub(crate) fn build(
     };
 
     let mut plan = compute(&source, &dest, pair.mode, supports_symlinks, excludes);
+    #[cfg(feature = "fault-injection")]
+    if std::env::var_os("VIBESYNC_TEST_BLOCK_PLAN").is_some() {
+        plan.errors.push(PlanError {
+            rel_path: PathBuf::from("__test_blocked_plan__"),
+            message: "injected blocked plan".to_string(),
+        });
+    }
     plan.strays = stray_temps(&pair.destination).map_err(|e| scan_error(&pair.destination, e))?;
     Ok((pair, plan))
 }

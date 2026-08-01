@@ -263,6 +263,65 @@ fn run_impl(
         );
     }
     retain_reviewed_actions(&mut plan, &initial_plan);
+    // Delete reviewed destination entries before writing new content. Besides
+    // keeping every deletion in the SafetyNet, this clears file/directory
+    // conflicts so a reviewed COPY can publish at its planned path.
+    for action in plan
+        .deletes
+        .iter()
+        .filter(|deletion| delete_precedes_copy(deletion, &plan.copies))
+    {
+        let destination = pair.destination.join(&action.rel_path);
+        journal
+            .action_start(Operation::Delete, action, None, None)
+            .map_err(journal_runtime_error)?;
+        if let Some(stream) = stream.as_mut() {
+            stream.action_start(journal.run_id(), Operation::Delete, action)?;
+        }
+        match remove_file(
+            &pair.destination,
+            &destination,
+            &action.rel_path,
+            journal.run_id(),
+            options.permanent_delete,
+        ) {
+            Ok(safety_net) => {
+                journal
+                    .action_done(Operation::Delete, action, safety_net.as_deref(), &[])
+                    .map_err(journal_runtime_error)?;
+                if let Some(stream) = stream.as_mut() {
+                    stream.action_done(
+                        journal.run_id(),
+                        Operation::Delete,
+                        action,
+                        safety_net.as_deref(),
+                        &[],
+                    )?;
+                }
+                stats.counts.done += 1;
+                stats.counts.deleted += 1;
+                stats.bytes += action.bytes;
+            }
+            Err(error) => {
+                stats.counts.failed += 1;
+                journal
+                    .action_failed(Operation::Delete, action, &error.to_string())
+                    .map_err(journal_runtime_error)?;
+                if let Some(stream) = stream.as_mut() {
+                    stream.action_failed(
+                        journal.run_id(),
+                        Operation::Delete,
+                        action,
+                        &error.to_string(),
+                    )?;
+                }
+                eprintln!(
+                    "vibesync: DELETE {} failed: {error}",
+                    action.rel_path.display()
+                );
+            }
+        }
+    }
     for (operation, action) in plan
         .copies
         .iter()
@@ -290,6 +349,10 @@ fn run_impl(
             action,
             journal.run_id(),
             options.permanent_delete,
+            plan.deletes.iter().any(|deletion| {
+                deletion.rel_path != action.rel_path
+                    && deletion.rel_path.starts_with(&action.rel_path)
+            }),
             json_output.then_some(ProgressDetails {
                 run_id: journal.run_id(),
                 operation,
@@ -354,7 +417,11 @@ fn run_impl(
             }
         }
     }
-    for action in &plan.deletes {
+    for action in plan
+        .deletes
+        .iter()
+        .filter(|deletion| !delete_precedes_copy(deletion, &plan.copies))
+    {
         let destination = pair.destination.join(&action.rel_path);
         journal
             .action_start(Operation::Delete, action, None, None)
@@ -406,7 +473,6 @@ fn run_impl(
             }
         }
     }
-
     journal.summary(&stats).map_err(journal_runtime_error)?;
     if let Some(stream) = stream.as_mut() {
         stream.summary(journal.run_id(), &stats)?;
@@ -432,6 +498,13 @@ fn retain_reviewed_actions(fresh: &mut plan::Plan, reviewed: &plan::Plan) {
     fresh
         .deletes
         .retain(|action| reviewed.deletes.contains(action));
+}
+
+fn delete_precedes_copy(deletion: &Action, copies: &[Action]) -> bool {
+    copies.iter().any(|copy| {
+        copy.rel_path.starts_with(&deletion.rel_path)
+            || deletion.rel_path.starts_with(&copy.rel_path)
+    })
 }
 
 fn missing_reviewed_actions<'a>(
@@ -485,6 +558,7 @@ fn copy_file(
     action: &Action,
     run_id: &str,
     permanent_delete: bool,
+    replace_emptied_directory: bool,
     progress: Option<ProgressDetails<'_>>,
 ) -> io::Result<ActionOutcome> {
     let source_before = fs::metadata(source)?;
@@ -493,6 +567,12 @@ fn copy_file(
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
     let result = (|| {
+        if replace_emptied_directory
+            && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir())
+            && fs::read_dir(destination)?.next().is_none()
+        {
+            fs::remove_dir(destination)?;
+        }
         copyfile_all_but_acls(source, temp, progress)?;
         crash_at("copy_complete");
         #[cfg(feature = "fault-injection")]
@@ -538,6 +618,12 @@ struct ProgressDetails<'a> {
 
 struct ProgressObserver {
     done: Arc<AtomicBool>,
+    emitted: Arc<AtomicBool>,
+    temp: PathBuf,
+    run_id: String,
+    operation: String,
+    path: String,
+    total_bytes: u64,
     worker: thread::JoinHandle<io::Result<()>>,
 }
 
@@ -548,37 +634,35 @@ impl ProgressObserver {
         }
         let done = Arc::new(AtomicBool::new(false));
         let worker_done = Arc::clone(&done);
+        let emitted = Arc::new(AtomicBool::new(false));
+        let worker_emitted = Arc::clone(&emitted);
         let temp = temp.to_path_buf();
         let run_id = details.run_id.to_string();
-        let operation = details.operation.as_str();
+        let operation = details.operation.as_str().to_string();
         let path = path_text(&details.action.rel_path);
         let total_bytes = details.action.bytes;
+        let worker_temp = temp.clone();
+        let worker_run_id = run_id.clone();
+        let worker_operation = operation.clone();
+        let worker_path = path.clone();
         let worker = thread::spawn(move || {
             let mut last_bytes = 0;
             let mut last_emit = None;
             while !worker_done.load(Ordering::Acquire) {
-                if let Ok(metadata) = fs::metadata(&temp) {
+                if let Ok(metadata) = fs::metadata(&worker_temp) {
                     let copied = metadata.len();
                     if copied > last_bytes
                         && last_emit
                             .is_none_or(|instant: Instant| instant.elapsed() >= PROGRESS_INTERVAL)
                     {
-                        let mut stdout = io::stdout().lock();
-                        serde_json::to_writer(
-                            &mut stdout,
-                            &json!({
-                                "schema": "vibefilesync.run/v1",
-                                "type": "progress",
-                                "run_id": run_id,
-                                "op": operation,
-                                "path": path,
-                                "bytes": copied,
-                                "total_bytes": total_bytes,
-                            }),
-                        )
-                        .map_err(io::Error::other)?;
-                        stdout.write_all(b"\n")?;
-                        stdout.flush()?;
+                        write_progress(
+                            &worker_run_id,
+                            &worker_operation,
+                            &worker_path,
+                            copied,
+                            total_bytes,
+                        )?;
+                        worker_emitted.store(true, Ordering::Release);
                         last_emit = Some(Instant::now());
                     }
                     last_bytes = copied;
@@ -587,15 +671,59 @@ impl ProgressObserver {
             }
             Ok(())
         });
-        Some(Self { done, worker })
+        Some(Self {
+            done,
+            emitted,
+            temp,
+            run_id,
+            operation,
+            path,
+            total_bytes,
+            worker,
+        })
     }
 
-    fn finish(self) -> io::Result<()> {
+    fn finish(self, ensure_event: bool) -> io::Result<()> {
         self.done.store(true, Ordering::Release);
         self.worker
             .join()
-            .map_err(|_| io::Error::other("progress observer panicked"))?
+            .map_err(|_| io::Error::other("progress observer panicked"))??;
+        if ensure_event && !self.emitted.load(Ordering::Acquire) {
+            write_progress(
+                &self.run_id,
+                &self.operation,
+                &self.path,
+                fs::metadata(&self.temp)?.len(),
+                self.total_bytes,
+            )?;
+        }
+        Ok(())
     }
+}
+
+fn write_progress(
+    run_id: &str,
+    operation: &str,
+    path: &str,
+    bytes: u64,
+    total_bytes: u64,
+) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(
+        &mut stdout,
+        &json!({
+            "schema": "vibefilesync.run/v1",
+            "type": "progress",
+            "run_id": run_id,
+            "op": operation,
+            "path": path,
+            "bytes": bytes,
+            "total_bytes": total_bytes,
+        }),
+    )
+    .map_err(io::Error::other)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
 }
 
 #[cfg(feature = "fault-injection")]
@@ -878,7 +1006,7 @@ fn copyfile_all_but_acls(
         )
     };
     if let Some(observer) = observer {
-        observer.finish()?;
+        observer.finish(result == 0)?;
     }
     if result == 0 {
         Ok(())
@@ -1099,6 +1227,7 @@ mod tests {
             &action,
             "20260716T120000Z",
             false,
+            false,
             None,
         );
 
@@ -1136,6 +1265,7 @@ mod tests {
             &temp,
             &action,
             "20260716T120000Z",
+            false,
             false,
             None,
         );
