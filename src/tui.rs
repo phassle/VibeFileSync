@@ -278,9 +278,6 @@ impl ReviewModel {
         reviewed
             .errors
             .retain(|error| keep(Operation::Error, &error.rel_path));
-        reviewed
-            .strays
-            .retain(|path| keep(Operation::Cleanup, path));
         reviewed.directory_copies.retain(|path| {
             reviewed
                 .copies
@@ -320,6 +317,10 @@ impl ReviewModel {
 
     fn toggle(&mut self) {
         if let Some(row) = self.rows.get_mut(self.selected) {
+            if row.operation == Operation::Cleanup {
+                self.message = Some("Cleanup is mandatory for convergence".into());
+                return;
+            }
             row.included = !row.included;
             self.message = None;
         }
@@ -915,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_cleanup_is_removed_from_the_reviewed_plan() {
+    fn cleanup_cannot_be_excluded_from_the_reviewed_plan() {
         let dry_run = plan::Plan {
             strays: vec![PathBuf::from(".old.vibesync-tmp-run")],
             ..plan::Plan::default()
@@ -928,15 +929,13 @@ mod tests {
         let outcome =
             review_loop(&mut terminal, &mut events, &mut model, HeaderMode::Full).unwrap();
         let ReviewOutcome::Execute(exclusions) = outcome else {
-            panic!("excluded cleanup should produce an executable subset")
+            panic!("mandatory cleanup should remain executable")
         };
         let reviewed = model.into_reviewed_plan(&exclusions);
 
-        assert_eq!(exclusions.len(), 1);
-        assert_eq!(exclusions[0].operation, Operation::Cleanup);
-        assert_eq!(exclusions[0].path, ".old.vibesync-tmp-run");
-        assert!(reviewed.strays.is_empty());
-        assert_eq!(reviewed.excluded, 1);
+        assert!(exclusions.is_empty());
+        assert_eq!(reviewed.strays, [PathBuf::from(".old.vibesync-tmp-run")]);
+        assert_eq!(reviewed.excluded, 0);
     }
 
     #[test]

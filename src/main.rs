@@ -8,6 +8,7 @@ mod config;
 mod error;
 mod event;
 mod failure;
+mod interrupt;
 mod journal;
 mod ndjson;
 mod pair;

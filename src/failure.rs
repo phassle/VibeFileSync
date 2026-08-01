@@ -11,6 +11,7 @@ pub enum FailureReason {
     SourceChanged,
     DestinationFull,
     ReconciliationChanged,
+    DependencyFailed,
     FilesystemError,
 }
 

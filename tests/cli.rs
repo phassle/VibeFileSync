@@ -614,7 +614,7 @@ fn plan_json_action_order_is_deterministic_for_nested_trees() {
             .collect::<Vec<_>>()
     };
 
-    let expected = ["a/a.txt", "a/z.txt", "b.txt", "c/x.txt", "d.txt"];
+    let expected = ["a/a.txt", "a/z.txt", "b.txt", "c", "d.txt"];
     assert_eq!(action_paths(), expected);
     assert_eq!(action_paths(), expected);
 }
@@ -887,6 +887,43 @@ fn structural_replacement_gate_failure_leaves_destination_and_safetynet_untouche
             .unwrap();
 
         assert_eq!(output.status.code(), Some(EXIT_PARTIAL), "{output:?}");
+        let stream_rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if destination_is_directory {
+            assert!(stream_rows.iter().any(|row| {
+                row["type"] == "action_failed"
+                    && row["op"] == "delete"
+                    && row["path"] == destination_path
+                    && row["reason"] == "dependency_failed"
+            }));
+            let journal_path = fs::read_dir(fx.journal_dir("photos"))
+                .unwrap()
+                .find(|entry| {
+                    entry.as_ref().is_ok_and(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "ndjson")
+                    })
+                })
+                .unwrap()
+                .unwrap()
+                .path();
+            let journal_rows: Vec<serde_json::Value> = fs::read_to_string(journal_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(journal_rows.iter().any(|row| {
+                row["type"] == "action_failed"
+                    && row["op"] == "delete"
+                    && row["path"] == destination_path
+                    && row["reason"] == "dependency_failed"
+            }));
+        }
         if destination_is_directory {
             assert!(fx.destination.path().join(destination_path).is_dir());
         } else {
@@ -897,6 +934,45 @@ fn structural_replacement_gate_failure_leaves_destination_and_safetynet_untouche
         }
         assert!(!fx.destination.path().join("_SafetyNet").exists());
     }
+}
+
+#[test]
+fn plan_json_matches_run_review_for_nonempty_structural_replacement() {
+    let fx = Fixture::new();
+    fx.write_source("node", "new file");
+    fx.write_dest("node/subdir/old.txt", "old file");
+    fx.add_photos_pair();
+
+    let plan = fx
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(plan.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(plan.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let actions: Vec<_> = rows
+        .iter()
+        .filter(|row| row["type"] == "action")
+        .map(|row| (row["op"].clone(), row["path"].clone()))
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            (serde_json::json!("copy"), serde_json::json!("node")),
+            (serde_json::json!("delete"), serde_json::json!("node")),
+        ]
+    );
+
+    let run = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+    assert_eq!(run.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("node")).unwrap(),
+        "new file"
+    );
 }
 
 #[test]
@@ -1113,6 +1189,62 @@ fn run_json_progress_is_live_during_a_large_file_copy() {
         "copy emitted no intermediate progress row"
     );
     assert_eq!(child.wait().unwrap().code(), Some(EXIT_OK));
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn catchable_signal_exits_four_with_summaryless_interrupted_journal() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.source.path().join("large.bin"),
+        vec![7_u8; 16 * 1024 * 1024],
+    )
+    .unwrap();
+    fx.add_photos_pair();
+
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut child = ProcessCommand::new(binary.get_program())
+        .args(["run", "photos", "--json", "--yes"])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .env("VIBESYNC_TEST_COPY_CHUNK_DELAY_MS", "5")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    for line in lines.by_ref() {
+        let row: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if row["type"] == "progress" && row["bytes"].as_u64().unwrap_or(0) > 0 {
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+            break;
+        }
+    }
+    for line in lines {
+        let _: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(EXIT_INTERRUPTED));
+    assert!(!fx.destination.path().join("large.bin").exists());
+
+    let journal_path = fs::read_dir(fx.journal_dir("photos"))
+        .unwrap()
+        .find(|entry| {
+            entry.as_ref().is_ok_and(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ndjson")
+            })
+        })
+        .unwrap()
+        .unwrap()
+        .path();
+    let journal = fs::read_to_string(journal_path).unwrap();
+    assert!(journal
+        .lines()
+        .any(|line| line.contains("\"type\":\"action_start\"")));
+    assert!(!journal
+        .lines()
+        .any(|line| line.contains("\"type\":\"summary\"")));
 }
 
 #[test]
@@ -1921,10 +2053,10 @@ fn tui_does_not_execute_an_action_that_appears_after_review_started() {
 }
 
 #[test]
-fn cli_and_tui_can_both_exclude_a_reviewed_stray_cleanup_for_one_run() {
+fn cleanup_is_mandatory_even_when_its_path_is_excluded() {
     let fx = Fixture::new();
     let stray = ".note.vibesync-tmp-stale-run";
-    fx.write_dest(stray, "retain for this reviewed run");
+    fx.write_dest(stray, "crash debris");
     fx.add_photos_pair();
 
     let output = fx
@@ -1934,12 +2066,12 @@ fn cli_and_tui_can_both_exclude_a_reviewed_stray_cleanup_for_one_run() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(EXIT_OK));
-    assert!(fx.destination.path().join(stray).is_file());
+    assert!(!fx.destination.path().join(stray).exists());
     assert!(
-        !String::from_utf8(output.stderr)
+        String::from_utf8(output.stderr)
             .unwrap()
             .contains("exclude path not found"),
-        "a cleanup row printed by plan is an exact excludable plan path"
+        "mandatory cleanup is outside selectable sync content"
     );
 }
 

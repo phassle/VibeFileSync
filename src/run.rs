@@ -366,6 +366,9 @@ fn execute_reviewed_plan(
     mut initial_plan: plan::Plan,
     render_plan: bool,
 ) -> Result<i32, AppError> {
+    crate::interrupt::install().map_err(|error| {
+        AppError::Interrupted(format!("could not install signal handler: {error}"))
+    })?;
     let RunOptions {
         yes,
         permanent_delete,
@@ -424,6 +427,7 @@ fn execute_reviewed_plan(
         ..RunStats::default()
     };
     for stray in &initial_plan.strays {
+        crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         let action = Action {
             rel_path: stray.clone(),
             bytes: fs::metadata(pair.destination.join(stray))
@@ -519,6 +523,7 @@ fn execute_reviewed_plan(
                 .map(|action| (Operation::Update, action)),
         )
     {
+        crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
         let structural_delete = plan.deletes.iter().find(|deletion| {
@@ -547,6 +552,7 @@ fn execute_reviewed_plan(
         reporter.action_start(journal.run_id(), operation, action)?;
         let mut last_progress: Option<Instant> = None;
         let mut progress = |copied: u64| -> io::Result<()> {
+            crate::interrupt::check()?;
             let interval_elapsed = match last_progress {
                 Some(last) => last.elapsed() >= PROGRESS_INTERVAL,
                 None => true,
@@ -650,7 +656,29 @@ fn execute_reviewed_plan(
                 }
             }
             Err(failure) => {
+                if failure.kind() == io::ErrorKind::Interrupted {
+                    return Err(AppError::Interrupted(failure.to_string()));
+                }
                 stats.counts.failed += 1;
+                if let Some(deletion) = structural_delete {
+                    stats.counts.failed += 1;
+                    let dependency_failure = ActionFailure::new(
+                        FailureReason::DependencyFailed,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "dependent copy did not pass its publish gate",
+                        ),
+                    );
+                    journal
+                        .action_failed(Operation::Delete, deletion, FailureReason::DependencyFailed)
+                        .map_err(journal_runtime_error)?;
+                    reporter.action_failed(
+                        journal.run_id(),
+                        Operation::Delete,
+                        deletion,
+                        &dependency_failure,
+                    )?;
+                }
                 journal
                     .action_failed(operation, action, failure.reason())
                     .map_err(journal_runtime_error)?;
@@ -668,6 +696,7 @@ fn execute_reviewed_plan(
         .iter()
         .filter(|deletion| !delete_precedes_copy(deletion, &plan.copies))
     {
+        crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         execute_delete_action(
             &pair,
             action,
@@ -679,6 +708,7 @@ fn execute_reviewed_plan(
         )?;
     }
 
+    crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
     journal.summary(&stats).map_err(journal_runtime_error)?;
     reporter.summary(journal.run_id(), &stats)?;
     if stats.counts.failed == 0 {
