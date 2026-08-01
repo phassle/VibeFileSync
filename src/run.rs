@@ -118,6 +118,7 @@ fn run_impl(
     if !json_output {
         print!("{}", plan::render(&initial_plan, pair_name, pair.mode));
     }
+    plan::report_unknown_excludes(&initial_plan);
 
     let run_warnings = crate::preconditions::check_run(
         &pair,

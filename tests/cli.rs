@@ -972,6 +972,100 @@ fn plan_excludes_an_exact_path() {
 }
 
 #[test]
+fn run_excludes_exact_plan_json_paths_and_reports_unknown_paths() {
+    let fx = Fixture::new();
+    fx.write_source("keep.txt", "keep");
+    fx.write_source("skip.txt", "skip");
+    fx.write_dest("remove.txt", "old");
+    fx.add_photos_pair();
+
+    let plan = fx
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(plan.status.code(), Some(EXIT_OK));
+    let paths: Vec<String> = String::from_utf8(plan.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["type"] == "action")
+        .map(|row| row["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(paths.iter().any(|path| path == "skip.txt"));
+    assert!(paths.iter().any(|path| path == "remove.txt"));
+
+    let output = fx
+        .cmd()
+        .args([
+            "run",
+            "photos",
+            "--yes",
+            "--exclude",
+            "skip.txt",
+            "--exclude",
+            "remove.txt",
+            "--exclude",
+            "missing.txt",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("keep.txt")).unwrap(),
+        "keep"
+    );
+    assert!(!fx.destination.path().join("skip.txt").exists());
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("remove.txt")).unwrap(),
+        "old"
+    );
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("exclude path not found in plan: missing.txt"));
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn included_error_blocks_yes_and_interactive_runs_until_excluded() {
+    let fx = Fixture::new();
+    fx.write_source("safe.txt", "safe");
+    std::os::unix::fs::symlink("target", fx.source.path().join("link")).unwrap();
+    fx.add_photos_pair();
+    let before = Fixture::snapshot(fx.destination.path());
+
+    let blocked_yes = fx
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(blocked_yes.status.code(), Some(EXIT_BLOCKED_PLAN));
+    assert_eq!(Fixture::snapshot(fx.destination.path()), before);
+
+    let blocked_interactive = fx
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+        .args(["run", "photos"])
+        .write_stdin("yes\n")
+        .output()
+        .unwrap();
+    assert_eq!(blocked_interactive.status.code(), Some(EXIT_BLOCKED_PLAN));
+    assert_eq!(Fixture::snapshot(fx.destination.path()), before);
+
+    fx.cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+        .args(["run", "photos", "--yes", "--exclude", "link"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("safe.txt")).unwrap(),
+        "safe"
+    );
+    assert!(!fx.destination.path().join("link").exists());
+}
+
+#[test]
 fn plan_performs_zero_writes_to_source_or_destination() {
     let fx = Fixture::new();
     fx.write_source("new.txt", "aaaa");
