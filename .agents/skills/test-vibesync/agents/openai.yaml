@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test VibeSync"
+  short_description: "Run Rust quality and safety test gates"
+  default_prompt: "Use $test-vibesync to run the VibeSync quality and safety test gates."
