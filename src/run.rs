@@ -2,6 +2,7 @@
 //! before SafetyNet archives any old destination object and Publish renames the
 //! verified temp into place (ADR-0001 and ADR-0008).
 
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -83,6 +84,14 @@ enum RunReporter {
     Json,
 }
 
+fn planned_action(operation: Operation, action: &Action) -> serde_json::Value {
+    serde_json::json!({
+        "op": operation,
+        "path": action.rel_path.to_string_lossy(),
+        "bytes": action.bytes,
+    })
+}
+
 impl RunReporter {
     fn new(json: bool) -> Self {
         if json {
@@ -126,8 +135,9 @@ impl RunReporter {
     }
 
     fn cancelled(&self) {
-        if matches!(self, Self::Human) {
-            println!("Run cancelled; destination unchanged.");
+        match self {
+            Self::Human => println!("Run cancelled; destination unchanged."),
+            Self::Json => eprintln!("Run cancelled; destination unchanged."),
         }
     }
 
@@ -157,7 +167,7 @@ impl RunReporter {
         mode: crate::config::Mode,
         destination: &Path,
         warnings: &[String],
-        planned: usize,
+        plan: &plan::Plan,
     ) -> Result<(), AppError> {
         let mut event = crate::event::run_start(
             crate::event::Context {
@@ -169,7 +179,27 @@ impl RunReporter {
             &crate::volume::expected_degradations(destination),
         );
         event["mode"] = serde_json::json!(mode);
-        event["planned"] = planned.into();
+        let mut planned_actions = Vec::new();
+        planned_actions.extend(
+            plan.copies
+                .iter()
+                .map(|action| planned_action(Operation::Copy, action)),
+        );
+        planned_actions.extend(
+            plan.updates
+                .iter()
+                .map(|action| planned_action(Operation::Update, action)),
+        );
+        planned_actions.extend(
+            plan.deletes
+                .iter()
+                .map(|action| planned_action(Operation::Delete, action)),
+        );
+        planned_actions.extend(plan.strays.iter().map(|path| {
+            serde_json::json!({"op":Operation::Cleanup,"path":path.to_string_lossy(),"bytes":0})
+        }));
+        event["planned"] = planned_actions.len().into();
+        event["planned_actions"] = planned_actions.into();
         self.json(event)
     }
 
@@ -202,7 +232,7 @@ impl RunReporter {
         action: &Action,
         bytes: u64,
     ) -> Result<(), AppError> {
-        self.json(serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":bytes,"total_bytes":action.bytes}))
+        self.json(serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":bytes.min(action.bytes),"total_bytes":action.bytes}))
     }
 
     fn action_done(
@@ -389,10 +419,7 @@ fn execute_reviewed_plan(
         pair.mode,
         &pair.destination,
         &run_warnings,
-        initial_plan.copies.len()
-            + initial_plan.updates.len()
-            + initial_plan.deletes.len()
-            + initial_plan.strays.len(),
+        &initial_plan,
     )?;
     let mut stats = RunStats {
         counts: Counts {
@@ -457,12 +484,8 @@ fn execute_reviewed_plan(
         return Ok(EXIT_BLOCKED_PLAN);
     }
     for (operation, action) in missing_reviewed_actions(&initial_plan, &plan) {
-        let source = match operation {
-            Operation::Copy | Operation::Update => Some(pair.source.join(&action.rel_path)),
-            Operation::Delete | Operation::Cleanup => None,
-        };
         journal
-            .action_start(operation, action, source.as_deref(), None)
+            .action_start(operation, action, None, None)
             .map_err(journal_runtime_error)?;
         reporter.action_start(journal.run_id(), operation, action)?;
         let error = io::Error::other("changed during reconciliation; rerun required");
@@ -473,6 +496,20 @@ fn execute_reviewed_plan(
         stats.counts.failed += 1;
     }
     retain_reviewed_actions(&mut plan, &initial_plan);
+    for action in plan
+        .deletes
+        .iter()
+        .filter(|deletion| delete_precedes_copy(deletion, &plan.copies))
+    {
+        execute_delete_action(
+            &pair,
+            action,
+            &mut journal,
+            permanent_delete,
+            &reporter,
+            &mut stats,
+        )?;
+    }
     for (operation, action) in plan
         .copies
         .iter()
@@ -486,6 +523,7 @@ fn execute_reviewed_plan(
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
         let temp = temporary_path(&destination, journal.run_id());
+        let reviewed_empty_directories = reviewed_empty_directories(action, &plan.deletes);
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
@@ -515,6 +553,7 @@ fn execute_reviewed_plan(
                 permanent_delete,
                 full_verify,
                 report_progress: reporter.is_json(),
+                reviewed_empty_directories: &reviewed_empty_directories,
             },
             &mut progress,
         ) {
@@ -574,69 +613,19 @@ fn execute_reviewed_plan(
             }
         }
     }
-    for action in &plan.deletes {
-        let destination = pair.destination.join(&action.rel_path);
-        journal
-            .action_start(Operation::Delete, action, None, None)
-            .map_err(journal_runtime_error)?;
-        reporter.action_start(journal.run_id(), Operation::Delete, action)?;
-        match remove_file(
-            &pair.destination,
-            &destination,
-            &action.rel_path,
-            journal.run_id(),
+    for action in plan
+        .deletes
+        .iter()
+        .filter(|deletion| !delete_precedes_copy(deletion, &plan.copies))
+    {
+        execute_delete_action(
+            &pair,
+            action,
+            &mut journal,
             permanent_delete,
-        ) {
-            Ok(safety_net) => {
-                if let Some(archive) = safety_net.as_deref() {
-                    fault_at(
-                        FaultTransition::Archived,
-                        FaultContext {
-                            relative_path: &action.rel_path,
-                            source: None,
-                            temp: None,
-                            destination: Some(&destination),
-                            safety_net: Some(archive),
-                        },
-                    )
-                    .map_err(journal_runtime_error)?;
-                }
-                journal
-                    .action_done(Operation::Delete, action, safety_net.as_deref(), &[], None)
-                    .map_err(journal_runtime_error)?;
-                #[cfg(all(feature = "fault-injection", debug_assertions))]
-                journal.flush().map_err(journal_runtime_error)?;
-                fault_at(
-                    FaultTransition::ActionDoneWritten,
-                    FaultContext {
-                        relative_path: &action.rel_path,
-                        source: None,
-                        temp: None,
-                        destination: Some(&destination),
-                        safety_net: safety_net.as_deref(),
-                    },
-                )
-                .map_err(journal_runtime_error)?;
-                stats.counts.done += 1;
-                stats.counts.deleted += 1;
-                stats.bytes += action.bytes;
-                reporter.action_done(
-                    journal.run_id(),
-                    Operation::Delete,
-                    action,
-                    safety_net.as_deref(),
-                    &[],
-                    false,
-                )?;
-            }
-            Err(error) => {
-                stats.counts.failed += 1;
-                journal
-                    .action_failed(Operation::Delete, action, &error.to_string())
-                    .map_err(journal_runtime_error)?;
-                reporter.action_failed(journal.run_id(), Operation::Delete, action, &error)?;
-            }
-        }
+            &reporter,
+            &mut stats,
+        )?;
     }
 
     journal.summary(&stats).map_err(journal_runtime_error)?;
@@ -662,6 +651,86 @@ fn retain_reviewed_actions(fresh: &mut plan::Plan, reviewed: &plan::Plan) {
     fresh
         .deletes
         .retain(|action| reviewed.deletes.contains(action));
+}
+
+fn delete_precedes_copy(deletion: &Action, copies: &[Action]) -> bool {
+    copies.iter().any(|copy| {
+        copy.rel_path.starts_with(&deletion.rel_path)
+            || deletion.rel_path.starts_with(&copy.rel_path)
+    })
+}
+
+fn execute_delete_action(
+    pair: &crate::config::Pair,
+    action: &Action,
+    journal: &mut Journal,
+    permanent_delete: bool,
+    reporter: &RunReporter,
+    stats: &mut RunStats,
+) -> Result<(), AppError> {
+    let destination = pair.destination.join(&action.rel_path);
+    journal
+        .action_start(Operation::Delete, action, None, None)
+        .map_err(journal_runtime_error)?;
+    reporter.action_start(journal.run_id(), Operation::Delete, action)?;
+    match remove_file(
+        &pair.destination,
+        &destination,
+        &action.rel_path,
+        journal.run_id(),
+        permanent_delete,
+    ) {
+        Ok(safety_net) => {
+            if let Some(archive) = safety_net.as_deref() {
+                fault_at(
+                    FaultTransition::Archived,
+                    FaultContext {
+                        relative_path: &action.rel_path,
+                        source: None,
+                        temp: None,
+                        destination: Some(&destination),
+                        safety_net: Some(archive),
+                    },
+                )
+                .map_err(journal_runtime_error)?;
+            }
+            journal
+                .action_done(Operation::Delete, action, safety_net.as_deref(), &[], None)
+                .map_err(journal_runtime_error)?;
+            #[cfg(all(feature = "fault-injection", debug_assertions))]
+            journal.flush().map_err(journal_runtime_error)?;
+            fault_at(
+                FaultTransition::ActionDoneWritten,
+                FaultContext {
+                    relative_path: &action.rel_path,
+                    source: None,
+                    temp: None,
+                    destination: Some(&destination),
+                    safety_net: safety_net.as_deref(),
+                },
+            )
+            .map_err(journal_runtime_error)?;
+            stats.counts.done += 1;
+            stats.counts.deleted += 1;
+            stats.bytes += action.bytes;
+            reporter.action_done(
+                journal.run_id(),
+                Operation::Delete,
+                action,
+                safety_net.as_deref(),
+                &[],
+                false,
+            )?;
+        }
+        Err(error) => {
+            stats.counts.failed += 1;
+            journal
+                .action_failed(Operation::Delete, action, &error.to_string())
+                .map_err(journal_runtime_error)?;
+            reporter.action_failed(journal.run_id(), Operation::Delete, action, &error)?;
+        }
+    }
+    Ok(())
 }
 
 fn missing_reviewed_actions<'a>(
@@ -704,6 +773,7 @@ fn copy_file(
         permanent_delete,
         full_verify,
         report_progress,
+        reviewed_empty_directories,
     } = options;
     let planned_source_mtime = action
         .source_mtime
@@ -713,6 +783,19 @@ fn copy_file(
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
     let result = (|| {
+        if fs::symlink_metadata(source)?.file_type().is_file()
+            && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir())
+            && !remove_reviewed_empty_directories(
+                destination_root,
+                destination,
+                reviewed_empty_directories,
+            )?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination path is a non-empty or unreviewed directory",
+            ));
+        }
         #[cfg(all(feature = "fault-injection", debug_assertions))]
         File::create(temp)?;
         let context = || FaultContext {
@@ -799,6 +882,7 @@ struct CopyOptions<'a> {
     permanent_delete: bool,
     full_verify: bool,
     report_progress: bool,
+    reviewed_empty_directories: &'a BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -913,6 +997,52 @@ fn remove_file(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Removes only directory nodes implied by reviewed child DELETE actions.
+/// Any unreviewed entry, including invisible sync machinery, preserves the
+/// obstruction and makes the conflicting COPY fail without recursive loss.
+fn remove_reviewed_empty_directories(
+    destination_root: &Path,
+    directory: &Path,
+    reviewed: &BTreeSet<PathBuf>,
+) -> io::Result<bool> {
+    let relative = directory
+        .strip_prefix(destination_root)
+        .expect("destination directory is under destination root");
+    if !reviewed.contains(relative) {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if fs::symlink_metadata(&path)?.file_type().is_dir() {
+            if !remove_reviewed_empty_directories(destination_root, &path, reviewed)? {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+    fs::remove_dir(directory)?;
+    Ok(true)
+}
+
+fn reviewed_empty_directories(copy: &Action, deletions: &[Action]) -> BTreeSet<PathBuf> {
+    let mut directories = BTreeSet::new();
+    for deletion in deletions
+        .iter()
+        .filter(|deletion| deletion.rel_path.starts_with(&copy.rel_path))
+    {
+        let mut parent = deletion.rel_path.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() || !directory.starts_with(&copy.rel_path) {
+                break;
+            }
+            directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    directories
 }
 
 /// Makes the old version visible in SafetyNet with its relative path kept
@@ -1393,6 +1523,7 @@ mod tests {
                 permanent_delete: false,
                 full_verify: false,
                 report_progress: false,
+                reviewed_empty_directories: &BTreeSet::new(),
             },
             &mut |_| Ok(()),
         );
@@ -1436,6 +1567,7 @@ mod tests {
                 permanent_delete: false,
                 full_verify: false,
                 report_progress: false,
+                reviewed_empty_directories: &BTreeSet::new(),
             },
             &mut |_| Ok(()),
         );

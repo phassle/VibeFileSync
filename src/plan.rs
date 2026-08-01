@@ -612,7 +612,14 @@ fn entry_at(path: &Path) -> io::Result<Option<Entry>> {
             mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             is_symlink: metadata.file_type().is_symlink(),
         })),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }

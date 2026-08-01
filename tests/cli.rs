@@ -547,6 +547,121 @@ fn plan_json_stream_has_versioned_rows_in_contract_order_and_pure_stdout() {
 }
 
 #[test]
+fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
+    let source_directory = Fixture::new();
+    source_directory.write_source("docs/new.txt", "new");
+    source_directory.write_dest("docs", "old file");
+    source_directory.add_photos_pair();
+    let output = source_directory
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(rows
+        .iter()
+        .any(|row| row["op"] == "delete" && row["path"] == "docs"));
+    assert!(rows
+        .iter()
+        .any(|row| row["op"] == "copy" && row["path"] == "docs/new.txt"));
+    let excluded = source_directory
+        .cmd()
+        .args(["plan", "photos", "--json", "--exclude", "docs"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8(excluded.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|row| row["op"] == "delete" && row["path"] == "docs"));
+    let output = source_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(source_directory.destination.path().join("docs/new.txt")).unwrap(),
+        "new"
+    );
+
+    let source_file = Fixture::new();
+    source_file.write_source("node", "new file");
+    source_file.write_dest("node/subdir/old.txt", "old child");
+    source_file.add_photos_pair();
+    let output = source_file
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(source_file.destination.path().join("node")).unwrap(),
+        "new file"
+    );
+
+    let empty_directory = Fixture::new();
+    empty_directory.write_source("empty", "new file");
+    fs::create_dir(empty_directory.destination.path().join("empty")).unwrap();
+    empty_directory.add_photos_pair();
+    let output = empty_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    assert!(empty_directory.destination.path().join("empty").is_dir());
+
+    let unreviewed_directory = Fixture::new();
+    unreviewed_directory.write_source("node", "new file");
+    fs::create_dir_all(
+        unreviewed_directory
+            .destination
+            .path()
+            .join("node/unreviewed-empty"),
+    )
+    .unwrap();
+    unreviewed_directory.add_photos_pair();
+    let output = unreviewed_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    assert!(unreviewed_directory
+        .destination
+        .path()
+        .join("node/unreviewed-empty")
+        .is_dir());
+
+    let machinery_directory = Fixture::new();
+    machinery_directory.write_source("node", "new file");
+    fs::create_dir_all(
+        machinery_directory
+            .destination
+            .path()
+            .join("node/_SafetyNet"),
+    )
+    .unwrap();
+    machinery_directory.add_photos_pair();
+    let output = machinery_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    assert!(machinery_directory
+        .destination
+        .path()
+        .join("node/_SafetyNet")
+        .is_dir());
+}
+
+#[test]
 fn run_json_stream_reports_execution_order_verification_and_safetynet() {
     let fx = Fixture::new();
     fx.write_source("created.txt", "created");
@@ -576,6 +691,16 @@ fn run_json_stream_reports_execution_order_verification_and_safetynet() {
     assert_eq!(rows.first().unwrap()["type"], "run_start");
     assert_eq!(rows.last().unwrap()["type"], "summary");
     assert!(rows[0]["degradations"].is_array());
+    let planned = rows[0]["planned_actions"]
+        .as_array()
+        .expect("run_start declares the reviewed action set");
+    assert_eq!(planned.len(), 2);
+    assert!(planned
+        .iter()
+        .any(|action| action["op"] == "copy" && action["path"] == "created.txt"));
+    assert!(planned
+        .iter()
+        .any(|action| action["op"] == "update" && action["path"] == "updated.txt"));
     for path in ["created.txt", "updated.txt"] {
         let events: Vec<_> = rows.iter().filter(|row| row["path"] == path).collect();
         assert_eq!(events.first().unwrap()["type"], "action_start");
@@ -592,6 +717,46 @@ fn run_json_stream_reports_execution_order_verification_and_safetynet() {
         .unwrap()
         .contains("_SafetyNet/"));
     assert_eq!(rows.last().unwrap()["warnings"], 0);
+}
+
+#[test]
+fn run_json_cancellation_and_early_errors_keep_stdout_clean() {
+    let cancelled = Fixture::new();
+    cancelled.write_source("photo.txt", "would copy if approved");
+    cancelled.add_photos_pair();
+    let output = cancelled
+        .cmd()
+        .args(["run", "photos", "--json"])
+        .write_stdin("n\n")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert!(output.stdout.is_empty(), "stdout must remain NDJSON-only");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Proceed with COPY actions?"), "{stderr}");
+    assert!(stderr.contains("Run cancelled"), "{stderr}");
+    assert!(!cancelled.destination.path().join("photo.txt").exists());
+
+    let unknown_pair = Fixture::new();
+    let usage = unknown_pair
+        .cmd()
+        .args(["plan", "missing", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(usage.status.code(), Some(EXIT_USAGE));
+    assert!(usage.stdout.is_empty());
+
+    let bad_config = Fixture::new();
+    let path = config_file(bad_config.xdg.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, "version = 1\nbogus = true\n").unwrap();
+    let precondition = bad_config
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(precondition.status.code(), Some(EXIT_PRECONDITION));
+    assert!(precondition.stdout.is_empty());
 }
 
 #[test]
@@ -747,6 +912,7 @@ fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows
 
     let deletion = Fixture::new();
     deletion.write_dest("gone.txt", "gone");
+    deletion.write_dest(".gone.txt.vibesync-tmp-old-run", "abandoned");
     deletion.add_photos_pair();
     let deletion_output = deletion
         .cmd()
@@ -761,12 +927,17 @@ fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows
         .collect();
     let deleted = deletion_rows
         .iter()
-        .find(|row| row["type"] == "action_done")
+        .find(|row| row["type"] == "action_done" && row["op"] == "delete")
         .unwrap();
     assert_eq!(deleted["op"], "delete");
     assert_eq!(deleted["result"], "done");
     assert!(deleted["safety_net"].as_str().is_some());
     assert!(deleted.get("verified").is_none());
+    let cleanup = deletion_rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["op"] == "cleanup")
+        .expect("cleanup emits action_done");
+    assert!(cleanup.get("verified").is_none());
 
     let interrupted = Fixture::new();
     interrupted.write_source("crash.txt", "contents");
