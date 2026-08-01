@@ -575,8 +575,7 @@ fn draw_pair_selector(
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, body, &mut state);
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k move · Enter select · q cancel")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new("↑/↓ or j/k move · Enter select · q cancel"),
         footer,
     );
 }
@@ -594,10 +593,7 @@ fn draw_review(frame: &mut Frame<'_>, model: &ReviewModel, header_mode: HeaderMo
         }
         Screen::Confirm => "y confirm and run · b/n/Esc return to actions · q cancel",
     };
-    frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(help), footer);
 }
 
 fn vertical_sections(
@@ -1002,6 +998,39 @@ mod tests {
             select_pair_loop(&mut terminal, &mut events, &choices, HeaderMode::Full).unwrap();
 
         assert_eq!(selected.as_deref(), Some("photos"));
+    }
+
+    #[test]
+    fn review_footer_uses_terminal_default_foreground() {
+        let model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), plan::Plan::default());
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        let footer_start = terminal.backend().buffer().cell((0, 17)).unwrap();
+        assert_eq!(footer_start.symbol(), "↑");
+        assert_eq!(footer_start.fg, Color::Reset);
+    }
+
+    #[test]
+    fn pair_selector_footer_uses_terminal_default_foreground() {
+        let choices = vec![PairChoice {
+            name: "photos".to_string(),
+            mode: Mode::Mirror,
+            source: PathBuf::from("/photos"),
+            destination: PathBuf::from("/Volumes/Backup/Photos"),
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+
+        terminal
+            .draw(|frame| draw_pair_selector(frame, &choices, 0, HeaderMode::Full))
+            .unwrap();
+
+        let footer_start = terminal.backend().buffer().cell((0, 17)).unwrap();
+        assert_eq!(footer_start.symbol(), "↑");
+        assert_eq!(footer_start.fg, Color::Reset);
     }
 
     #[test]
