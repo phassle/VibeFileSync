@@ -281,6 +281,18 @@ impl ReviewModel {
         reviewed
             .strays
             .retain(|path| keep(Operation::Cleanup, path));
+        reviewed.directory_copies.retain(|path| {
+            reviewed
+                .copies
+                .iter()
+                .any(|action| action.rel_path == *path)
+        });
+        reviewed.directory_deletes.retain(|path| {
+            reviewed
+                .deletes
+                .iter()
+                .any(|action| action.rel_path == *path)
+        });
         let after = reviewed.copies.len()
             + reviewed.updates.len()
             + reviewed.deletes.len()
@@ -370,6 +382,7 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
     // Planning happens outside alternate-screen mode so volume-relocation
     // notices remain ordinary terminal output rather than corrupting a frame.
     let (pair, dry_run) = plan::build(config_path, &pair_name, &[])?;
+    run_engine::present_default_preflight(&pair, &dry_run)?;
     let mut model = ReviewModel::from_plan(&pair_name, &pair, dry_run);
     let outcome = review(&mut model)?;
     let ReviewOutcome::Execute(excludes) = outcome else {
@@ -929,7 +942,7 @@ mod tests {
     #[test]
     fn exclusion_identity_distinguishes_structural_delete_from_copy_at_same_path() {
         let mut deletion = action("report.txt", 0, "replaced by source file");
-        deletion.structural_conflict = Some(plan::StructuralConflict::DestinationEmptyDirectory);
+        deletion.structural_conflict = Some(plan::StructuralConflict::DestinationDirectory);
         let dry_run = plan::Plan {
             copies: vec![action("report.txt", 10, "new")],
             deletes: vec![deletion],

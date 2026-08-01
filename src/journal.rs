@@ -106,14 +106,17 @@ impl Journal {
         source: Option<&Path>,
         temp: Option<&Path>,
     ) -> io::Result<()> {
-        let source_identity = source.map(fs::metadata).transpose()?.map(|metadata| {
-            let modified_ns = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos().to_string());
-            json!({ "size": metadata.len(), "modified_ns": modified_ns })
-        });
+        let source_identity = source
+            .map(fs::symlink_metadata)
+            .transpose()?
+            .map(|metadata| {
+                let modified_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos().to_string());
+                json!({ "size": metadata.len(), "modified_ns": modified_ns })
+            });
         let context = crate::event::Context {
             schema: SCHEMA,
             run_id: &self.run_id,
@@ -129,8 +132,8 @@ impl Journal {
         operation: Operation,
         action: &Action,
         safety_net: Option<&Path>,
-        warnings: &[String],
-        verified: Option<&str>,
+        warnings: &[crate::event::MetadataWarning],
+        verified: Option<crate::event::VerificationTier>,
     ) -> io::Result<()> {
         self.append(
             crate::event::action_done(

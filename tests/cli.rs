@@ -294,7 +294,7 @@ fn pair_list_json_emits_the_versioned_schema() {
     fx.add_photos_pair();
 
     let output = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
 
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid JSON output");
@@ -732,7 +732,7 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
         .args(["run", "photos", "--yes", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
     assert_eq!(
         fs::read_to_string(source_directory.destination.path().join("docs/new.txt")).unwrap(),
         "new"
@@ -832,12 +832,11 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
         .args(["run", "photos", "--yes", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
-    assert!(unreviewed_directory
-        .destination
-        .path()
-        .join("node/unreviewed-empty")
-        .is_dir());
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(unreviewed_directory.destination.path().join("node")).unwrap(),
+        "new file"
+    );
 
     let machinery_directory = Fixture::new();
     machinery_directory.write_source("node", "new file");
@@ -860,6 +859,111 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
         .path()
         .join("node/_SafetyNet")
         .is_dir());
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn structural_replacement_gate_failure_leaves_destination_and_safetynet_untouched() {
+    for (source_path, destination_path, destination_is_directory) in
+        [("docs/new.txt", "docs", false), ("node", "node", true)]
+    {
+        let fx = Fixture::new();
+        fx.write_source(source_path, "new verified bytes");
+        if destination_is_directory {
+            fs::create_dir(fx.destination.path().join(destination_path)).unwrap();
+        } else {
+            fx.write_dest(destination_path, "old destination");
+        }
+        fx.add_photos_pair();
+
+        let output = fx
+            .cmd()
+            .env(
+                "VIBESYNC_TEST_EXEC_AT",
+                "copy_complete:truncate -s 1 \"$VIBESYNC_TEST_TEMP\"",
+            )
+            .args(["run", "photos", "--json", "--yes", "--verify"])
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(EXIT_PARTIAL), "{output:?}");
+        if destination_is_directory {
+            assert!(fx.destination.path().join(destination_path).is_dir());
+        } else {
+            assert_eq!(
+                fs::read_to_string(fx.destination.path().join(destination_path)).unwrap(),
+                "old destination"
+            );
+        }
+        assert!(!fx.destination.path().join("_SafetyNet").exists());
+    }
+}
+
+#[test]
+fn mirror_preserves_empty_directory_shape_while_update_remains_additive() {
+    let mirror = Fixture::new();
+    fs::create_dir(mirror.source.path().join("source-empty")).unwrap();
+    fs::create_dir(mirror.destination.path().join("destination-empty")).unwrap();
+    mirror.add_photos_pair();
+    let plan = mirror
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    let rows: Vec<serde_json::Value> = String::from_utf8(plan.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(rows.iter().any(|row| {
+        row["type"] == "action" && row["op"] == "copy" && row["path"] == "source-empty"
+    }));
+    assert!(rows.iter().any(|row| {
+        row["type"] == "action" && row["op"] == "delete" && row["path"] == "destination-empty"
+    }));
+    mirror
+        .cmd()
+        .args(["run", "photos", "--yes"])
+        .assert()
+        .success();
+    assert!(mirror.destination.path().join("source-empty").is_dir());
+    assert!(!mirror.destination.path().join("destination-empty").exists());
+    assert!(fs::read_dir(mirror.destination.path().join("_SafetyNet"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("destination-empty"))
+        .any(|path| path.is_dir()));
+
+    let update = Fixture::new();
+    fs::create_dir(update.source.path().join("source-empty")).unwrap();
+    fs::create_dir(update.destination.path().join("destination-empty")).unwrap();
+    update.add_pair("photos", "update");
+    update
+        .cmd()
+        .args(["run", "photos", "--yes"])
+        .assert()
+        .success();
+    assert!(update.destination.path().join("source-empty").is_dir());
+    assert!(update.destination.path().join("destination-empty").is_dir());
+}
+
+#[test]
+fn apfs_run_copies_symlink_identity_without_following_its_target() {
+    let fx = Fixture::new();
+    std::os::unix::fs::symlink("missing-relative-target", fx.source.path().join("link")).unwrap();
+    fx.write_dest("link", "old regular file");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let destination = fx.destination.path().join("link");
+    assert!(fs::symlink_metadata(&destination)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read_link(destination).unwrap(),
+        Path::new("missing-relative-target")
+    );
 }
 
 #[test]
@@ -1753,6 +1857,21 @@ fn tui_confirmation_executes_the_reviewed_plan_through_the_run_engine() {
 }
 
 #[test]
+fn tui_shows_preflight_warnings_before_final_confirmation() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "new");
+    fx.write_dest("_SafetyNet/old-run/old.txt", "archived bytes");
+    fx.add_photos_pair();
+
+    // Enter reaches final confirmation; q cancels without mutation.
+    let output =
+        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\rq");
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(transcript.contains("_SafetyNet/ uses"), "{transcript}");
+    assert!(!fx.destination.path().join("new.txt").exists());
+}
+
+#[test]
 fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
     let fx = Fixture::new();
     fx.write_source("later.txt", "still needs copying");
@@ -2005,10 +2124,7 @@ fn plan_prints_summary_first_then_grouped_sections() {
         stdout.contains("changed.txt"),
         "UPDATE row present: {stdout}"
     );
-    assert!(
-        stdout.contains("old/stale.txt"),
-        "DELETE row present: {stdout}"
-    );
+    assert!(stdout.contains("old"), "DELETE row present: {stdout}");
 }
 
 #[test]

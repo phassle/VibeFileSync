@@ -2,7 +2,6 @@
 //! before SafetyNet archives any old destination object and Publish renames the
 //! verified temp into place (ADR-0001 and ADR-0008).
 
-use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -14,11 +13,12 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
+use crate::event::{MetadataWarning, VerificationTier};
 use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
-use crate::plan::{self, Action, StructuralConflict};
+use crate::plan::{self, Action};
 
-const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
+const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 18) | (1 << 19);
 const F_FULLFSYNC: libc::c_int = 51;
 const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -216,7 +216,7 @@ impl RunReporter {
         operation: Operation,
         action: &Action,
         safety_net: Option<&Path>,
-        warnings: &[String],
+        warnings: &[MetadataWarning],
         full_verify: bool,
     ) -> Result<(), AppError> {
         match self {
@@ -229,16 +229,22 @@ impl RunReporter {
                 action,
                 safety_net,
                 warnings,
-                matches!(operation, Operation::Copy | Operation::Update)
-                    .then_some(if full_verify { "full" } else { "standard" }),
+                matches!(operation, Operation::Copy | Operation::Update).then_some(
+                    if full_verify {
+                        VerificationTier::Full
+                    } else {
+                        VerificationTier::Standard
+                    },
+                ),
                 true,
             )),
             Self::Human => {
                 for warning in warnings {
                     eprintln!(
-                        "vibesync: {} {} warning: {warning}",
+                        "vibesync: {} {} warning: {}",
                         operation.as_str().to_ascii_uppercase(),
-                        action.rel_path.display()
+                        action.rel_path.display(),
+                        warning.detail()
                     );
                 }
                 Ok(())
@@ -330,6 +336,17 @@ pub(crate) fn run_reviewed(
         ));
     }
     execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, false)
+}
+
+pub(crate) fn present_default_preflight(
+    pair: &crate::config::Pair,
+    reviewed_plan: &plan::Plan,
+) -> Result<(), AppError> {
+    let reporter = RunReporter::Human;
+    let warnings = crate::preconditions::check_run(pair, reviewed_plan, false, false)?;
+    reporter.precondition_warnings(&warnings);
+    reporter.expected_degradations(&crate::volume::expected_degradations(&pair.destination));
+    Ok(())
 }
 
 fn configured_pair(config_path: &Path, pair_name: &str) -> Result<crate::config::Pair, AppError> {
@@ -491,21 +508,7 @@ fn execute_reviewed_plan(
     }
     retain_reviewed_actions(&mut plan, &initial_plan);
     plan::drop_orphan_structural_deletions(&mut plan);
-    for action in plan
-        .deletes
-        .iter()
-        .filter(|deletion| delete_precedes_copy(deletion, &plan.copies))
-    {
-        execute_delete_action(
-            &pair,
-            action,
-            &mut journal,
-            permanent_delete,
-            replaces_empty_directory(action),
-            &reporter,
-            &mut stats,
-        )?;
-    }
+    let mut completed_structural_deletes = std::collections::BTreeSet::new();
     for (operation, action) in plan
         .copies
         .iter()
@@ -518,8 +521,26 @@ fn execute_reviewed_plan(
     {
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
-        let temp = temporary_path(&destination, journal.run_id());
-        let reviewed_empty_directories = reviewed_empty_directories(action, &plan.deletes);
+        let structural_delete = plan.deletes.iter().find(|deletion| {
+            deletion.structural_conflict.is_some()
+                && !completed_structural_deletes.contains(&deletion.rel_path)
+                && deletion.structural_conflict.is_some_and(|conflict| {
+                    conflict.has_dependent_copy(&deletion.rel_path, &action.rel_path)
+                })
+        });
+        let temp_target = structural_delete
+            .filter(|_| !destination.parent().is_some_and(Path::is_dir))
+            .map(|deletion| pair.destination.join(&deletion.rel_path));
+        let temp = temporary_path(
+            temp_target.as_deref().unwrap_or(&destination),
+            journal.run_id(),
+        );
+        if let Some(deletion) = structural_delete {
+            journal
+                .action_start(Operation::Delete, deletion, None, None)
+                .map_err(journal_runtime_error)?;
+            reporter.action_start(journal.run_id(), Operation::Delete, deletion)?;
+        }
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
@@ -538,29 +559,62 @@ fn execute_reviewed_plan(
             }
             Ok(())
         };
-        match copy_file(
-            &pair.destination,
-            &source,
-            &destination,
-            &temp,
-            action,
-            CopyOptions {
-                run_id: journal.run_id(),
-                permanent_delete,
-                full_verify,
-                report_progress: reporter.is_json(),
-                reviewed_empty_directories: &reviewed_empty_directories,
-            },
-            &mut progress,
-        ) {
+        let options = CopyOptions {
+            run_id: journal.run_id(),
+            permanent_delete,
+            full_verify,
+            report_progress: reporter.is_json(),
+            structural_delete,
+        };
+        let result = if plan.directory_copies.contains(&action.rel_path) {
+            create_directory(&pair.destination, &source, &destination, action, options)
+        } else {
+            copy_file(
+                &pair.destination,
+                &source,
+                &destination,
+                &temp,
+                action,
+                options,
+                &mut progress,
+            )
+        };
+        match result {
             Ok(outcome) => {
+                if let Some(deletion) = structural_delete {
+                    journal
+                        .action_done(
+                            Operation::Delete,
+                            deletion,
+                            outcome.structural_safety_net.as_deref(),
+                            &[],
+                            None,
+                        )
+                        .map_err(journal_runtime_error)?;
+                    stats.counts.done += 1;
+                    stats.counts.deleted += 1;
+                    stats.bytes += deletion.bytes;
+                    reporter.action_done(
+                        journal.run_id(),
+                        Operation::Delete,
+                        deletion,
+                        outcome.structural_safety_net.as_deref(),
+                        &[],
+                        false,
+                    )?;
+                    completed_structural_deletes.insert(deletion.rel_path.clone());
+                }
                 journal
                     .action_done(
                         operation,
                         action,
                         outcome.safety_net.as_deref(),
                         &outcome.warnings,
-                        Some(if full_verify { "full" } else { "standard" }),
+                        Some(if full_verify {
+                            VerificationTier::Full
+                        } else {
+                            VerificationTier::Standard
+                        }),
                     )
                     .map_err(journal_runtime_error)?;
                 #[cfg(all(feature = "fault-injection", debug_assertions))]
@@ -619,7 +673,7 @@ fn execute_reviewed_plan(
             action,
             &mut journal,
             permanent_delete,
-            replaces_empty_directory(action),
+            plan.directory_deletes.contains(&action.rel_path),
             &reporter,
             &mut stats,
         )?;
@@ -648,6 +702,12 @@ fn retain_reviewed_actions(fresh: &mut plan::Plan, reviewed: &plan::Plan) {
     fresh
         .deletes
         .retain(|action| reviewed.deletes.contains(action));
+    fresh
+        .directory_copies
+        .retain(|path| reviewed.directory_copies.contains(path));
+    fresh
+        .directory_deletes
+        .retain(|path| reviewed.directory_deletes.contains(path));
 }
 
 fn delete_precedes_copy(deletion: &Action, copies: &[Action]) -> bool {
@@ -655,10 +715,6 @@ fn delete_precedes_copy(deletion: &Action, copies: &[Action]) -> bool {
         copy.rel_path.starts_with(&deletion.rel_path)
             || deletion.rel_path.starts_with(&copy.rel_path)
     })
-}
-
-fn replaces_empty_directory(deletion: &Action) -> bool {
-    deletion.structural_conflict == Some(StructuralConflict::DestinationEmptyDirectory)
 }
 
 fn execute_delete_action(
@@ -777,29 +833,17 @@ fn copy_file(
         permanent_delete,
         full_verify,
         report_progress,
-        reviewed_empty_directories,
+        structural_delete,
     } = options;
-    let planned_source_mtime = action
-        .source_mtime
-        .unwrap_or(fs::metadata(source)?.modified()?);
+    let planned_source_mtime = match action.source_mtime {
+        Some(mtime) => mtime,
+        None => fs::symlink_metadata(source)?.modified()?,
+    };
     let parent = destination
         .parent()
         .expect("relative COPY path always has a parent");
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(temp.parent().expect("temp has a parent"))?;
     let result: Result<ActionOutcome, ActionFailure> = (|| {
-        if fs::symlink_metadata(source)?.file_type().is_file()
-            && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir())
-            && !remove_reviewed_empty_directories(
-                destination_root,
-                destination,
-                reviewed_empty_directories,
-            )?
-        {
-            return Err(ActionFailure::from(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination path is a non-empty or unreviewed directory",
-            )));
-        }
         #[cfg(all(feature = "fault-injection", debug_assertions))]
         File::create(temp)?;
         let context = || FaultContext {
@@ -810,7 +854,11 @@ fn copy_file(
             safety_net: None,
         };
         fault_at(FaultTransition::TempCreated, context())?;
-        if report_progress
+        if fs::symlink_metadata(source)?.file_type().is_symlink() {
+            #[cfg(all(feature = "fault-injection", debug_assertions))]
+            fs::remove_file(temp)?;
+            std::os::unix::fs::symlink(fs::read_link(source)?, temp)?;
+        } else if report_progress
             && action.bytes >= PROGRESS_THRESHOLD
             && fs::symlink_metadata(source)?.is_file()
         {
@@ -827,7 +875,11 @@ fn copy_file(
                 libc::ENOSPC,
             )));
         }
-        fully_sync(temp)?;
+        if fs::symlink_metadata(temp)?.file_type().is_symlink() {
+            sync_directory(temp.parent().expect("temp has a parent"))?;
+        } else {
+            fully_sync(temp)?;
+        }
         // Narrow issue-22 process-seam injection. ADR-0009's generic
         // EXEC_AT transition harness is owned by the later harness slice.
         #[cfg(all(feature = "fault-injection", debug_assertions))]
@@ -852,15 +904,35 @@ fn copy_file(
         revalidate_source(source, planned_source_mtime, action.bytes)?;
         fault_at(FaultTransition::SourceRevalidated, context())?;
         let warnings = verification.warnings;
-        let safety_net = remove_file(
-            destination_root,
-            destination,
-            &action.rel_path,
-            run_id,
-            permanent_delete,
-            false,
-        )?;
-        if let Some(archive) = safety_net.as_deref() {
+        let (safety_net, structural_safety_net) = if let Some(deletion) = structural_delete {
+            let blocker = destination_root.join(&deletion.rel_path);
+            (
+                None,
+                remove_file(
+                    destination_root,
+                    &blocker,
+                    &deletion.rel_path,
+                    run_id,
+                    permanent_delete,
+                    deletion.structural_conflict
+                        == Some(plan::StructuralConflict::DestinationDirectory),
+                )?,
+            )
+        } else {
+            (
+                remove_file(
+                    destination_root,
+                    destination,
+                    &action.rel_path,
+                    run_id,
+                    permanent_delete,
+                    false,
+                )?,
+                None,
+            )
+        };
+        fs::create_dir_all(parent)?;
+        if let Some(archive) = safety_net.as_deref().or(structural_safety_net.as_deref()) {
             fault_at(
                 FaultTransition::Archived,
                 FaultContext {
@@ -874,6 +946,7 @@ fn copy_file(
         fault_at(FaultTransition::PublishComplete, context())?;
         Ok(ActionOutcome {
             safety_net,
+            structural_safety_net,
             warnings,
         })
     })();
@@ -889,7 +962,7 @@ struct CopyOptions<'a> {
     permanent_delete: bool,
     full_verify: bool,
     report_progress: bool,
-    reviewed_empty_directories: &'a BTreeSet<PathBuf>,
+    structural_delete: Option<&'a Action>,
 }
 
 #[derive(Clone, Copy)]
@@ -982,7 +1055,42 @@ fn fault_at(_: FaultTransition, _: FaultContext<'_>) -> io::Result<()> {
 
 struct ActionOutcome {
     safety_net: Option<PathBuf>,
-    warnings: Vec<String>,
+    structural_safety_net: Option<PathBuf>,
+    warnings: Vec<MetadataWarning>,
+}
+
+fn create_directory(
+    destination_root: &Path,
+    source: &Path,
+    destination: &Path,
+    _action: &Action,
+    options: CopyOptions<'_>,
+) -> Result<ActionOutcome, ActionFailure> {
+    if !fs::symlink_metadata(source)?.file_type().is_dir() {
+        return Err(ActionFailure::new(
+            FailureReason::SourceChanged,
+            io::Error::new(io::ErrorKind::InvalidData, "source directory changed"),
+        ));
+    }
+    let structural_safety_net = if let Some(deletion) = options.structural_delete {
+        remove_file(
+            destination_root,
+            &destination_root.join(&deletion.rel_path),
+            &deletion.rel_path,
+            options.run_id,
+            options.permanent_delete,
+            deletion.structural_conflict == Some(plan::StructuralConflict::DestinationDirectory),
+        )?
+    } else {
+        None
+    };
+    fs::create_dir_all(destination)?;
+    sync_directory(destination.parent().expect("directory has a parent"))?;
+    Ok(ActionOutcome {
+        safety_net: None,
+        structural_safety_net,
+        warnings: Vec::new(),
+    })
 }
 
 /// Removes a final destination object only after the copy gate has passed,
@@ -1012,6 +1120,7 @@ fn remove_file(
         }
         Ok(metadata)
             if metadata.file_type().is_dir()
+                && !allow_empty_directory
                 && fs::read_dir(destination)?.next().transpose()?.is_some() =>
         {
             Err(io::Error::new(
@@ -1020,7 +1129,11 @@ fn remove_file(
             ))
         }
         Ok(metadata) if metadata.file_type().is_dir() && permanent_delete => {
-            fs::remove_dir(destination).map(|()| None)
+            if allow_empty_directory {
+                fs::remove_dir_all(destination).map(|()| None)
+            } else {
+                fs::remove_dir(destination).map(|()| None)
+            }
         }
         Ok(_) if permanent_delete => fs::remove_file(destination).map(|()| None),
         Ok(_) => archive_by_rename(destination_root, destination, relative_path, run_id).map(Some),
@@ -1035,52 +1148,6 @@ fn reviewed_path(plan: &plan::Plan, path: &Path) -> bool {
         .chain(&plan.updates)
         .chain(&plan.deletes)
         .any(|action| action.rel_path == path)
-}
-
-/// Removes only directory nodes implied by reviewed child DELETE actions.
-/// Any unreviewed entry, including invisible sync machinery, preserves the
-/// obstruction and makes the conflicting COPY fail without recursive loss.
-fn remove_reviewed_empty_directories(
-    destination_root: &Path,
-    directory: &Path,
-    reviewed: &BTreeSet<PathBuf>,
-) -> io::Result<bool> {
-    let relative = directory
-        .strip_prefix(destination_root)
-        .expect("destination directory is under destination root");
-    if !reviewed.contains(relative) {
-        return Ok(false);
-    }
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
-        if fs::symlink_metadata(&path)?.file_type().is_dir() {
-            if !remove_reviewed_empty_directories(destination_root, &path, reviewed)? {
-                return Ok(false);
-            }
-        } else {
-            return Ok(false);
-        }
-    }
-    fs::remove_dir(directory)?;
-    Ok(true)
-}
-
-fn reviewed_empty_directories(copy: &Action, deletions: &[Action]) -> BTreeSet<PathBuf> {
-    let mut directories = BTreeSet::new();
-    for deletion in deletions
-        .iter()
-        .filter(|deletion| deletion.rel_path.starts_with(&copy.rel_path))
-    {
-        let mut parent = deletion.rel_path.parent();
-        while let Some(directory) = parent {
-            if directory.as_os_str().is_empty() || !directory.starts_with(&copy.rel_path) {
-                break;
-            }
-            directories.insert(directory.to_path_buf());
-            parent = directory.parent();
-        }
-    }
-    directories
 }
 
 /// Makes the old version visible in SafetyNet with its relative path kept
@@ -1317,7 +1384,7 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 /// a warning after Publish so a deterministic metadata quirk never prevents
 /// the verified file contents from landing (ADR-0008).
 struct TempVerification {
-    warnings: Vec<String>,
+    warnings: Vec<MetadataWarning>,
     size_mismatch: bool,
     content_mismatch: bool,
 }
@@ -1346,10 +1413,16 @@ fn verify_temp(
     planned_size: u64,
     full_verify: bool,
 ) -> io::Result<TempVerification> {
-    let copied = fs::metadata(temp)?;
-    let size_mismatch = copied.len() != planned_size;
-    let content_mismatch = full_verify && !files_equal(source, temp)?;
-    let source_after = fs::metadata(source)?;
+    let source_after = fs::symlink_metadata(source)?;
+    let copied = fs::symlink_metadata(temp)?;
+    let source_is_symlink = source_after.file_type().is_symlink();
+    let size_mismatch =
+        copied.len() != planned_size || copied.file_type().is_symlink() != source_is_symlink;
+    let content_mismatch = if source_is_symlink {
+        fs::read_link(source)? != fs::read_link(temp)?
+    } else {
+        full_verify && !files_equal(source, temp)?
+    };
     let source_mtime = source_after.modified()?;
     let temp_mtime = copied.modified()?;
     let mut warnings = Vec::new();
@@ -1358,15 +1431,20 @@ fn verify_temp(
             .duration_since(source_mtime)
             .expect("opposite order works")
     });
-    let timestamp_granularity = crate::volume::timestamp_granularity(temp)?;
+    let filesystem_path = if source_is_symlink {
+        temp.parent().expect("temp has a parent")
+    } else {
+        temp
+    };
+    let timestamp_granularity = crate::volume::timestamp_granularity(filesystem_path)?;
     if delta > timestamp_granularity {
-        warnings.push("modified time differs".to_string());
+        warnings.push(MetadataWarning::mismatch("modified time differs"));
     }
     // macOS preserves extended attributes on exFAT through AppleDouble
     // sidecars. Compare the file-facing name set on every filesystem; the
     // scanner keeps the backing `._*` machinery out of sync content.
-    if xattr_names(source)? != xattr_names(temp)? {
-        warnings.push("xattr names differ".to_string());
+    if !source_is_symlink && xattr_names(source)? != xattr_names(temp)? {
+        warnings.push(MetadataWarning::mismatch("xattr names differ"));
     }
     Ok(TempVerification {
         warnings,
@@ -1380,7 +1458,7 @@ fn revalidate_source(
     planned_source_mtime: std::time::SystemTime,
     planned_size: u64,
 ) -> Result<(), ActionFailure> {
-    let source_final = fs::metadata(source)?;
+    let source_final = fs::symlink_metadata(source)?;
     if source_final.len() != planned_size || source_final.modified()? != planned_source_mtime {
         return Err(ActionFailure::new(
             FailureReason::SourceChanged,
@@ -1457,6 +1535,7 @@ fn lock_error(error: io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::StructuralConflict;
 
     #[test]
     fn temp_suffixes_are_sibling_dot_files() {
@@ -1536,14 +1615,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_directory_replacement_is_identified_by_reviewed_actions_not_reason_text() {
+    fn directory_replacement_is_identified_by_reviewed_actions_not_reason_text() {
         let deletion = Action {
             rel_path: PathBuf::from("report.txt"),
             bytes: 0,
             source_mtime: None,
             old_bytes: Some(0),
             reason: "presentation text may change".to_string(),
-            structural_conflict: Some(StructuralConflict::DestinationEmptyDirectory),
+            structural_conflict: Some(StructuralConflict::DestinationDirectory),
         };
         let copy = Action {
             rel_path: PathBuf::from("report.txt"),
@@ -1554,8 +1633,11 @@ mod tests {
             structural_conflict: None,
         };
 
-        assert!(replaces_empty_directory(&deletion));
-        assert!(!replaces_empty_directory(&copy));
+        assert_eq!(
+            deletion.structural_conflict,
+            Some(StructuralConflict::DestinationDirectory)
+        );
+        assert!(copy.structural_conflict.is_none());
         let mut plan = plan::Plan {
             copies: vec![copy],
             deletes: vec![deletion],
@@ -1625,7 +1707,7 @@ mod tests {
                 permanent_delete: false,
                 full_verify: false,
                 report_progress: false,
-                reviewed_empty_directories: &BTreeSet::new(),
+                structural_delete: None,
             },
             &mut |_| Ok(()),
         );
@@ -1670,7 +1752,7 @@ mod tests {
                 permanent_delete: false,
                 full_verify: false,
                 report_progress: false,
-                reviewed_empty_directories: &BTreeSet::new(),
+                structural_delete: None,
             },
             &mut |_| Ok(()),
         );

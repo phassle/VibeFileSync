@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::failure::FailureReason;
@@ -14,6 +15,38 @@ use crate::plan::{Action, Plan};
 pub struct Context<'a> {
     pub schema: &'a str,
     pub run_id: &'a str,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationTier {
+    Standard,
+    Full,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataWarningCode {
+    MetadataMismatch,
+}
+
+#[derive(Serialize)]
+pub struct MetadataWarning {
+    code: MetadataWarningCode,
+    detail: String,
+}
+
+impl MetadataWarning {
+    pub fn mismatch(detail: impl Into<String>) -> Self {
+        Self {
+            code: MetadataWarningCode::MetadataMismatch,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 pub fn run_start(
@@ -80,14 +113,10 @@ pub fn action_done(
     operation: Operation,
     action: &Action,
     safety_net: Option<&Path>,
-    warnings: &[String],
-    verified: Option<&str>,
+    warnings: &[MetadataWarning],
+    verified: Option<VerificationTier>,
     explicit_absence: bool,
 ) -> Value {
-    let warnings: Vec<_> = warnings
-        .iter()
-        .map(|detail| json!({"code":"metadata_mismatch","detail":detail}))
-        .collect();
     let mut row = json!({
         "schema": context.schema, "type": "action_done", "run_id": context.run_id,
         "op": operation, "path": path_text(&action.rel_path), "result": "done",
@@ -100,7 +129,7 @@ pub fn action_done(
         row["safety_net"] = safety_net.map_or(Value::Null, |path| json!(path_text(path)));
     }
     if explicit_absence || !warnings.is_empty() {
-        row["warnings"] = warnings.into();
+        row["warnings"] = json!(warnings);
     }
     row
 }
@@ -160,8 +189,8 @@ mod tests {
             Operation::Copy,
             &action(),
             None,
-            &["modified time differs".to_string()],
-            Some("standard"),
+            &[MetadataWarning::mismatch("modified time differs")],
+            Some(VerificationTier::Standard),
             true,
         );
 

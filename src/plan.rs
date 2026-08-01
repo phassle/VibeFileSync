@@ -42,13 +42,13 @@ pub struct Entry {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StructuralConflict {
     DestinationFile,
-    DestinationEmptyDirectory,
+    DestinationDirectory,
 }
 
 impl StructuralConflict {
     pub(crate) fn has_dependent_copy(self, deletion: &Path, copy: &Path) -> bool {
         match self {
-            Self::DestinationEmptyDirectory => copy == deletion,
+            Self::DestinationDirectory => copy == deletion,
             Self::DestinationFile => copy.starts_with(deletion),
         }
     }
@@ -114,6 +114,8 @@ pub struct Plan {
     /// Sibling dot-temps left by an interrupted run. They are never sync
     /// content, but read commands report them and a real run cleans them.
     pub strays: Vec<PathBuf>,
+    pub directory_copies: BTreeSet<PathBuf>,
+    pub directory_deletes: BTreeSet<PathBuf>,
 }
 
 /// Is `name` sync machinery the scanner must never treat as content?
@@ -151,6 +153,30 @@ fn scan(root: &Path, skip_apple_double: bool) -> io::Result<BTreeMap<PathBuf, En
         Ok(())
     })?;
     Ok(entries)
+}
+
+fn scan_directories(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
+    let mut directories = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries.into_iter().rev() {
+            if is_machinery(&entry.file_name()) {
+                continue;
+            }
+            let path = entry.path();
+            if fs::symlink_metadata(&path)?.file_type().is_dir() {
+                directories.insert(
+                    path.strip_prefix(root)
+                        .expect("read_dir path is under root")
+                        .to_path_buf(),
+                );
+                stack.push(path);
+            }
+        }
+    }
+    Ok(directories)
 }
 
 fn walk(
@@ -575,7 +601,7 @@ pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
                         source_mtime: None,
                         old_bytes: Some(0),
                         reason: "replaced by source file".into(),
-                        structural_conflict: Some(StructuralConflict::DestinationEmptyDirectory),
+                        structural_conflict: Some(StructuralConflict::DestinationDirectory),
                     };
                     crate::ndjson::stdout(&plan_action_row(
                         &plan_id,
@@ -601,7 +627,63 @@ pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
         crate::ndjson::stdout(&row).map_err(io::Error::other)
     })
     .map_err(|e| scan_error(&header_pair.source, e))?;
+    let source_directories = scan_directories(&header_pair.source)
+        .map_err(|error| scan_error(&header_pair.source, error))?;
+    let destination_directories = if header_pair.destination.is_dir() {
+        scan_directories(&header_pair.destination)
+            .map_err(|error| scan_error(&header_pair.destination, error))?
+    } else {
+        BTreeSet::new()
+    };
+    for path in source_directories.difference(&destination_directories) {
+        let source_directory = header_pair.source.join(path);
+        if fs::read_dir(&source_directory)
+            .map_err(|error| scan_error(&source_directory, error))?
+            .next()
+            .transpose()
+            .map_err(|error| scan_error(&source_directory, error))?
+            .is_some()
+        {
+            continue;
+        }
+        let action = Action {
+            rel_path: path.clone(),
+            bytes: 0,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "new directory".into(),
+            structural_conflict: None,
+        };
+        emit(plan_action_row(&plan_id, PlanOperation::Copy, &action))?;
+        stats.copies += 1;
+        stats.scanned += 1;
+    }
     if header_pair.destination.is_dir() {
+        if header_pair.mode == Mode::Mirror {
+            for path in destination_directories.difference(&source_directories) {
+                let destination_directory = header_pair.destination.join(path);
+                if fs::read_dir(&destination_directory)
+                    .map_err(|error| scan_error(&destination_directory, error))?
+                    .next()
+                    .transpose()
+                    .map_err(|error| scan_error(&destination_directory, error))?
+                    .is_some()
+                {
+                    continue;
+                }
+                let action = Action {
+                    rel_path: path.clone(),
+                    bytes: 0,
+                    source_mtime: None,
+                    old_bytes: Some(0),
+                    reason: "directory not in source".into(),
+                    structural_conflict: None,
+                };
+                emit(plan_action_row(&plan_id, PlanOperation::Delete, &action))?;
+                stats.deletes += 1;
+                stats.scanned += 1;
+            }
+        }
         walk(
             &header_pair.destination,
             setup.skip_apple_double,
@@ -825,12 +907,28 @@ pub(crate) fn build(
     } else {
         BTreeMap::new()
     };
+    let source_directories =
+        scan_directories(&pair.source).map_err(|error| scan_error(&pair.source, error))?;
+    let destination_directories = if pair.destination.is_dir() {
+        scan_directories(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?
+    } else {
+        BTreeSet::new()
+    };
     let mut plan = compute(
         &source,
         &destination,
         pair.mode,
         setup.supports_symlinks,
         setup.mtime_tolerance,
+        excludes,
+    );
+    add_directory_actions(
+        &mut plan,
+        &source,
+        &source_directories,
+        &destination_directories,
+        &pair.destination,
+        pair.mode,
         excludes,
     );
     add_structural_replacements(
@@ -846,6 +944,84 @@ pub(crate) fn build(
         stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
     apply_stray_excludes(&mut plan, excludes);
     Ok((pair, plan))
+}
+
+fn add_directory_actions(
+    plan: &mut Plan,
+    source_entries: &BTreeMap<PathBuf, Entry>,
+    source: &BTreeSet<PathBuf>,
+    destination: &BTreeSet<PathBuf>,
+    destination_root: &Path,
+    mode: Mode,
+    excludes: &[String],
+) {
+    for path in source.difference(destination) {
+        if source_entries.keys().any(|entry| entry.starts_with(path))
+            || source
+                .iter()
+                .any(|directory| directory != path && directory.starts_with(path))
+        {
+            continue;
+        }
+        if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+            plan.excluded += 1;
+            continue;
+        }
+        plan.copies.push(Action {
+            rel_path: path.clone(),
+            bytes: 0,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "new directory".into(),
+            structural_conflict: None,
+        });
+        plan.directory_copies.insert(path.clone());
+    }
+    if mode == Mode::Mirror {
+        for path in destination.difference(source) {
+            if destination
+                .difference(source)
+                .any(|ancestor| ancestor != path && path.starts_with(ancestor))
+                || contains_machinery(&destination_root.join(path))
+            {
+                continue;
+            }
+            if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+                plan.excluded += 1;
+                continue;
+            }
+            plan.deletes
+                .retain(|action| !action.rel_path.starts_with(path));
+            plan.deletes.push(Action {
+                rel_path: path.clone(),
+                bytes: 0,
+                source_mtime: None,
+                old_bytes: Some(0),
+                reason: "directory not in source".into(),
+                structural_conflict: None,
+            });
+            plan.directory_deletes.insert(path.clone());
+        }
+    }
+    plan.copies
+        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    plan.deletes
+        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+}
+
+fn contains_machinery(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if is_machinery(&entry.file_name()) {
+            return true;
+        }
+        if entry.path().is_dir() && contains_machinery(&entry.path()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn add_structural_replacements(
@@ -865,6 +1041,10 @@ fn add_structural_replacements(
         if source
             .keys()
             .any(|source_path| source_path != path && source_path.starts_with(path))
+            || plan
+                .directory_copies
+                .iter()
+                .any(|source_path| source_path.starts_with(path))
         {
             if mode == Mode::Mirror {
                 if let Some(existing) = plan
@@ -889,20 +1069,38 @@ fn add_structural_replacements(
         }
     }
 
-    // Directories are not ordinary plan entries. An exactly empty directory
-    // at a source-file path is nevertheless a safe, explicit replacement:
-    // review its archive row before the COPY in both Sync modes.
+    // A reviewed destination directory at a source-file path is archived as
+    // one object after the dependent file passes its gate. An excluded
+    // descendant keeps the directory outside the structural replacement.
     for copy in &plan.copies {
-        if is_empty_directory(&destination_root.join(&copy.rel_path))? {
+        if plan.directory_copies.contains(&copy.rel_path)
+            || !fs::symlink_metadata(destination_root.join(&copy.rel_path))
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+            || excludes
+                .iter()
+                .any(|excluded| Path::new(excluded).starts_with(&copy.rel_path))
+            || contains_machinery(&destination_root.join(&copy.rel_path))
+        {
+            continue;
+        }
+        if let Some(existing) = plan
+            .deletes
+            .iter_mut()
+            .find(|action| action.rel_path == copy.rel_path)
+        {
+            existing.reason = "replaced by source file".into();
+            existing.structural_conflict = Some(StructuralConflict::DestinationDirectory);
+        } else {
             structural.push(Action {
                 rel_path: copy.rel_path.clone(),
                 bytes: 0,
                 source_mtime: None,
                 old_bytes: Some(0),
                 reason: "replaced by source file".into(),
-                structural_conflict: Some(StructuralConflict::DestinationEmptyDirectory),
+                structural_conflict: Some(StructuralConflict::DestinationDirectory),
             });
         }
+        plan.directory_deletes.insert(copy.rel_path.clone());
     }
 
     for action in structural {
