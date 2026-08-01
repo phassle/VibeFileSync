@@ -43,6 +43,7 @@ pub struct Entry {
 pub struct Action {
     pub rel_path: PathBuf,
     pub bytes: u64,
+    pub source_mtime: Option<SystemTime>,
     pub old_bytes: Option<u64>,
     pub reason: String,
 }
@@ -218,6 +219,7 @@ pub fn compute(
             plan.deletes.push(Action {
                 rel_path: rel.clone(),
                 bytes: dst.size,
+                source_mtime: None,
                 old_bytes: Some(dst.size),
                 reason: "not in source".to_string(),
             });
@@ -263,6 +265,7 @@ fn classify_source_entry(
             Action {
                 rel_path: rel.to_path_buf(),
                 bytes: source.size,
+                source_mtime: Some(source.mtime),
                 old_bytes: None,
                 reason: "new".to_string(),
             },
@@ -273,6 +276,7 @@ fn classify_source_entry(
                 Action {
                     rel_path: rel.to_path_buf(),
                     bytes: source.size,
+                    source_mtime: Some(source.mtime),
                     old_bytes: Some(old.size),
                     reason: reason.to_string(),
                 },
@@ -511,6 +515,7 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
             let action = Action {
                 rel_path: path.to_path_buf(),
                 bytes: entry.size,
+                source_mtime: None,
                 old_bytes: Some(entry.size),
                 reason: "not in source".into(),
             };

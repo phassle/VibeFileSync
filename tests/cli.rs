@@ -696,6 +696,259 @@ fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows
     assert!(!interrupted_rows.iter().any(|row| row["type"] == "summary"));
 }
 
+// --- Slice 10: Verification and Expected degradations (issue #24) ---
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn full_verification_rejects_corrupt_temp_without_publishing_and_continues() {
+    let fx = Fixture::new();
+    fx.write_source("corrupt.bin", "ABCD");
+    fx.write_source("later.txt", "still copied");
+    fx.write_dest("corrupt.bin", "old destination");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:if [ \"$VIBESYNC_TEST_RELATIVE_PATH\" = corrupt.bin ]; then printf WXYZ > \"$VIBESYNC_TEST_TEMP\"; fi",
+        )
+        .args(["run", "photos", "--json", "--yes", "--verify"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed = rows
+        .iter()
+        .find(|row| row["type"] == "action_failed" && row["path"] == "corrupt.bin")
+        .unwrap();
+    assert_eq!(failed["reason"], "verify_mismatch");
+    assert!(rows.iter().any(|row| {
+        row["type"] == "action_done" && row["path"] == "later.txt" && row["verified"] == "full"
+    }));
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("corrupt.bin")).unwrap(),
+        "old destination"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("later.txt")).unwrap(),
+        "still copied"
+    );
+    assert!(!fx.destination.path().join("_SafetyNet").exists());
+    assert!(!fs::read_dir(fx.destination.path())
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".vibesync-tmp-")));
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn standard_verification_reports_standard_and_does_not_read_back_file_data() {
+    let fx = Fixture::new();
+    fx.write_source("photo.bin", "ABCD");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:printf WXYZ > \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let done = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "photo.bin")
+        .unwrap();
+    assert_eq!(done["verified"], "standard");
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("photo.bin")).unwrap(),
+        "WXYZ"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn source_changed_keeps_old_destination_and_next_run_converges() {
+    let fx = Fixture::new();
+    fx.write_source("report.txt", "planned source");
+    fx.write_dest("report.txt", "old destination");
+    fx.add_photos_pair();
+
+    let first = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:printf 'new source after copy' > \"$VIBESYNC_TEST_SOURCE\"",
+        )
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(first.status.code(), Some(EXIT_PARTIAL));
+    let rows: Vec<serde_json::Value> = String::from_utf8(first.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(rows.iter().any(|row| {
+        row["type"] == "action_failed"
+            && row["path"] == "report.txt"
+            && row["reason"] == "source_changed"
+    }));
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("report.txt")).unwrap(),
+        "old destination"
+    );
+    assert!(!fx.destination.path().join("_SafetyNet").exists());
+
+    let second = fx
+        .cmd()
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("report.txt")).unwrap(),
+        "new source after copy"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn metadata_mismatch_publishes_structured_warning_and_exits_zero() {
+    let fx = Fixture::new();
+    fx.write_source("metadata.txt", "verified data");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:touch -t 197001010000 \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let done = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "metadata.txt")
+        .unwrap();
+    assert_eq!(done["warnings"][0]["code"], "metadata_mismatch");
+    assert!(done["warnings"][0]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("modified time"));
+    assert_eq!(rows.last().unwrap()["warnings"], 1);
+    assert_eq!(rows.last().unwrap()["result"], "success");
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("metadata.txt")).unwrap(),
+        "verified data"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn expected_degradations_are_once_per_exfat_run_and_absent_on_apfs() {
+    let human = Fixture::new();
+    human.write_source("one.txt", "one");
+    human.write_source("two.txt", "two");
+    human.add_photos_pair();
+    let output = human
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.matches("expected destination degradations:").count(),
+        1,
+        "Expected degradations must be one preflight fact, not per-file noise: {stderr}"
+    );
+    for code in [
+        "posix_permissions",
+        "acls",
+        "bsd_flags",
+        "timestamp_granularity",
+    ] {
+        assert!(stderr.contains(code), "missing {code}: {stderr}");
+    }
+    assert!(!stderr.contains("COPY one.txt warning"));
+    assert!(!stderr.contains("COPY two.txt warning"));
+
+    let exfat_json = Fixture::new();
+    exfat_json.write_source("file.txt", "data");
+    exfat_json.add_photos_pair();
+    let exfat_output = exfat_json
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+    let exfat_rows: Vec<serde_json::Value> = String::from_utf8(exfat_output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        exfat_rows[0]["degradations"],
+        serde_json::json!([
+            "posix_permissions",
+            "acls",
+            "bsd_flags",
+            "timestamp_granularity"
+        ])
+    );
+    assert!(exfat_rows
+        .iter()
+        .filter(|row| row["type"] == "action_done")
+        .all(|row| row.get("warnings").is_none()));
+
+    let apfs_json = Fixture::new();
+    apfs_json.write_source("file.txt", "data");
+    apfs_json.add_photos_pair();
+    let apfs_output = apfs_json
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "apfs")
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+    let apfs_start: serde_json::Value = serde_json::from_str(
+        String::from_utf8(apfs_output.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(apfs_start["degradations"], serde_json::json!([]));
+}
+
 #[test]
 fn no_mode_flag_exists_on_run_or_plan() {
     // ADR-0006: sync mode is per-pair config only, never a per-run flag.

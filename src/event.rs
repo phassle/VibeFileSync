@@ -128,6 +128,7 @@ mod tests {
         Action {
             rel_path: PathBuf::from("photo.jpg"),
             bytes: 42,
+            source_mtime: None,
             old_bytes: None,
             reason: "new".to_string(),
         }

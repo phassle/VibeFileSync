@@ -10,6 +10,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
@@ -105,6 +107,15 @@ impl RunReporter {
             for warning in warnings {
                 eprintln!("{warning}");
             }
+        }
+    }
+
+    fn expected_degradations(&self, degradations: &[&str]) {
+        if matches!(self, Self::Human) && !degradations.is_empty() {
+            eprintln!(
+                "vibesync: expected destination degradations: {}",
+                degradations.join(", ")
+            );
         }
     }
 
@@ -317,6 +328,8 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
         ignore_space_check,
     )?;
     reporter.precondition_warnings(&run_warnings);
+    let degradations = crate::volume::expected_degradations(&pair.destination);
+    reporter.expected_degradations(&degradations);
 
     if !yes && !reporter.confirm()? {
         reporter.cancelled();
@@ -324,7 +337,6 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
     }
 
     let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
-    let degradations = crate::volume::expected_degradations(&pair.destination);
     journal
         .run_start(pair_name, &initial_plan, &run_warnings, &degradations)
         .map_err(io_error)?;
@@ -355,6 +367,7 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
             bytes: fs::metadata(pair.destination.join(stray))
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
+            source_mtime: None,
             old_bytes: None,
             reason: "abandoned temp".to_string(),
         };
@@ -610,7 +623,9 @@ fn copy_file(
         full_verify,
         report_progress,
     } = options;
-    let source_before = fs::metadata(source)?;
+    let planned_source_mtime = action
+        .source_mtime
+        .unwrap_or(fs::metadata(source)?.modified()?);
     let parent = destination
         .parent()
         .expect("relative COPY path always has a parent");
@@ -625,6 +640,7 @@ fn copy_file(
             copyfile_all_but_acls(source, temp)?;
         }
         crash_at("copy_complete");
+        exec_at("copy_complete", &action.rel_path, source, temp)?;
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
             .is_some_and(|path| Path::new(&path) == action.rel_path)
@@ -647,7 +663,13 @@ fn copy_file(
                 return Err(io::Error::last_os_error());
             }
         }
-        let warnings = verify(source, &source_before, temp, action.bytes, full_verify)?;
+        let warnings = verify(
+            source,
+            planned_source_mtime,
+            temp,
+            action.bytes,
+            full_verify,
+        )?;
         let safety_net = remove_file(
             destination_root,
             destination,
@@ -685,6 +707,43 @@ fn crash_at(transition: &str) {
 
 #[cfg(not(feature = "fault-injection"))]
 fn crash_at(_: &str) {}
+
+#[cfg(feature = "fault-injection")]
+fn exec_at(transition: &str, relative_path: &Path, source: &Path, temp: &Path) -> io::Result<()> {
+    let Some(specification) = std::env::var_os("VIBESYNC_TEST_EXEC_AT") else {
+        return Ok(());
+    };
+    let specification = specification.to_string_lossy();
+    let Some((requested, command)) = specification.split_once(':') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VIBESYNC_TEST_EXEC_AT must be <transition>:<command>",
+        ));
+    };
+    if requested != transition {
+        return Ok(());
+    }
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .env("VIBESYNC_TEST_TRANSITION", transition)
+        .env("VIBESYNC_TEST_RELATIVE_PATH", relative_path)
+        .env("VIBESYNC_TEST_SOURCE", source)
+        .env("VIBESYNC_TEST_TEMP", temp)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "fault-injection command exited with {status}"
+        )))
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn exec_at(_: &str, _: &Path, _: &Path, _: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 struct ActionOutcome {
     safety_net: Option<PathBuf>,
@@ -949,33 +1008,15 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 /// the verified file contents from landing (ADR-0008).
 fn verify(
     source: &Path,
-    source_before: &fs::Metadata,
+    planned_source_mtime: std::time::SystemTime,
     temp: &Path,
     planned_size: u64,
     full_verify: bool,
 ) -> io::Result<Vec<String>> {
-    let source_after = fs::metadata(source)?;
-    if source_after.len() != source_before.len()
-        || source_after.modified()? != source_before.modified()?
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "source changed during copy",
-        ));
-    }
     let copied = fs::metadata(temp)?;
-    if copied.len() != planned_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "verify mismatch: size differs",
-        ));
-    }
-    if full_verify && !files_equal(source, temp)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "verify mismatch: content differs",
-        ));
-    }
+    let size_mismatch = copied.len() != planned_size;
+    let content_mismatch = full_verify && !files_equal(source, temp)?;
+    let source_after = fs::metadata(source)?;
     let source_mtime = source_after.modified()?;
     let temp_mtime = copied.modified()?;
     let mut warnings = Vec::new();
@@ -996,31 +1037,50 @@ fn verify(
     // exFAT does not preserve POSIX extended attributes. They are an
     // expected degradation, so they are outside this standard-tier spot
     // check; capable filesystems must preserve the complete name set.
-    let expected_xattrs = if destination_type.eq_ignore_ascii_case("exfat") {
-        Vec::new()
-    } else {
-        xattr_names(source)?
-    };
-    if expected_xattrs != xattr_names(temp)? {
+    if !destination_type.eq_ignore_ascii_case("exfat") && xattr_names(source)? != xattr_names(temp)?
+    {
         warnings.push("xattr names differ".to_string());
+    }
+    // Re-stat after every temp check and optional full read-back. This is the
+    // last gate step before archive/Publish, so a moving source cannot make a
+    // copy of stale or mixed content look committed. Source movement wins
+    // over a consequential temp mismatch so agents receive the causal code.
+    let source_final = fs::metadata(source)?;
+    if source_final.len() != planned_size || source_final.modified()? != planned_source_mtime {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source changed during copy",
+        ));
+    }
+    if size_mismatch {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verify mismatch: size differs",
+        ));
+    }
+    if content_mismatch {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verify mismatch: content differs",
+        ));
     }
     Ok(warnings)
 }
 
 fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
-    let mut left = File::open(left)?;
-    let mut right = File::open(right)?;
-    let mut a = [0_u8; 64 * 1024];
-    let mut b = [0_u8; 64 * 1024];
+    Ok(file_hash(left)? == file_hash(right)?)
+}
+
+fn file_hash(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let an = left.read(&mut a)?;
-        let bn = right.read(&mut b)?;
-        if an != bn || a[..an] != b[..bn] {
-            return Ok(false);
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finalize().into());
         }
-        if an == 0 {
-            return Ok(true);
-        }
+        hasher.update(&buffer[..read]);
     }
 }
 
@@ -1091,6 +1151,7 @@ mod tests {
             copies: vec![Action {
                 rel_path: PathBuf::from("reviewed.txt"),
                 bytes: 1,
+                source_mtime: None,
                 old_bytes: None,
                 reason: "new".to_string(),
             }],
@@ -1102,6 +1163,7 @@ mod tests {
                 Action {
                     rel_path: PathBuf::from("arrived-later.txt"),
                     bytes: 2,
+                    source_mtime: None,
                     old_bytes: None,
                     reason: "new".to_string(),
                 },
@@ -1120,6 +1182,7 @@ mod tests {
             copies: vec![Action {
                 rel_path: PathBuf::from("photo.txt"),
                 bytes: 1,
+                source_mtime: Some(std::time::SystemTime::UNIX_EPOCH),
                 old_bytes: None,
                 reason: "new".to_string(),
             }],
@@ -1128,7 +1191,10 @@ mod tests {
         let fresh = plan::Plan {
             copies: vec![Action {
                 rel_path: PathBuf::from("photo.txt"),
-                bytes: 2,
+                bytes: 1,
+                source_mtime: Some(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+                ),
                 old_bytes: None,
                 reason: "new".to_string(),
             }],
@@ -1152,6 +1218,7 @@ mod tests {
         let action = Action {
             rel_path: PathBuf::from("photo.jpg"),
             bytes: 1, // independent planned expectation forces gate failure
+            source_mtime: None,
             old_bytes: None,
             reason: "new".to_string(),
         };
@@ -1194,6 +1261,7 @@ mod tests {
         let action = Action {
             rel_path: PathBuf::from("report.txt"),
             bytes: 1,
+            source_mtime: None,
             old_bytes: Some(11),
             reason: "size differs".to_string(),
         };
