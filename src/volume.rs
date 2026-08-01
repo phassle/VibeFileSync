@@ -95,7 +95,7 @@ pub fn volume_uuid(path: &Path) -> io::Result<String> {
 pub fn filesystem_type(path: &Path) -> io::Result<String> {
     // Deterministic issue-22 blocked-plan process seam; ADR-0009's generic
     // filesystem acceptance harness is implemented by its downstream slice.
-    #[cfg(feature = "fault-injection")]
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
     if let Ok(kind) = std::env::var("VIBESYNC_TEST_FILESYSTEM_TYPE") {
         return Ok(kind);
     }

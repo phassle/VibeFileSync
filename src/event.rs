@@ -7,7 +7,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::journal::{Operation, RunStats};
-use crate::plan::Action;
+use crate::plan::{Action, Plan};
 
 #[derive(Clone, Copy)]
 pub struct Context<'a> {
@@ -25,6 +25,46 @@ pub fn run_start(
         "schema": context.schema, "type": "run_start", "run_id": context.run_id,
         "pair": pair, "warnings": warnings, "degradations": degradations,
     })
+}
+
+pub fn planned_actions(plan: &Plan) -> Vec<Value> {
+    let planned = |operation: Operation, action: &Action| {
+        json!({
+            "op": operation,
+            "path": path_text(&action.rel_path),
+            "bytes": action.bytes,
+        })
+    };
+    let mut actions = Vec::new();
+    actions.extend(
+        plan.copies
+            .iter()
+            .map(|action| planned(Operation::Copy, action)),
+    );
+    actions.extend(
+        plan.updates
+            .iter()
+            .map(|action| planned(Operation::Update, action)),
+    );
+    actions.extend(
+        plan.deletes
+            .iter()
+            .map(|action| planned(Operation::Delete, action)),
+    );
+    actions.extend(plan.strays.iter().map(|stray| {
+        planned(
+            Operation::Cleanup,
+            &Action {
+                rel_path: stray.clone(),
+                bytes: 0,
+                source_mtime: None,
+                old_bytes: None,
+                reason: "abandoned temp".to_string(),
+                structural_conflict: None,
+            },
+        )
+    }));
+    actions
 }
 
 pub fn action_start(context: Context<'_>, operation: Operation, action: &Action) -> Value {
@@ -64,23 +104,6 @@ pub fn action_done(
     row
 }
 
-/// Retained `journal/v1` predates the public structured-warning shape. Keep
-/// its warning array as plain detail strings under the unchanged schema.
-pub fn journal_action_done(
-    context: Context<'_>,
-    operation: Operation,
-    action: &Action,
-    safety_net: Option<&Path>,
-    warnings: &[String],
-    verified: Option<&str>,
-) -> Value {
-    let mut row = action_done(
-        context, operation, action, safety_net, warnings, verified, true,
-    );
-    row["warnings"] = json!(warnings);
-    row
-}
-
 pub fn action_failed(
     context: Context<'_>,
     operation: Operation,
@@ -92,19 +115,6 @@ pub fn action_failed(
         "op": operation, "path": path_text(&action.rel_path), "result": "failed",
         "bytes": action.bytes, "reason": crate::failure::normalize(reason), "warnings": [],
     })
-}
-
-/// `journal/v1` keeps forensic error text verbatim; only the public run
-/// stream maps it to stable agent-facing reason codes.
-pub fn journal_action_failed(
-    context: Context<'_>,
-    operation: Operation,
-    action: &Action,
-    reason: &str,
-) -> Value {
-    let mut row = action_failed(context, operation, action, reason);
-    row["reason"] = reason.into();
-    row
 }
 
 pub fn summary(context: Context<'_>, stats: &RunStats) -> Value {
@@ -131,6 +141,7 @@ mod tests {
             source_mtime: None,
             old_bytes: None,
             reason: "new".to_string(),
+            structural_conflict: None,
         }
     }
 
@@ -142,28 +153,39 @@ mod tests {
     }
 
     #[test]
-    fn journal_done_preserves_plain_warning_strings() {
-        let row = journal_action_done(
+    fn journal_done_uses_structured_warning_vocabulary() {
+        let row = action_done(
             journal_context(),
             Operation::Copy,
             &action(),
             None,
             &["modified time differs".to_string()],
             Some("standard"),
+            true,
         );
 
-        assert_eq!(row["warnings"], json!(["modified time differs"]));
+        assert_eq!(
+            row["warnings"],
+            json!([{"code":"metadata_mismatch","detail":"modified time differs"}])
+        );
     }
 
     #[test]
-    fn journal_failure_preserves_raw_reason_text() {
-        let row = journal_action_failed(
+    fn journal_failure_uses_normalized_reason_codes() {
+        let mismatch = action_failed(
             journal_context(),
             Operation::Copy,
             &action(),
             "verify mismatch: size differs",
         );
+        let source_changed = action_failed(
+            journal_context(),
+            Operation::Copy,
+            &action(),
+            "source changed during copy",
+        );
 
-        assert_eq!(row["reason"], "verify mismatch: size differs");
+        assert_eq!(mismatch["reason"], "verify_mismatch");
+        assert_eq!(source_changed["reason"], "source_changed");
     }
 }

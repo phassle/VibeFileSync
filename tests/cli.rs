@@ -241,6 +241,20 @@ impl Fixture {
             .join("Library/Application Support/VibeFileSync/runs")
             .join(pair)
     }
+
+    #[cfg(feature = "fault-injection")]
+    fn only_journal_events(&self, pair: &str) -> Vec<serde_json::Value> {
+        let journal = fs::read_dir(self.journal_dir(pair))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("ndjson"))
+            .expect("one retained Journal exists");
+        fs::read_to_string(journal)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
 }
 
 #[test]
@@ -503,6 +517,7 @@ fn plan_json_stream_has_versioned_rows_in_contract_order_and_pure_stdout() {
     fx.write_source("changed.txt", "new value");
     fx.write_dest("changed.txt", "old");
     fx.write_dest("removed.txt", "gone");
+    fx.write_dest(".abandoned.vibesync-tmp-old-run", "stale");
     fx.add_photos_pair();
 
     let output = fx
@@ -532,6 +547,11 @@ fn plan_json_stream_has_versioned_rows_in_contract_order_and_pure_stdout() {
     assert_eq!(rows[0]["pair"], "photos");
     assert_eq!(rows[0]["mode"], "mirror");
     assert_eq!(rows[0]["dry_run"], true);
+    let plan_id = rows[0]["plan_id"]
+        .as_str()
+        .expect("Dry-run keeps its established plan identity");
+    assert!(rows.iter().all(|row| row["plan_id"] == plan_id));
+    assert!(rows.iter().all(|row| row.get("run_id").is_none()));
     let update = rows.iter().find(|row| row["op"] == "update").unwrap();
     assert_eq!(update["path"], "changed.txt");
     assert_eq!(update["bytes"], 9);
@@ -541,13 +561,121 @@ fn plan_json_stream_has_versioned_rows_in_contract_order_and_pure_stdout() {
         .unwrap()
         .contains("_SafetyNet/"));
     let delete = rows.iter().find(|row| row["op"] == "delete").unwrap();
+    assert_eq!(delete["bytes"], 4);
     assert_eq!(delete["old_bytes"], 4);
-    assert!(delete.get("bytes").is_none());
-    assert_eq!(rows.last().unwrap()["counts"]["copy"], 1);
+    let cleanup = rows.iter().find(|row| row["op"] == "cleanup").unwrap();
+    assert_eq!(cleanup["bytes"], 5);
+    assert_eq!(cleanup["reason"], "abandoned temp");
+    let summary = rows.last().unwrap();
+    assert_eq!(summary["counts"]["copy"], 1);
+    assert_eq!(summary["counts"]["cleanup"], 1);
+    for field in [
+        "copy",
+        "update",
+        "delete",
+        "error",
+        "cleanup",
+        "scanned",
+        "unchanged",
+        "excluded",
+    ] {
+        assert!(
+            summary["counts"][field].is_number(),
+            "missing count {field}"
+        );
+    }
+    assert!(summary.get("scanned").is_none());
+    assert!(summary.get("strays").is_none());
+}
+
+#[test]
+fn relocated_json_plan_reports_notice_on_stderr_and_keeps_stdout_ndjson_only() {
+    let fx = Fixture::new();
+    let source = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    fs::write(source.path().join("photo.txt"), "photo").unwrap();
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            source.path().to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+    let path = config_file(fx.xdg.path());
+    let original = source.path().display().to_string();
+    let stale = "/Volumes/VibeFileSync-Stale/Photos";
+    let config = fs::read_to_string(&path).unwrap().replace(
+        &format!("source = \"{original}\""),
+        &format!("source = \"{stale}\""),
+    );
+    fs::write(path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("source volume moved"), "{stderr}");
+    assert!(stderr.contains(stale), "{stderr}");
+    assert!(stderr.contains(&original), "{stderr}");
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
 }
 
 #[test]
 fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
+    let orphaned_replacement = Fixture::new();
+    orphaned_replacement.write_source("docs/new.txt", "new");
+    orphaned_replacement.write_dest("docs", "old file");
+    orphaned_replacement.add_pair("photos", "update");
+    let output = orphaned_replacement
+        .cmd()
+        .args(["run", "photos", "--yes", "--exclude", "docs/new.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(orphaned_replacement.destination.path().join("docs")).unwrap(),
+        "old file"
+    );
+    assert!(!orphaned_replacement
+        .destination
+        .path()
+        .join("_SafetyNet")
+        .exists());
+
+    let orphaned_empty_directory = Fixture::new();
+    orphaned_empty_directory.write_source("node", "new file");
+    fs::create_dir(orphaned_empty_directory.destination.path().join("node")).unwrap();
+    orphaned_empty_directory.add_pair("photos", "update");
+    let output = orphaned_empty_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--exclude", "node"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    assert!(orphaned_empty_directory
+        .destination
+        .path()
+        .join("node")
+        .is_dir());
+    assert!(!orphaned_empty_directory
+        .destination
+        .path()
+        .join("_SafetyNet")
+        .exists());
+
     let source_directory = Fixture::new();
     source_directory.write_source("docs/new.txt", "new");
     source_directory.write_dest("docs", "old file");
@@ -568,16 +696,6 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
     assert!(rows
         .iter()
         .any(|row| row["op"] == "copy" && row["path"] == "docs/new.txt"));
-    let excluded = source_directory
-        .cmd()
-        .args(["plan", "photos", "--json", "--exclude", "docs"])
-        .output()
-        .unwrap();
-    assert!(!String::from_utf8(excluded.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .any(|row| row["op"] == "delete" && row["path"] == "docs"));
     let output = source_directory
         .cmd()
         .args(["run", "photos", "--yes", "--json"])
@@ -604,17 +722,69 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
         "new file"
     );
 
-    let empty_directory = Fixture::new();
-    empty_directory.write_source("empty", "new file");
-    fs::create_dir(empty_directory.destination.path().join("empty")).unwrap();
-    empty_directory.add_photos_pair();
-    let output = empty_directory
+    let update_directory = Fixture::new();
+    update_directory.write_source("docs/new.txt", "new");
+    update_directory.write_dest("docs", "old file");
+    update_directory.add_pair("photos", "update");
+    let output = update_directory
         .cmd()
         .args(["run", "photos", "--yes", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
-    assert!(empty_directory.destination.path().join("empty").is_dir());
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(update_directory.destination.path().join("docs/new.txt")).unwrap(),
+        "new"
+    );
+    assert!(
+        fs::read_dir(update_directory.destination.path().join("_SafetyNet"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("docs"))
+            .any(|path| fs::read_to_string(path).is_ok_and(|contents| contents == "old file"))
+    );
+
+    for mode in ["mirror", "update"] {
+        let empty_directory = Fixture::new();
+        empty_directory.write_source("empty", "new file");
+        fs::create_dir(empty_directory.destination.path().join("empty")).unwrap();
+        empty_directory.add_pair("photos", mode);
+
+        let plan = empty_directory
+            .cmd()
+            .args(["plan", "photos", "--json"])
+            .output()
+            .unwrap();
+        let rows: Vec<serde_json::Value> = String::from_utf8(plan.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(rows.iter().any(|row| {
+            row["op"] == "delete"
+                && row["path"] == "empty"
+                && row["reason"] == "replaced by source file"
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| row["op"] == "copy" && row["path"] == "empty"));
+
+        let output = empty_directory
+            .cmd()
+            .args(["run", "photos", "--yes", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(EXIT_OK), "{mode}: {output:?}");
+        assert_eq!(
+            fs::read_to_string(empty_directory.destination.path().join("empty")).unwrap(),
+            "new file"
+        );
+        let archived = fs::read_dir(empty_directory.destination.path().join("_SafetyNet"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("empty"))
+            .find(|path| path.is_dir())
+            .expect("the reviewed empty directory is retained in SafetyNet");
+        assert!(archived.is_dir());
+    }
 
     let unreviewed_directory = Fixture::new();
     unreviewed_directory.write_source("node", "new file");
@@ -707,7 +877,14 @@ fn run_json_stream_reports_execution_order_verification_and_safetynet() {
         assert_eq!(events.last().unwrap()["type"], "action_done");
         assert_eq!(events.last().unwrap()["result"], "done");
         assert_eq!(events.last().unwrap()["verified"], "full");
+        assert!(events.last().unwrap()["warnings"].is_array());
     }
+    let created = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "created.txt")
+        .unwrap();
+    assert!(created["safety_net"].is_null());
+    assert_eq!(created["warnings"], serde_json::json!([]));
     let updated = rows
         .iter()
         .find(|row| row["type"] == "action_done" && row["path"] == "updated.txt")
@@ -807,7 +984,7 @@ fn run_json_progress_is_live_during_a_large_file_copy() {
 fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
     let fx = Fixture::new();
     fx.write_source("blocked.txt", "contents");
-    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    fs::create_dir_all(fx.destination.path().join("blocked.txt/_SafetyNet")).unwrap();
     fx.add_photos_pair();
     assert_eq!(
         fx.cmd()
@@ -866,7 +1043,7 @@ fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
 fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows() {
     let failed = Fixture::new();
     failed.write_source("blocked.txt", "contents");
-    fs::create_dir(failed.destination.path().join("blocked.txt")).unwrap();
+    fs::create_dir_all(failed.destination.path().join("blocked.txt/_SafetyNet")).unwrap();
     failed.add_photos_pair();
     let failed_output = failed
         .cmd()
@@ -909,6 +1086,13 @@ fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows
     assert_eq!(done["verified"], "standard");
     assert_eq!(done["warnings"][0]["code"], "metadata_mismatch");
     assert_eq!(warning_rows.last().unwrap()["warnings"], 1);
+    let journal_done = warning
+        .only_journal_events("photos")
+        .into_iter()
+        .find(|row| row["type"] == "action_done")
+        .unwrap();
+    assert_eq!(journal_done["warnings"][0]["code"], "metadata_mismatch");
+    assert!(journal_done["warnings"][0]["detail"].is_string());
 
     let deletion = Fixture::new();
     deletion.write_dest("gone.txt", "gone");
@@ -932,12 +1116,15 @@ fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows
     assert_eq!(deleted["op"], "delete");
     assert_eq!(deleted["result"], "done");
     assert!(deleted["safety_net"].as_str().is_some());
-    assert!(deleted.get("verified").is_none());
+    assert!(deleted["verified"].is_null());
+    assert_eq!(deleted["warnings"], serde_json::json!([]));
     let cleanup = deletion_rows
         .iter()
         .find(|row| row["type"] == "action_done" && row["op"] == "cleanup")
         .expect("cleanup emits action_done");
-    assert!(cleanup.get("verified").is_none());
+    assert!(cleanup["verified"].is_null());
+    assert!(cleanup["safety_net"].is_null());
+    assert_eq!(cleanup["warnings"], serde_json::json!([]));
 
     let interrupted = Fixture::new();
     interrupted.write_source("crash.txt", "contents");
@@ -994,6 +1181,11 @@ fn full_verification_rejects_corrupt_temp_without_publishing_and_continues() {
         .find(|row| row["type"] == "action_failed" && row["path"] == "corrupt.bin")
         .unwrap();
     assert_eq!(failed["reason"], "verify_mismatch");
+    assert!(fx.only_journal_events("photos").iter().any(|row| {
+        row["type"] == "action_failed"
+            && row["path"] == "corrupt.bin"
+            && row["reason"] == "verify_mismatch"
+    }));
     assert!(rows.iter().any(|row| {
         row["type"] == "action_done" && row["path"] == "later.txt" && row["verified"] == "full"
     }));
@@ -1074,6 +1266,11 @@ fn source_changed_keeps_old_destination_and_next_run_converges() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(rows.iter().any(|row| {
+        row["type"] == "action_failed"
+            && row["path"] == "report.txt"
+            && row["reason"] == "source_changed"
+    }));
+    assert!(fx.only_journal_events("photos").iter().any(|row| {
         row["type"] == "action_failed"
             && row["path"] == "report.txt"
             && row["reason"] == "source_changed"
@@ -1261,6 +1458,51 @@ fn fault_injection_environment_is_absent_without_the_feature() {
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn release_binary_with_fault_feature_contains_no_environment_hooks() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let status = ProcessCommand::new("cargo")
+        .current_dir(manifest)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--features",
+            "fault-injection",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| manifest.join("target"));
+    let binary = fs::read(target.join("release/vibesync")).unwrap();
+
+    for hook in [
+        "VIBESYNC_TEST_CRASH_AT",
+        "VIBESYNC_TEST_EXEC_AT",
+        "VIBESYNC_TEST_FILESYSTEM_TYPE",
+        "VIBESYNC_TEST_AVAILABLE_BYTES",
+        "VIBESYNC_TEST_ENOSPC_PATH",
+        "VIBESYNC_TEST_WARNING_PATH",
+        "VIBESYNC_TEST_COPY_CHUNK_DELAY_MS",
+        "VIBESYNC_TEST_TRANSITION",
+        "VIBESYNC_TEST_RELATIVE_PATH",
+        "VIBESYNC_TEST_SOURCE",
+        "VIBESYNC_TEST_TEMP",
+        "VIBESYNC_TEST_DESTINATION",
+        "VIBESYNC_TEST_SAFETY_NET",
+    ] {
+        assert!(
+            !binary
+                .windows(hook.len())
+                .any(|bytes| bytes == hook.as_bytes()),
+            "release binary exposes {hook}"
+        );
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn expected_degradations_are_once_per_exfat_run_and_absent_on_apfs() {
     let human = Fixture::new();
     human.write_source("one.txt", "one");
@@ -1316,7 +1558,7 @@ fn expected_degradations_are_once_per_exfat_run_and_absent_on_apfs() {
     assert!(exfat_rows
         .iter()
         .filter(|row| row["type"] == "action_done")
-        .all(|row| row.get("warnings").is_none()));
+        .all(|row| row["warnings"] == serde_json::json!([])));
 
     let apfs_json = Fixture::new();
     apfs_json.write_source("file.txt", "data");
@@ -1760,30 +2002,20 @@ fn plan_never_shows_or_deletes_machinery() {
 }
 
 #[test]
-fn plan_excludes_an_exact_path() {
+fn plan_does_not_expose_a_public_exclude_flag() {
     let fx = Fixture::new();
     fx.write_source("keep.txt", "aaaa");
     fx.write_source("skip.txt", "aaaa");
     fx.add_photos_pair();
 
-    let stdout = String::from_utf8(
-        fx.cmd()
-            .args(["plan", "photos", "--exclude", "skip.txt"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let output = fx
+        .cmd()
+        .args(["plan", "photos", "--exclude", "skip.txt"])
+        .output()
+        .unwrap();
 
-    assert!(stdout.contains("keep.txt"));
-    assert!(
-        !stdout.contains("skip.txt"),
-        "excluded path must not appear: {stdout}"
-    );
-    assert!(
-        stdout.contains("excluded 1"),
-        "excluded count reported: {stdout}"
-    );
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--exclude'"));
 }
 
 #[test]
@@ -1855,8 +2087,9 @@ fn exclusions_only_match_unfiltered_action_and_error_rows() {
     let output = fx
         .cmd()
         .args([
-            "plan",
+            "run",
             "photos",
+            "--yes",
             "--exclude",
             "unchanged.txt",
             "--exclude",
@@ -2053,9 +2286,9 @@ fn a_failed_copy_stops_remaining_mutations() {
     let fx = Fixture::new();
     fx.write_source("blocked.txt", "would be partial if published");
     fx.write_source("good.txt", "this copy should still finish");
-    // Directories are not plan entries, so this models a destination object
-    // appearing after the fresh scan; Slice 3 must refuse to replace it.
-    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    // Invisible machinery makes this directory non-empty without creating a
+    // reviewed DELETE row. The run must preserve it and stop before later work.
+    fs::create_dir_all(fx.destination.path().join("blocked.txt/_SafetyNet")).unwrap();
     fx.write_dest("would-be-deleted.txt", "keep me");
     fx.add_photos_pair();
 
@@ -2687,9 +2920,14 @@ fn plan_and_status_report_stray_temps_without_destination_writes() {
         rows.iter()
             .map(|row| row["type"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["plan_start", "action", "summary"]
+        ["plan_start", "action", "action", "summary"]
     );
-    assert_eq!(rows.last().unwrap()["strays"], 1);
+    assert_eq!(rows.last().unwrap()["counts"]["cleanup"], 1);
+    assert!(rows.iter().any(|row| {
+        row["type"] == "action"
+            && row["op"] == "cleanup"
+            && row["path"] == ".photo.txt.vibesync-tmp-20260731T120000Z"
+    }));
     assert_eq!(
         Fixture::snapshot(fx.destination.path()),
         before,
@@ -2821,4 +3059,48 @@ fn rerun_cleans_strays_journals_cleanup_and_scans_fresh() {
         String::from_utf8_lossy(&status.stdout).contains("Actions: 2 done · 0 failed · 2 planned"),
         "status must retain the journal's cleanup action in its counts"
     );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn post_cleanup_new_plan_error_is_partial_and_never_executes_unreviewed_scope() {
+    let fx = Fixture::new();
+    fx.write_source("drift.txt", "reviewed file");
+    fx.write_dest(".abandoned.vibesync-tmp-old-run", "stale temp");
+    fx.add_photos_pair();
+    let command = format!(
+        "rm '{}'; ln -s target '{}'",
+        fx.source.path().join("drift.txt").display(),
+        fx.source.path().join("drift.txt").display()
+    );
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            format!("cleanup_complete:{command}"),
+        )
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL), "{output:?}");
+    assert!(!fx
+        .destination
+        .path()
+        .join(".abandoned.vibesync-tmp-old-run")
+        .exists());
+    assert!(!fx.destination.path().join("drift.txt").exists());
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(rows.iter().any(|row| {
+        row["type"] == "action_failed"
+            && row["path"] == "drift.txt"
+            && row["reason"] == "changed during reconciliation; rerun required"
+    }));
+    assert_eq!(rows.last().unwrap()["result"], "partial");
 }

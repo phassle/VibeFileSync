@@ -45,9 +45,6 @@ enum Command {
         /// Stream the plan as NDJSON (schema `vibefilesync.plan/v1`).
         #[arg(long)]
         json: bool,
-        /// Exclude an exact plan path (repeatable); glob-free per ADR-0004.
-        #[arg(long, value_name = "PATH")]
-        exclude: Vec<String>,
     },
     /// Execute a run for a Folder pair.
     Run {
@@ -160,15 +157,11 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
     config::load(config_path)?;
 
     match command {
-        Command::Plan {
-            pair,
-            json,
-            exclude,
-        } => {
+        Command::Plan { pair, json } => {
             if *json {
-                return plan::run_json(config_path, pair, exclude);
+                return plan::run_json(config_path, pair);
             }
-            plan::run(config_path, pair, exclude)
+            plan::run(config_path, pair)
         }
         Command::Run {
             pair,

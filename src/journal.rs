@@ -85,34 +85,7 @@ impl Journal {
         run_warnings: &[String],
         degradations: &[&str],
     ) -> io::Result<()> {
-        let mut actions = Vec::new();
-        actions.extend(
-            plan.copies
-                .iter()
-                .map(|action| planned(Operation::Copy, action)),
-        );
-        actions.extend(
-            plan.updates
-                .iter()
-                .map(|action| planned(Operation::Update, action)),
-        );
-        actions.extend(
-            plan.deletes
-                .iter()
-                .map(|action| planned(Operation::Delete, action)),
-        );
-        actions.extend(plan.strays.iter().map(|stray| {
-            planned(
-                Operation::Cleanup,
-                &Action {
-                    rel_path: stray.clone(),
-                    bytes: 0,
-                    source_mtime: None,
-                    old_bytes: None,
-                    reason: "abandoned temp".to_string(),
-                },
-            )
-        }));
+        let actions = crate::event::planned_actions(plan);
         let mut event = crate::event::run_start(
             crate::event::Context {
                 schema: SCHEMA,
@@ -160,7 +133,7 @@ impl Journal {
         verified: Option<&str>,
     ) -> io::Result<()> {
         self.append(
-            crate::event::journal_action_done(
+            crate::event::action_done(
                 crate::event::Context {
                     schema: SCHEMA,
                     run_id: &self.run_id,
@@ -170,6 +143,7 @@ impl Journal {
                 safety_net,
                 warnings,
                 verified,
+                true,
             ),
             false,
         )
@@ -182,7 +156,7 @@ impl Journal {
         reason: &str,
     ) -> io::Result<()> {
         self.append(
-            crate::event::journal_action_failed(
+            crate::event::action_failed(
                 crate::event::Context {
                     schema: SCHEMA,
                     run_id: &self.run_id,
@@ -220,29 +194,6 @@ impl Journal {
     #[cfg(all(feature = "fault-injection", debug_assertions))]
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
-    }
-}
-
-pub fn available_run_id(pair_name: &str, destination_root: &Path) -> io::Result<String> {
-    let directory = pair_directory(pair_name);
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_secs();
-    let base = utc_basic(seconds);
-    let mut suffix = 1_u32;
-    loop {
-        let run_id = if suffix == 1 {
-            base.clone()
-        } else {
-            format!("{base}-{suffix}")
-        };
-        if !destination_root.join("_SafetyNet").join(&run_id).exists()
-            && !directory.join(format!("{run_id}.ndjson")).exists()
-        {
-            return Ok(run_id);
-        }
-        suffix = next_suffix(suffix)?;
     }
 }
 
@@ -585,14 +536,6 @@ fn local_time(run_id: &str) -> String {
             .to_string_lossy()
             .into_owned()
     }
-}
-
-fn planned(operation: Operation, action: &Action) -> Value {
-    json!({
-        "op": operation,
-        "path": path_text(&action.rel_path),
-        "bytes": action.bytes,
-    })
 }
 
 fn path_text(path: &Path) -> String {

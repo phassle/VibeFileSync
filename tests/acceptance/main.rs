@@ -1261,8 +1261,15 @@ fn assert_plan_hides_machinery(case: &Case, label: &str) -> usize {
     for row in String::from_utf8(plan.stdout).unwrap().lines() {
         let event: Value = serde_json::from_str(row).expect("plan line is NDJSON");
         if event["type"] == "action" {
-            actions += 1;
             let path = event["path"].as_str().unwrap();
+            if event["op"] == "cleanup" {
+                assert!(
+                    path.contains(".vibesync-tmp-"),
+                    "{label}: cleanup row must name only an abandoned temp: {event}"
+                );
+                continue;
+            }
+            actions += 1;
             assert!(
                 !path.contains(".vibesync-tmp-")
                     && !path.starts_with("_SafetyNet/")

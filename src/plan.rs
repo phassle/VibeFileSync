@@ -16,7 +16,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, Mode};
 use crate::error::AppError;
@@ -39,6 +39,21 @@ pub struct Entry {
 /// One planned file operation, carrying what the human diff row shows. The
 /// operation itself (copy/update/delete) is encoded by which [`Plan`] vector
 /// the action lives in, so it isn't repeated as a field here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StructuralConflict {
+    DestinationFile,
+    DestinationEmptyDirectory,
+}
+
+impl StructuralConflict {
+    pub(crate) fn has_dependent_copy(self, deletion: &Path, copy: &Path) -> bool {
+        match self {
+            Self::DestinationEmptyDirectory => copy == deletion,
+            Self::DestinationFile => copy.starts_with(deletion),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub rel_path: PathBuf,
@@ -46,6 +61,7 @@ pub struct Action {
     pub source_mtime: Option<SystemTime>,
     pub old_bytes: Option<u64>,
     pub reason: String,
+    pub structural_conflict: Option<StructuralConflict>,
 }
 
 /// A per-file plan error — surfaced as an ERRORS row rather than crashing
@@ -62,6 +78,7 @@ enum PlanOperation {
     Copy,
     Update,
     Delete,
+    Cleanup,
     Error,
 }
 
@@ -241,6 +258,7 @@ pub fn compute(
                 source_mtime: None,
                 old_bytes: Some(dst.size),
                 reason: "not in source".to_string(),
+                structural_conflict: None,
             });
         }
     }
@@ -262,29 +280,25 @@ pub(crate) fn report_unknown_excludes(plan: &Plan) {
     }
 }
 
-/// Applies an interactive review's exact exclusions to the already-scanned
-/// plan. This preserves the plan identity the user saw; rebuilding here would
-/// allow newly discovered work to masquerade as reviewed work.
-pub(crate) fn apply_review_exclusions(mut plan: Plan, excludes: &[String]) -> Plan {
-    let before = plan.copies.len()
-        + plan.updates.len()
-        + plan.deletes.len()
-        + plan.errors.len()
-        + plan.strays.len();
-    let keep = |path: &Path| !excludes.iter().any(|excluded| Path::new(excluded) == path);
-    plan.copies.retain(|action| keep(&action.rel_path));
-    plan.updates.retain(|action| keep(&action.rel_path));
-    plan.deletes.retain(|action| keep(&action.rel_path));
-    plan.errors.retain(|error| keep(&error.rel_path));
-    plan.strays.retain(|path| keep(path));
-    let after = plan.copies.len()
-        + plan.updates.len()
-        + plan.deletes.len()
-        + plan.errors.len()
-        + plan.strays.len();
-    plan.excluded += before - after;
-    plan.unknown_excludes.clear();
-    plan
+fn structural_dependency_satisfied(deletion: &Action, copies: &[Action]) -> bool {
+    match deletion.structural_conflict {
+        Some(conflict) => copies
+            .iter()
+            .any(|copy| conflict.has_dependent_copy(&deletion.rel_path, &copy.rel_path)),
+        None => true,
+    }
+}
+
+/// A structural delete exists only to unblock a reviewed Publish. If review
+/// filtering or reconciliation removes every dependent COPY, the delete must
+/// disappear too so destination content is never archived on its own.
+pub(crate) fn drop_orphan_structural_deletions(plan: &mut Plan) -> usize {
+    let before = plan.deletes.len();
+    plan.deletes
+        .retain(|deletion| structural_dependency_satisfied(deletion, &plan.copies));
+    let removed = before - plan.deletes.len();
+    plan.excluded += removed;
+    removed
 }
 
 /// Classifies and records one source entry for both buffered human plans and
@@ -313,6 +327,7 @@ fn classify_source_entry(
                 source_mtime: Some(source.mtime),
                 old_bytes: None,
                 reason: "new".to_string(),
+                structural_conflict: None,
             },
         ),
         Some(old) => match change_reason(source, old, mtime_tolerance) {
@@ -324,6 +339,7 @@ fn classify_source_entry(
                     source_mtime: Some(source.mtime),
                     old_bytes: Some(old.size),
                     reason: reason.to_string(),
+                    structural_conflict: None,
                 },
             ),
             None => SourceClassification::Unchanged,
@@ -506,9 +522,8 @@ pub(crate) fn human_size(bytes: u64) -> String {
 /// source would render the whole destination as deletions, exactly the
 /// blast radius we refuse to imply. A missing destination is fine — it just
 /// reads as empty (a first sync), so everything plans as COPY.
-pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
-    let (pair, plan) = build(config_path, pair_name, excludes)?;
-    report_unknown_excludes(&plan);
+pub fn run(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
+    let (pair, plan) = build(config_path, pair_name, &[])?;
     print!("{}", render(&plan, pair_name, pair.mode));
     Ok(crate::error::EXIT_OK)
 }
@@ -516,19 +531,23 @@ pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i
 /// Streams the versioned Dry-run contract as one flushed JSON object per
 /// line. Rows are emitted individually and never assembled into a JSON
 /// document, keeping the public wire format incremental and constant-space.
-pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
+pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
     let setup = prepare(config_path, pair_name)?;
+    for notice in &setup.notices {
+        eprintln!("{notice}");
+    }
     let header_pair = setup.pair;
-    let run_id = crate::journal::available_run_id(pair_name, &header_pair.destination)
-        .map_err(scan_error_for_json)?;
+    let plan_id = plan_id();
     emit(serde_json::json!({
-        "schema": "vibefilesync.plan/v1", "type": "plan_start", "run_id": run_id,
+        "schema": "vibefilesync.plan/v1", "type": "plan_start", "plan_id": plan_id,
         "pair": pair_name, "mode": header_pair.mode, "dry_run": true
     }))?;
     let mut stats = StreamStats::default();
     walk(&header_pair.source, false, |path, entry| {
         stats.scanned += 1;
-        let old = entry_at(&header_pair.destination.join(path))?;
+        let destination_path = header_pair.destination.join(path);
+        let replaces_empty_directory = is_empty_directory(&destination_path)?;
+        let old = entry_at(&destination_path)?;
         let classification = classify_source_entry(
             path,
             entry,
@@ -536,48 +555,81 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
             setup.supports_symlinks,
             setup.mtime_tolerance,
         );
-        let row = match apply_excludes(classification, excludes) {
+        let row = match classification {
             SourceClassification::Action(op, action) => {
+                if replaces_empty_directory {
+                    let replacement = Action {
+                        rel_path: path.to_path_buf(),
+                        bytes: 0,
+                        source_mtime: None,
+                        old_bytes: Some(0),
+                        reason: "replaced by source file".into(),
+                        structural_conflict: Some(StructuralConflict::DestinationEmptyDirectory),
+                    };
+                    crate::ndjson::stdout(&plan_action_row(
+                        &plan_id,
+                        PlanOperation::Delete,
+                        &replacement,
+                    ))
+                    .map_err(io::Error::other)?;
+                    stats.deletes += 1;
+                }
                 stats.increment(op);
-                plan_action_row(&run_id, op, &action)
+                plan_action_row(&plan_id, op, &action)
             }
             SourceClassification::Error(error) => {
                 stats.errors += 1;
-                serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","run_id":run_id,"op":PlanOperation::Error,"path":error.rel_path.to_string_lossy(),"reason":error.message})
-            }
-            SourceClassification::Excluded => {
-                stats.excluded += 1;
-                return Ok(());
+                serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","plan_id":plan_id,"op":PlanOperation::Error,"path":error.rel_path.to_string_lossy(),"reason":error.message})
             }
             SourceClassification::Unchanged => {
                 stats.unchanged += 1;
                 return Ok(());
             }
+            SourceClassification::Excluded => unreachable!("public Plan has no exclusions"),
         };
         crate::ndjson::stdout(&row).map_err(io::Error::other)
     })
     .map_err(|e| scan_error(&header_pair.source, e))?;
-    if header_pair.mode == Mode::Mirror && header_pair.destination.is_dir() {
+    if header_pair.destination.is_dir() {
         walk(
             &header_pair.destination,
             setup.skip_apple_double,
             |path, entry| {
-                if entry_at(&header_pair.source.join(path))?.is_some() {
-                    return Ok(());
-                }
+                let source = fs::symlink_metadata(header_pair.source.join(path));
+                let (reason, structural_conflict) = match source {
+                    Ok(metadata) if metadata.file_type().is_dir() => (
+                        "replaced by source directory",
+                        Some(StructuralConflict::DestinationFile),
+                    ),
+                    Ok(_) => return Ok(()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) && header_pair.mode == Mode::Mirror =>
+                    {
+                        ("not in source", None)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(error),
+                };
                 stats.scanned += 1;
-                if excludes.iter().any(|excluded| Path::new(excluded) == path) {
-                    stats.excluded += 1;
-                    return Ok(());
-                }
                 let action = Action {
                     rel_path: path.to_path_buf(),
                     bytes: entry.size,
                     source_mtime: None,
                     old_bytes: Some(entry.size),
-                    reason: "not in source".into(),
+                    reason: reason.into(),
+                    structural_conflict,
                 };
-                crate::ndjson::stdout(&plan_action_row(&run_id, PlanOperation::Delete, &action))
+                crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Delete, &action))
                     .map_err(io::Error::other)?;
                 stats.deletes += 1;
                 Ok(())
@@ -585,21 +637,29 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         )
         .map_err(|error| scan_error(&header_pair.destination, error))?;
     }
-    let mut stray_count = 0;
     walk_stray_temps(&header_pair.destination, |path| {
-        if excludes.iter().any(|excluded| Path::new(excluded) == path) {
-            stats.excluded += 1;
-        } else {
-            stray_count += 1;
-        }
+        let bytes = fs::symlink_metadata(header_pair.destination.join(path))?.len();
+        let action = Action {
+            rel_path: path.to_path_buf(),
+            bytes,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "abandoned temp".into(),
+            structural_conflict: None,
+        };
+        crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Cleanup, &action))
+            .map_err(io::Error::other)?;
+        stats.cleanup += 1;
         Ok(())
     })
     .map_err(|error| scan_error(&header_pair.destination, error))?;
     emit(serde_json::json!({
-        "schema": "vibefilesync.plan/v1", "type": "summary", "run_id": run_id,
-        "counts": {"copy": stats.copies, "update": stats.updates, "delete": stats.deletes, "error": stats.errors},
-        "scanned": stats.scanned, "unchanged": stats.unchanged, "excluded": stats.excluded,
-        "strays": stray_count
+        "schema": "vibefilesync.plan/v1", "type": "summary", "plan_id": plan_id,
+        "counts": {
+            "copy": stats.copies, "update": stats.updates, "delete": stats.deletes,
+            "error": stats.errors, "cleanup": stats.cleanup, "scanned": stats.scanned,
+            "unchanged": stats.unchanged, "excluded": stats.excluded
+        }
     }))?;
     Ok(crate::error::EXIT_OK)
 }
@@ -624,12 +684,31 @@ fn entry_at(path: &Path) -> io::Result<Option<Entry>> {
     }
 }
 
+fn is_empty_directory(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            Ok(fs::read_dir(path)?.next().transpose()?.is_none())
+        }
+        Ok(_) => Ok(false),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Default)]
 struct StreamStats {
     copies: usize,
     updates: usize,
     deletes: usize,
     errors: usize,
+    cleanup: usize,
     scanned: usize,
     unchanged: usize,
     excluded: usize,
@@ -645,16 +724,13 @@ impl StreamStats {
     }
 }
 
-fn plan_action_row(run_id: &str, op: PlanOperation, action: &Action) -> serde_json::Value {
-    let mut row = serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","run_id":run_id,"op":op,"path":action.rel_path.to_string_lossy(),"reason":action.reason});
-    if op != PlanOperation::Delete {
-        row["bytes"] = action.bytes.into();
-    }
+fn plan_action_row(plan_id: &str, op: PlanOperation, action: &Action) -> serde_json::Value {
+    let mut row = serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","plan_id":plan_id,"op":op,"path":action.rel_path.to_string_lossy(),"reason":action.reason,"bytes":action.bytes});
     if let Some(bytes) = action.old_bytes {
         row["old_bytes"] = bytes.into();
     }
     if matches!(op, PlanOperation::Update | PlanOperation::Delete) {
-        row["safety_net"] = format!("_SafetyNet/{run_id}/{}", action.rel_path.display()).into();
+        row["safety_net"] = format!("_SafetyNet/<run-id>/{}", action.rel_path.display()).into();
     }
     row
 }
@@ -663,8 +739,11 @@ fn emit(value: serde_json::Value) -> Result<(), AppError> {
     crate::ndjson::stdout(&value)
 }
 
-fn scan_error_for_json(error: io::Error) -> AppError {
-    AppError::Precondition(error.to_string())
+fn plan_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch");
+    format!("plan-{}-{:09}", now.as_secs(), now.subsec_nanos())
 }
 
 struct PlanSetup {
@@ -739,10 +818,97 @@ pub(crate) fn build(
         setup.mtime_tolerance,
         excludes,
     );
+    add_structural_replacements(
+        &mut plan,
+        &source,
+        &destination,
+        &pair.destination,
+        pair.mode,
+        excludes,
+    )
+    .map_err(|error| scan_error(&pair.destination, error))?;
     plan.strays =
         stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
     apply_stray_excludes(&mut plan, excludes);
     Ok((pair, plan))
+}
+
+fn add_structural_replacements(
+    plan: &mut Plan,
+    source: &BTreeMap<PathBuf, Entry>,
+    destination: &BTreeMap<PathBuf, Entry>,
+    destination_root: &Path,
+    mode: Mode,
+    excludes: &[String],
+) -> io::Result<()> {
+    let mut structural = Vec::new();
+
+    // A destination file blocks creation of a source directory. Mirror
+    // already classifies it as destination-only, so tag that existing row;
+    // Update needs a new replacement row even though unrelated content stays.
+    for (path, entry) in destination {
+        if source
+            .keys()
+            .any(|source_path| source_path != path && source_path.starts_with(path))
+        {
+            if mode == Mode::Mirror {
+                if let Some(existing) = plan
+                    .deletes
+                    .iter_mut()
+                    .find(|action| action.rel_path == *path)
+                {
+                    existing.reason = "replaced by source directory".into();
+                    existing.structural_conflict = Some(StructuralConflict::DestinationFile);
+                }
+            } else {
+                structural.push(Action {
+                    rel_path: path.clone(),
+                    bytes: entry.size,
+                    source_mtime: None,
+                    old_bytes: Some(entry.size),
+                    reason: "replaced by source directory".into(),
+                    structural_conflict: Some(StructuralConflict::DestinationFile),
+                });
+                plan.scanned += 1;
+            }
+        }
+    }
+
+    // Directories are not ordinary plan entries. An exactly empty directory
+    // at a source-file path is nevertheless a safe, explicit replacement:
+    // review its archive row before the COPY in both Sync modes.
+    for copy in &plan.copies {
+        if is_empty_directory(&destination_root.join(&copy.rel_path))? {
+            structural.push(Action {
+                rel_path: copy.rel_path.clone(),
+                bytes: 0,
+                source_mtime: None,
+                old_bytes: Some(0),
+                reason: "replaced by source file".into(),
+                structural_conflict: Some(StructuralConflict::DestinationEmptyDirectory),
+            });
+        }
+    }
+
+    for action in structural {
+        plan.unknown_excludes
+            .retain(|excluded| Path::new(excluded) != action.rel_path);
+        if excludes
+            .iter()
+            .any(|excluded| Path::new(excluded) == action.rel_path)
+        {
+            plan.excluded += 1;
+        } else if !plan
+            .deletes
+            .iter()
+            .any(|existing| existing.rel_path == action.rel_path)
+        {
+            plan.deletes.push(action);
+        }
+    }
+    plan.deletes
+        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    Ok(())
 }
 
 fn apply_stray_excludes(plan: &mut Plan, excludes: &[String]) {

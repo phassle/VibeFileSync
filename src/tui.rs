@@ -1,6 +1,6 @@
 //! ADR-0003's thin action-list review UI. Planning and execution stay owned
 //! by `plan` and `run`; this module only selects a Folder pair and produces
-//! the exact per-run exclusion list handed to the ordinary Run engine.
+//! the exact reviewed action subset handed to the ordinary Run engine.
 
 use std::fs;
 use std::io::{self, IsTerminal, Stdout};
@@ -34,7 +34,7 @@ struct PairChoice {
     destination: PathBuf,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Copy,
     Update,
@@ -75,6 +75,7 @@ struct ReviewRow {
     path: String,
     bytes: Option<u64>,
     detail: String,
+    structural_conflict: Option<plan::StructuralConflict>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,7 +108,13 @@ struct Totals {
 
 enum ReviewOutcome {
     Cancelled,
-    Execute(Vec<String>),
+    Execute(Vec<ReviewExclusion>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewExclusion {
+    operation: Operation,
+    path: String,
 }
 
 trait Events {
@@ -194,6 +201,7 @@ impl ReviewModel {
                     .ok()
                     .map(|metadata| metadata.len()),
                 detail: "abandoned temp".to_string(),
+                structural_conflict: None,
             }
         }));
         rows.extend(dry_run.errors.iter().map(|error| ReviewRow {
@@ -202,6 +210,7 @@ impl ReviewModel {
             path: error.rel_path.to_string_lossy().into_owned(),
             bytes: None,
             detail: error.message.clone(),
+            structural_conflict: None,
         }));
         Self {
             pair_name: pair_name.to_string(),
@@ -234,16 +243,53 @@ impl ReviewModel {
         totals
     }
 
-    fn exclusions(&self) -> Vec<String> {
+    fn exclusions(&self) -> Vec<ReviewExclusion> {
         self.rows
             .iter()
             .filter(|row| !row.included)
-            .map(|row| row.path.clone())
+            .map(|row| ReviewExclusion {
+                operation: row.operation,
+                path: row.path.clone(),
+            })
             .collect()
     }
 
-    fn into_reviewed_plan(self, excludes: &[String]) -> plan::Plan {
-        plan::apply_review_exclusions(self.dry_run, excludes)
+    fn into_reviewed_plan(self, excludes: &[ReviewExclusion]) -> plan::Plan {
+        let mut reviewed = self.dry_run;
+        let before = reviewed.copies.len()
+            + reviewed.updates.len()
+            + reviewed.deletes.len()
+            + reviewed.errors.len()
+            + reviewed.strays.len();
+        let keep = |operation, path: &Path| {
+            !excludes.iter().any(|excluded| {
+                excluded.operation == operation && Path::new(&excluded.path) == path
+            })
+        };
+        reviewed
+            .copies
+            .retain(|action| keep(Operation::Copy, &action.rel_path));
+        reviewed
+            .updates
+            .retain(|action| keep(Operation::Update, &action.rel_path));
+        reviewed
+            .deletes
+            .retain(|action| keep(Operation::Delete, &action.rel_path));
+        reviewed
+            .errors
+            .retain(|error| keep(Operation::Error, &error.rel_path));
+        reviewed
+            .strays
+            .retain(|path| keep(Operation::Cleanup, path));
+        let after = reviewed.copies.len()
+            + reviewed.updates.len()
+            + reviewed.deletes.len()
+            + reviewed.errors.len()
+            + reviewed.strays.len();
+        reviewed.excluded += before - after;
+        reviewed.unknown_excludes.clear();
+        plan::drop_orphan_structural_deletions(&mut reviewed);
+        reviewed
     }
 
     fn move_up(&mut self) {
@@ -265,6 +311,23 @@ impl ReviewModel {
             row.included = !row.included;
             self.message = None;
         }
+        let included_copies: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|row| row.included && row.operation == Operation::Copy)
+            .map(|row| row.path.clone())
+            .collect();
+        for row in &mut self.rows {
+            let dependency_present = match row.structural_conflict {
+                Some(conflict) => included_copies
+                    .iter()
+                    .any(|copy| conflict.has_dependent_copy(Path::new(&row.path), Path::new(copy))),
+                None => true,
+            };
+            if !dependency_present {
+                row.included = false;
+            }
+        }
     }
 }
 
@@ -276,6 +339,7 @@ impl ReviewRow {
             path: action.rel_path.to_string_lossy().into_owned(),
             bytes: Some(action.bytes),
             detail: action.reason.clone(),
+            structural_conflict: action.structural_conflict,
         }
     }
 }
@@ -312,6 +376,11 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
         println!("Run cancelled; destination unchanged.");
         return Ok(EXIT_OK);
     };
+    let reconciliation_excludes: Vec<String> = excludes
+        .iter()
+        .filter(|excluded| excluded.operation == Operation::Error)
+        .map(|excluded| excluded.path.clone())
+        .collect();
     let reviewed_plan = model.into_reviewed_plan(&excludes);
 
     run_engine::run_reviewed(
@@ -324,7 +393,11 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
             ignore_space_check: false,
             json_output: false,
             full_verify: false,
-            excludes: &excludes,
+            // Ordinary actions are intersected with the reviewed Plan by
+            // run_reviewed. Excluded error rows must also be absent from its
+            // fresh plan-error gate; errors cannot share a path with another
+            // source action, so this remains operation-safe.
+            excludes: &reconciliation_excludes,
         },
         pair,
         reviewed_plan,
@@ -734,6 +807,7 @@ mod tests {
             source_mtime: Some(SystemTime::UNIX_EPOCH),
             old_bytes: None,
             reason: reason.to_string(),
+            structural_conflict: None,
         }
     }
 
@@ -822,7 +896,9 @@ mod tests {
         let ReviewOutcome::Execute(exclusions) = outcome else {
             panic!("included error confirmation must remain in the TUI")
         };
-        assert_eq!(exclusions, ["link"]);
+        assert_eq!(exclusions.len(), 1);
+        assert_eq!(exclusions[0].operation, Operation::Error);
+        assert_eq!(exclusions[0].path, "link");
     }
 
     #[test]
@@ -843,9 +919,52 @@ mod tests {
         };
         let reviewed = model.into_reviewed_plan(&exclusions);
 
-        assert_eq!(exclusions, [".old.vibesync-tmp-run"]);
+        assert_eq!(exclusions.len(), 1);
+        assert_eq!(exclusions[0].operation, Operation::Cleanup);
+        assert_eq!(exclusions[0].path, ".old.vibesync-tmp-run");
         assert!(reviewed.strays.is_empty());
         assert_eq!(reviewed.excluded, 1);
+    }
+
+    #[test]
+    fn exclusion_identity_distinguishes_structural_delete_from_copy_at_same_path() {
+        let mut deletion = action("report.txt", 0, "replaced by source file");
+        deletion.structural_conflict = Some(plan::StructuralConflict::DestinationEmptyDirectory);
+        let dry_run = plan::Plan {
+            copies: vec![action("report.txt", 10, "new")],
+            deletes: vec![deletion],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+
+        model.toggle();
+        let exclusions = model.exclusions();
+        let reviewed = model.into_reviewed_plan(&exclusions);
+
+        assert!(reviewed.copies.is_empty());
+        assert!(reviewed.deletes.is_empty());
+        assert_eq!(reviewed.excluded, 2);
+    }
+
+    #[test]
+    fn descendant_copy_exclusion_also_drops_its_orphan_structural_delete() {
+        let mut deletion = action("docs", 8, "replaced by source directory");
+        deletion.structural_conflict = Some(plan::StructuralConflict::DestinationFile);
+        let dry_run = plan::Plan {
+            copies: vec![action("docs/new.txt", 10, "new")],
+            deletes: vec![deletion],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Update), dry_run);
+
+        model.toggle();
+        let totals = model.totals();
+        let exclusions = model.exclusions();
+        let reviewed = model.into_reviewed_plan(&exclusions);
+
+        assert_eq!(totals.excluded, 2);
+        assert!(reviewed.copies.is_empty());
+        assert!(reviewed.deletes.is_empty());
     }
 
     #[test]
