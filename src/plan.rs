@@ -11,7 +11,7 @@
 //! Everything here is strictly read-only — `plan` never writes to the
 //! source or destination.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -85,6 +85,10 @@ pub struct Plan {
     pub unchanged: usize,
     /// Rows removed by `--exclude`.
     pub excluded: usize,
+    /// Requested exclusions that did not name an action row in this plan.
+    /// They remain non-fatal so a script can safely reuse a filtered list,
+    /// but are reported to make a typo or a stale plan visible.
+    pub unknown_excludes: Vec<String>,
     /// Files found under the source and destination before filtering. These
     /// counts are precondition inputs, not presentation rows.
     pub source_entries: usize,
@@ -168,7 +172,8 @@ fn walk(root: &Path, mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>) -> 
 ///   an ERRORS row instead of a COPY/UPDATE.
 ///
 /// `excludes` are exact relative-path strings (as the diff prints them,
-/// ADR-0004); a matching candidate is dropped and counted in `excluded`.
+/// ADR-0004); a matching unfiltered action/error row is dropped and counted
+/// in `excluded`.
 pub fn compute(
     source: &BTreeMap<PathBuf, Entry>,
     dest: &BTreeMap<PathBuf, Entry>,
@@ -189,11 +194,13 @@ pub fn compute(
         destination_entries: dest.len(),
         ..Plan::default()
     };
+    let mut actionable_paths = BTreeSet::new();
     for (rel, src) in source {
-        record_classification(
-            &mut plan,
-            classify_source_entry(rel, src, dest.get(rel), supports_symlinks, excludes),
-        );
+        let classification = classify_source_entry(rel, src, dest.get(rel), supports_symlinks);
+        if let Some(path) = actionable_path(&classification) {
+            actionable_paths.insert(path.to_path_buf());
+        }
+        record_classification(&mut plan, apply_excludes(classification, excludes));
     }
 
     // Removals are Mirror-only. In Update nothing at the destination is
@@ -203,6 +210,7 @@ pub fn compute(
             if source.contains_key(rel) {
                 continue;
             }
+            actionable_paths.insert(rel.clone());
             if excludes.iter().any(|excluded| Path::new(excluded) == rel) {
                 plan.excluded += 1;
                 continue;
@@ -216,7 +224,21 @@ pub fn compute(
         }
     }
 
+    plan.unknown_excludes = excludes
+        .iter()
+        .filter(|excluded| !actionable_paths.contains(Path::new(excluded)))
+        .cloned()
+        .collect();
+
     plan
+}
+
+/// Reports exclusions which did not match an exact action path. Keep this on
+/// stderr so NDJSON stdout remains a machine-readable event stream.
+pub(crate) fn report_unknown_excludes(plan: &Plan) {
+    for excluded in &plan.unknown_excludes {
+        eprintln!("vibesync: exclude path not found in plan: {excluded}");
+    }
 }
 
 /// Classifies and records one source entry for both buffered human plans and
@@ -227,11 +249,7 @@ fn classify_source_entry(
     source: &Entry,
     destination: Option<&Entry>,
     supports_symlinks: bool,
-    excludes: &[String],
 ) -> SourceClassification {
-    if excludes.iter().any(|excluded| Path::new(excluded) == rel) {
-        return SourceClassification::Excluded;
-    }
     if source.is_symlink && !supports_symlinks {
         let error = PlanError {
             rel_path: rel.to_path_buf(),
@@ -261,6 +279,30 @@ fn classify_source_entry(
             ),
             None => SourceClassification::Unchanged,
         },
+    }
+}
+
+fn actionable_path(classification: &SourceClassification) -> Option<&Path> {
+    match classification {
+        SourceClassification::Action(_, action) => Some(&action.rel_path),
+        SourceClassification::Error(error) => Some(&error.rel_path),
+        SourceClassification::Excluded | SourceClassification::Unchanged => None,
+    }
+}
+
+fn apply_excludes(
+    classification: SourceClassification,
+    excludes: &[String],
+) -> SourceClassification {
+    let excluded = actionable_path(&classification).is_some_and(|path| {
+        excludes
+            .iter()
+            .any(|candidate| Path::new(candidate) == path)
+    });
+    if excluded {
+        SourceClassification::Excluded
+    } else {
+        classification
     }
 }
 
@@ -412,6 +454,7 @@ fn human_size(bytes: u64) -> String {
 /// reads as empty (a first sync), so everything plans as COPY.
 pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
     let (pair, plan) = build(config_path, pair_name, excludes)?;
+    report_unknown_excludes(&plan);
     print!("{}", render(&plan, pair_name, pair.mode));
     Ok(crate::error::EXIT_OK)
 }
@@ -432,13 +475,9 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
     walk(&header_pair.source, |path, entry| {
         stats.scanned += 1;
         let old = entry_at(&header_pair.destination.join(path))?;
-        let row = match classify_source_entry(
-            path,
-            entry,
-            old.as_ref(),
-            setup.supports_symlinks,
-            excludes,
-        ) {
+        let classification =
+            classify_source_entry(path, entry, old.as_ref(), setup.supports_symlinks);
+        let row = match apply_excludes(classification, excludes) {
             SourceClassification::Action(op, action) => {
                 stats.increment(op);
                 plan_action_row(&run_id, op, &action)

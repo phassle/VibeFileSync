@@ -302,7 +302,13 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
     }
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, initial_plan) = plan::build(config_path, pair_name, excludes)?;
+    plan::report_unknown_excludes(&initial_plan);
     reporter.plan(&initial_plan, pair_name, pair.mode);
+
+    if !initial_plan.errors.is_empty() {
+        reporter.blocked(initial_plan.errors.len());
+        return Ok(EXIT_BLOCKED_PLAN);
+    }
 
     let run_warnings = crate::preconditions::check_run(
         &pair,
@@ -311,11 +317,6 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
         ignore_space_check,
     )?;
     reporter.precondition_warnings(&run_warnings);
-
-    if !initial_plan.errors.is_empty() {
-        reporter.blocked(initial_plan.errors.len());
-        return Ok(EXIT_BLOCKED_PLAN);
-    }
 
     if !yes && !reporter.confirm()? {
         reporter.cancelled();
