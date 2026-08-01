@@ -1049,6 +1049,7 @@ fn plan_json_matches_run_review_for_nonempty_structural_replacement() {
             (serde_json::json!("delete"), serde_json::json!("node")),
         ]
     );
+    assert_eq!(rows.last().unwrap()["counts"]["scanned"], 3);
 
     let run = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
     assert_eq!(run.status.code(), Some(EXIT_OK));

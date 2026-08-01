@@ -637,6 +637,7 @@ pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
                     .map_err(io::Error::other)?;
                     stats.increment(op);
                     stats.deletes += 1;
+                    stats.scanned += 1;
                     return Ok(());
                 }
                 stats.increment(op);
