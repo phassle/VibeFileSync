@@ -1716,8 +1716,10 @@ fn plan_and_status_report_stray_temps_without_destination_writes() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(
-        rows.iter().find(|row| row["type"] == "stray").unwrap()["path"],
-        ".photo.txt.vibesync-tmp-20260731T120000Z"
+        rows.iter()
+            .map(|row| row["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["plan_start", "action", "summary"]
     );
     assert_eq!(rows.last().unwrap()["strays"], 1);
     assert_eq!(

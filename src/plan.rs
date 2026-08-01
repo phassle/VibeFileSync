@@ -482,14 +482,8 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         })
         .map_err(|error| scan_error(&header_pair.destination, error))?;
     }
-    let stray_count = walk_stray_temps(&header_pair.destination, |path| {
-        crate::ndjson::stdout(&serde_json::json!({
-            "schema": "vibefilesync.plan/v1", "type": "stray", "run_id": run_id,
-            "path": path.to_string_lossy(),
-        }))
-        .map_err(io::Error::other)
-    })
-    .map_err(|error| scan_error(&header_pair.destination, error))?;
+    let stray_count = walk_stray_temps(&header_pair.destination, |_| Ok(()))
+        .map_err(|error| scan_error(&header_pair.destination, error))?;
     emit(serde_json::json!({
         "schema": "vibefilesync.plan/v1", "type": "summary", "run_id": run_id,
         "counts": {"copy": stats.copies, "update": stats.updates, "delete": stats.deletes, "error": stats.errors},

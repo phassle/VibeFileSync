@@ -24,6 +24,7 @@ const COPYFILE_STATE_STATUS_CTX: u32 = 7;
 const COPYFILE_STATE_COPIED: u32 = 8;
 const COPYFILE_STATE_BSIZE: u32 = 13;
 const COPYFILE_COPY_DATA: libc::c_int = 4;
+const COPYFILE_ERR: libc::c_int = 3;
 const COPYFILE_PROGRESS: libc::c_int = 4;
 const COPYFILE_CONTINUE: libc::c_int = 0;
 const COPYFILE_QUIT: libc::c_int = 2;
@@ -812,10 +813,17 @@ unsafe extern "C" fn copyfile_progress_callback<F>(
 where
     F: FnMut(u64) -> io::Result<()>,
 {
-    if what != COPYFILE_COPY_DATA || stage != COPYFILE_PROGRESS {
+    if what != COPYFILE_COPY_DATA {
         return COPYFILE_CONTINUE;
     }
     let context = &mut *raw_context.cast::<CopyProgressContext<'_, F>>();
+    if stage == COPYFILE_ERR {
+        context.error = Some(io::Error::last_os_error());
+        return COPYFILE_QUIT;
+    }
+    if stage != COPYFILE_PROGRESS {
+        return COPYFILE_CONTINUE;
+    }
     let mut copied: libc::off_t = 0;
     if copyfile_state_get(
         state,
@@ -1074,5 +1082,30 @@ mod tests {
             !destination_dir.path().join("_SafetyNet").exists(),
             "archive is strictly after the verification gate"
         );
+    }
+
+    #[test]
+    fn copyfile_data_error_quits_and_preserves_errno() {
+        let mut progress: fn(u64) -> io::Result<()> = |_| Ok(());
+        let mut context = CopyProgressContext {
+            progress: &mut progress,
+            error: None,
+            copied: 0,
+        };
+        unsafe { *libc::__error() = libc::ENOSPC };
+
+        let response = unsafe {
+            copyfile_progress_callback::<fn(u64) -> io::Result<()>>(
+                COPYFILE_COPY_DATA,
+                COPYFILE_ERR,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                (&mut context as *mut CopyProgressContext<'_, _>).cast(),
+            )
+        };
+
+        assert_eq!(response, COPYFILE_QUIT);
+        assert_eq!(context.error.unwrap().raw_os_error(), Some(libc::ENOSPC));
     }
 }
