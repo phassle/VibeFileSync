@@ -14,9 +14,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::config::{self, Mode};
 use crate::error::AppError;
@@ -103,8 +103,8 @@ pub struct Plan {
 ///
 /// `_SafetyNet/` is the archive tree; `.*.vibesync-tmp-*` are in-flight
 /// Publish temps. Neither is ever synced, and neither is ever planned for
-/// deletion (invariant I5) — skipping them here is what makes that true on
-/// both the source and destination side.
+/// deletion (invariant I5). AppleDouble files require content-aware handling
+/// because `._notes` can also be a legitimate user filename.
 fn is_machinery(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name == "_SafetyNet"
@@ -112,27 +112,44 @@ fn is_machinery(name: &OsStr) -> bool {
             && (name.contains(".vibesync-tmp-") || name.starts_with("._vibesync-run-")))
 }
 
+fn is_apple_double(path: &Path, name: &OsStr) -> bool {
+    if !name.to_string_lossy().starts_with("._") {
+        return false;
+    }
+    let mut magic = [0_u8; 4];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == [0x00, 0x05, 0x16, 0x07]
+}
+
 /// Recursively collects every file and symlink under `root`, keyed by path
 /// relative to `root`, skipping machinery. `BTreeMap` keeps the output
 /// deterministically sorted. Symlinks are recorded via `symlink_metadata`
 /// (never followed), so a symlinked directory is one entry, not a subtree.
-fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
+fn scan(root: &Path, skip_apple_double: bool) -> io::Result<BTreeMap<PathBuf, Entry>> {
     let mut entries = BTreeMap::new();
-    walk(root, |path, entry| {
+    walk(root, skip_apple_double, |path, entry| {
         entries.insert(path.to_path_buf(), entry.clone());
         Ok(())
     })?;
     Ok(entries)
 }
 
-fn walk(root: &Path, mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>) -> io::Result<usize> {
+fn walk(
+    root: &Path,
+    skip_apple_double: bool,
+    mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
+) -> io::Result<usize> {
     let mut count = 0;
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
-            if is_machinery(&entry.file_name()) {
+            if is_machinery(&entry.file_name())
+                || (skip_apple_double && is_apple_double(&entry.path(), &entry.file_name()))
+            {
                 continue;
             }
 
@@ -180,6 +197,7 @@ pub fn compute(
     dest: &BTreeMap<PathBuf, Entry>,
     mode: Mode,
     supports_symlinks: bool,
+    mtime_tolerance: Duration,
     excludes: &[String],
 ) -> Plan {
     // `scanned` is the count of files the plan actually reasons about, so
@@ -197,7 +215,8 @@ pub fn compute(
     };
     let mut actionable_paths = BTreeSet::new();
     for (rel, src) in source {
-        let classification = classify_source_entry(rel, src, dest.get(rel), supports_symlinks);
+        let classification =
+            classify_source_entry(rel, src, dest.get(rel), supports_symlinks, mtime_tolerance);
         if let Some(path) = actionable_path(&classification) {
             actionable_paths.insert(path.to_path_buf());
         }
@@ -251,6 +270,7 @@ fn classify_source_entry(
     source: &Entry,
     destination: Option<&Entry>,
     supports_symlinks: bool,
+    mtime_tolerance: Duration,
 ) -> SourceClassification {
     if source.is_symlink && !supports_symlinks {
         let error = PlanError {
@@ -270,7 +290,7 @@ fn classify_source_entry(
                 reason: "new".to_string(),
             },
         ),
-        Some(old) => match change_reason(source, old) {
+        Some(old) => match change_reason(source, old, mtime_tolerance) {
             Some(reason) => SourceClassification::Action(
                 PlanOperation::Update,
                 Action {
@@ -325,12 +345,17 @@ fn record_classification(plan: &mut Plan, classification: SourceClassification) 
 /// Why a file present on both sides needs an UPDATE, or `None` if it is
 /// unchanged. Size is the cheap, decisive signal; mtime catches
 /// same-size edits (with the documented cross-filesystem granularity risk).
-fn change_reason(src: &Entry, dst: &Entry) -> Option<&'static str> {
+fn change_reason(src: &Entry, dst: &Entry, mtime_tolerance: Duration) -> Option<&'static str> {
     if src.is_symlink != dst.is_symlink {
         Some("type changed")
     } else if src.size != dst.size {
         Some("size differs")
-    } else if src.mtime != dst.mtime {
+    } else if src
+        .mtime
+        .duration_since(dst.mtime)
+        .unwrap_or_else(|_| dst.mtime.duration_since(src.mtime).unwrap_or_default())
+        > mtime_tolerance
+    {
         Some("modified")
     } else {
         None
@@ -476,11 +501,16 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         "pair": pair_name, "mode": header_pair.mode, "dry_run": true
     }))?;
     let mut stats = StreamStats::default();
-    walk(&header_pair.source, |path, entry| {
+    walk(&header_pair.source, false, |path, entry| {
         stats.scanned += 1;
         let old = entry_at(&header_pair.destination.join(path))?;
-        let classification =
-            classify_source_entry(path, entry, old.as_ref(), setup.supports_symlinks);
+        let classification = classify_source_entry(
+            path,
+            entry,
+            old.as_ref(),
+            setup.supports_symlinks,
+            setup.mtime_tolerance,
+        );
         let row = match apply_excludes(classification, excludes) {
             SourceClassification::Action(op, action) => {
                 stats.increment(op);
@@ -503,27 +533,31 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
     })
     .map_err(|e| scan_error(&header_pair.source, e))?;
     if header_pair.mode == Mode::Mirror && header_pair.destination.is_dir() {
-        walk(&header_pair.destination, |path, entry| {
-            if entry_at(&header_pair.source.join(path))?.is_some() {
-                return Ok(());
-            }
-            stats.scanned += 1;
-            if excludes.iter().any(|excluded| Path::new(excluded) == path) {
-                stats.excluded += 1;
-                return Ok(());
-            }
-            let action = Action {
-                rel_path: path.to_path_buf(),
-                bytes: entry.size,
-                source_mtime: None,
-                old_bytes: Some(entry.size),
-                reason: "not in source".into(),
-            };
-            crate::ndjson::stdout(&plan_action_row(&run_id, PlanOperation::Delete, &action))
-                .map_err(io::Error::other)?;
-            stats.deletes += 1;
-            Ok(())
-        })
+        walk(
+            &header_pair.destination,
+            setup.skip_apple_double,
+            |path, entry| {
+                if entry_at(&header_pair.source.join(path))?.is_some() {
+                    return Ok(());
+                }
+                stats.scanned += 1;
+                if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+                    stats.excluded += 1;
+                    return Ok(());
+                }
+                let action = Action {
+                    rel_path: path.to_path_buf(),
+                    bytes: entry.size,
+                    source_mtime: None,
+                    old_bytes: Some(entry.size),
+                    reason: "not in source".into(),
+                };
+                crate::ndjson::stdout(&plan_action_row(&run_id, PlanOperation::Delete, &action))
+                    .map_err(io::Error::other)?;
+                stats.deletes += 1;
+                Ok(())
+            },
+        )
         .map_err(|error| scan_error(&header_pair.destination, error))?;
     }
     let stray_count = walk_stray_temps(&header_pair.destination, |_| Ok(()))
@@ -596,6 +630,8 @@ fn scan_error_for_json(error: io::Error) -> AppError {
 struct PlanSetup {
     pair: config::Pair,
     supports_symlinks: bool,
+    mtime_tolerance: Duration,
+    skip_apple_double: bool,
     notices: Vec<String>,
 }
 
@@ -612,14 +648,25 @@ fn prepare(config_path: &Path, pair_name: &str) -> Result<PlanSetup, AppError> {
             pair.source.display()
         )));
     }
-    let destination_exists = pair.destination.is_dir();
-    let supports_symlinks = !destination_exists
-        || volume::filesystem_type(&pair.destination)
-            .map(|kind| !kind.eq_ignore_ascii_case("exfat"))
-            .unwrap_or(true);
+    let destination_type = pair
+        .destination
+        .is_dir()
+        .then(|| volume::filesystem_type(&pair.destination).ok())
+        .flatten();
+    let is_exfat = destination_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("exfat"));
+    let supports_symlinks = !is_exfat;
+    let mtime_tolerance = if is_exfat {
+        Duration::from_secs(2)
+    } else {
+        Duration::ZERO
+    };
     Ok(PlanSetup {
         pair,
         supports_symlinks,
+        mtime_tolerance,
+        skip_apple_double: is_exfat,
         notices,
     })
 }
@@ -637,9 +684,10 @@ pub(crate) fn build(
         eprintln!("{notice}");
     }
     let pair = setup.pair;
-    let source = scan(&pair.source).map_err(|error| scan_error(&pair.source, error))?;
+    let source = scan(&pair.source, false).map_err(|error| scan_error(&pair.source, error))?;
     let destination = if pair.destination.is_dir() {
-        scan(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?
+        scan(&pair.destination, setup.skip_apple_double)
+            .map_err(|error| scan_error(&pair.destination, error))?
     } else {
         BTreeMap::new()
     };
@@ -648,6 +696,7 @@ pub(crate) fn build(
         &destination,
         pair.mode,
         setup.supports_symlinks,
+        setup.mtime_tolerance,
         excludes,
     );
     plan.strays =
@@ -750,7 +799,7 @@ mod tests {
             ("gone.txt", file(5, 50)),     // dest-only -> delete
         ]);
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
 
         assert_eq!(plan.copies.len(), 1);
         assert_eq!(plan.copies[0].rel_path, PathBuf::from("new.txt"));
@@ -768,10 +817,28 @@ mod tests {
         let source = tree(&[("edited.txt", file(20, 500))]);
         let dest = tree(&[("edited.txt", file(20, 200))]);
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
         assert_eq!(plan.updates.len(), 1);
         assert_eq!(plan.updates[0].reason, "modified");
         assert_eq!(plan.unchanged, 0);
+    }
+
+    #[test]
+    fn exfat_timestamp_granularity_does_not_replan_a_published_file() {
+        let source = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 11))]);
+        let destination = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 10))]);
+
+        let plan = compute(
+            &source,
+            &destination,
+            Mode::Mirror,
+            false,
+            Duration::from_secs(2),
+            &[],
+        );
+
+        assert!(plan.updates.is_empty());
+        assert_eq!(plan.unchanged, 1);
     }
 
     #[test]
@@ -779,7 +846,7 @@ mod tests {
         let source = tree(&[("new.txt", file(10, 100))]);
         let dest = tree(&[("gone.txt", file(5, 50)), ("also-gone.txt", file(6, 60))]);
 
-        let plan = compute(&source, &dest, Mode::Update, true, &[]);
+        let plan = compute(&source, &dest, Mode::Update, true, Duration::ZERO, &[]);
 
         assert_eq!(plan.copies.len(), 1);
         assert!(
@@ -799,6 +866,7 @@ mod tests {
             &dest,
             Mode::Mirror,
             /* supports_symlinks */ false,
+            Duration::ZERO,
             &[],
         );
 
@@ -815,7 +883,7 @@ mod tests {
         let source = tree(&[("link", link(12))]);
         let dest = BTreeMap::new();
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
         assert!(plan.errors.is_empty());
         assert_eq!(plan.copies.len(), 1);
     }
@@ -830,6 +898,7 @@ mod tests {
             &dest,
             Mode::Mirror,
             true,
+            Duration::ZERO,
             &["skip.txt".to_string()],
         );
 
@@ -848,6 +917,7 @@ mod tests {
             &dest,
             Mode::Mirror,
             true,
+            Duration::ZERO,
             &["gone.txt".to_string()],
         );
         assert!(plan.deletes.is_empty());
@@ -858,7 +928,7 @@ mod tests {
     fn render_totals_and_safetynet_notes_for_mirror() {
         let source = tree(&[("new.txt", file(10, 100)), ("chg.txt", file(40, 300))]);
         let dest = tree(&[("chg.txt", file(30, 300)), ("gone.txt", file(5, 50))]);
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
 
         let out = render(&plan, "photos", Mode::Mirror);
 
@@ -879,7 +949,7 @@ mod tests {
         // reporting DELETE (0), not by hiding the section.
         let source = tree(&[("new.txt", file(10, 100))]);
         let dest = tree(&[("gone.txt", file(5, 50))]);
-        let plan = compute(&source, &dest, Mode::Update, true, &[]);
+        let plan = compute(&source, &dest, Mode::Update, true, Duration::ZERO, &[]);
 
         let out = render(&plan, "docs", Mode::Update);
 
@@ -918,8 +988,40 @@ mod tests {
         assert!(is_machinery(OsStr::new("_SafetyNet")));
         assert!(is_machinery(OsStr::new(".photo.jpg.vibesync-tmp-abc123")));
         assert!(is_machinery(OsStr::new("._vibesync-run-20260716T120000Z")));
+        assert!(!is_machinery(OsStr::new("._notes")));
         assert!(!is_machinery(OsStr::new("_SafetyNetworkNotes")));
         assert!(!is_machinery(OsStr::new("vibesync-tmp-visible")));
         assert!(!is_machinery(OsStr::new("regular.txt")));
+    }
+
+    #[test]
+    fn apple_double_filter_is_content_and_destination_context_sensitive() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("._photo.jpg"),
+            [0x00, 0x05, 0x16, 0x07, 0x01],
+        )
+        .unwrap();
+        fs::write(root.path().join("._notes"), b"legitimate user content").unwrap();
+
+        let mut source_paths = Vec::new();
+        walk(root.path(), false, |path, _| {
+            source_paths.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        source_paths.sort();
+        assert_eq!(
+            source_paths,
+            [PathBuf::from("._notes"), PathBuf::from("._photo.jpg")]
+        );
+
+        let mut exfat_destination_paths = Vec::new();
+        walk(root.path(), true, |path, _| {
+            exfat_destination_paths.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(exfat_destination_paths, [PathBuf::from("._notes")]);
     }
 }

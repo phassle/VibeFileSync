@@ -10,6 +10,11 @@ fault-injection = []
 name = "vibesync"
 path = "src/main.rs"
 
+[[test]]
+name = "acceptance"
+path = "tests/acceptance/main.rs"
+required-features = ["fault-injection"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

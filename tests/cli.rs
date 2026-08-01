@@ -870,6 +870,129 @@ fn metadata_mismatch_publishes_structured_warning_and_exits_zero() {
     );
 }
 
+// --- Slice 11: Generic transition fault injection (issue #25) ---
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn crash_at_temp_created_kills_the_real_binary_before_copying_data() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "complete source data");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_CRASH_AT", "temp_created")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "the real binary must abort");
+    assert!(!fx.destination.path().join("new.txt").exists());
+    let temps: Vec<_> = fs::read_dir(fx.destination.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".new.txt.vibesync-tmp-")
+        })
+        .collect();
+    assert_eq!(temps.len(), 1, "the named temp must be externally visible");
+    assert_eq!(fs::metadata(&temps[0]).unwrap().len(), 0);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn exec_at_runs_at_every_named_copy_transition() {
+    for transition in [
+        "temp_created",
+        "copy_complete",
+        "verify_complete",
+        "source_revalidated",
+        "archived",
+        "publish_complete",
+        "action_done_written",
+    ] {
+        let fx = Fixture::new();
+        fx.write_source("file.txt", "new content");
+        if transition == "archived" {
+            fx.write_dest("file.txt", "old content");
+        }
+        fx.add_photos_pair();
+        let marker = fx.home.path().join(format!("{transition}.marker"));
+        let command = format!(
+            "printf '%s' \"$VIBESYNC_TEST_TRANSITION\" > '{}'",
+            marker.display()
+        );
+
+        let output = fx
+            .cmd()
+            .env("VIBESYNC_TEST_EXEC_AT", format!("{transition}:{command}"))
+            .args(["run", "photos", "--yes"])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_OK),
+            "{transition}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(marker).unwrap_or_default(),
+            transition,
+            "EXEC_AT did not run at {transition}"
+        );
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn crash_at_archived_keeps_the_old_version_in_safetynet() {
+    let fx = Fixture::new();
+    fx.write_source("file.txt", "new content");
+    fx.write_dest("file.txt", "old content");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_CRASH_AT", "archived")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "the real binary must abort");
+    assert!(!fx.destination.path().join("file.txt").exists());
+    let archived: Vec<_> = fs::read_dir(fx.destination.path().join("_SafetyNet"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("file.txt"))
+        .collect();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(fs::read_to_string(&archived[0]).unwrap(), "old content");
+}
+
+#[cfg(not(feature = "fault-injection"))]
+#[test]
+fn fault_injection_environment_is_absent_without_the_feature() {
+    let fx = Fixture::new();
+    fx.write_source("new.txt", "complete source data");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_CRASH_AT", "temp_created")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("new.txt")).unwrap(),
+        "complete source data"
+    );
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn expected_degradations_are_once_per_exfat_run_and_absent_on_apfs() {
