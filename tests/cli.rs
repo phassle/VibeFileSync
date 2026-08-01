@@ -881,6 +881,19 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
     )
     .unwrap();
     machinery_directory.add_photos_pair();
+    let plan = machinery_directory
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    let rows: Vec<serde_json::Value> = String::from_utf8(plan.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!rows
+        .iter()
+        .any(|row| { row["type"] == "action" && row["op"] == "delete" && row["path"] == "node" }));
     let output = machinery_directory
         .cmd()
         .args(["run", "photos", "--yes", "--json"])
@@ -1095,7 +1108,14 @@ fn mirror_preserves_empty_directory_shape_while_update_remains_additive() {
 #[test]
 fn apfs_run_copies_symlink_identity_without_following_its_target() {
     let fx = Fixture::new();
-    std::os::unix::fs::symlink("missing-relative-target", fx.source.path().join("link")).unwrap();
+    let source_link = fx.source.path().join("link");
+    std::os::unix::fs::symlink("missing-relative-target", &source_link).unwrap();
+    assert!(ProcessCommand::new("xattr")
+        .args(["-w", "-s", "com.example.vibesync-test", "link metadata"])
+        .arg(&source_link)
+        .status()
+        .unwrap()
+        .success());
     fx.write_dest("link", "old regular file");
     fx.add_photos_pair();
 
@@ -1109,6 +1129,16 @@ fn apfs_run_copies_symlink_identity_without_following_its_target() {
     assert_eq!(
         fs::read_link(destination).unwrap(),
         Path::new("missing-relative-target")
+    );
+    let xattr = ProcessCommand::new("xattr")
+        .args(["-p", "-s", "com.example.vibesync-test"])
+        .arg(fx.destination.path().join("link"))
+        .output()
+        .unwrap();
+    assert!(xattr.status.success());
+    assert_eq!(
+        String::from_utf8(xattr.stdout).unwrap().trim(),
+        "link metadata"
     );
 }
 
@@ -1315,6 +1345,36 @@ fn catchable_signal_exits_four_with_summaryless_interrupted_journal() {
     assert!(!journal
         .lines()
         .any(|line| line.contains("\"type\":\"summary\"")));
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn signal_immediately_after_run_start_still_exits_four() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.source.path().join("photo.bin"),
+        vec![7_u8; 16 * 1024 * 1024],
+    )
+    .unwrap();
+    fx.add_photos_pair();
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut child = ProcessCommand::new(binary.get_program())
+        .args(["run", "photos", "--json", "--yes"])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .env("VIBESYNC_TEST_COPY_CHUNK_DELAY_MS", "5")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let start: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(start["type"], "run_start");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    for line in lines {
+        let _: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(EXIT_INTERRUPTED));
+    assert!(!fx.destination.path().join("photo.bin").exists());
 }
 
 #[test]

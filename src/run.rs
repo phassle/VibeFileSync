@@ -29,6 +29,7 @@ const COPYFILE_STATE_COPIED: u32 = 8;
 const COPYFILE_STATE_BSIZE: u32 = 13;
 const COPYFILE_COPY_DATA: libc::c_int = 4;
 const COPYFILE_ERR: libc::c_int = 3;
+const XATTR_NOFOLLOW: libc::c_int = 0x0001;
 const COPYFILE_PROGRESS: libc::c_int = 4;
 const COPYFILE_CONTINUE: libc::c_int = 0;
 const COPYFILE_QUIT: libc::c_int = 2;
@@ -401,6 +402,7 @@ fn execute_reviewed_plan(
         return Ok(EXIT_OK);
     }
 
+    install_interrupt_handler()?;
     let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
     journal
         .run_start(pair_name, &initial_plan, &run_warnings, &degradations)
@@ -413,7 +415,7 @@ fn execute_reviewed_plan(
         &run_warnings,
         &initial_plan,
     )?;
-    install_interrupt_handler()?;
+    crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
     let mut stats = RunStats {
         counts: Counts {
             planned: initial_plan.copies.len()
@@ -904,7 +906,7 @@ fn copy_file(
         if fs::symlink_metadata(source)?.file_type().is_symlink() {
             #[cfg(all(feature = "fault-injection", debug_assertions))]
             fs::remove_file(temp)?;
-            std::os::unix::fs::symlink(fs::read_link(source)?, temp)?;
+            copyfile_all_but_acls(source, temp)?;
         } else if report_progress
             && action.bytes >= PROGRESS_THRESHOLD
             && fs::symlink_metadata(source)?.is_file()
@@ -1492,7 +1494,7 @@ fn verify_temp(
     // macOS preserves extended attributes on exFAT through AppleDouble
     // sidecars. Compare the file-facing name set on every filesystem; the
     // scanner keeps the backing `._*` machinery out of sync content.
-    if !source_is_symlink && xattr_names(source)? != xattr_names(temp)? {
+    if xattr_names(source)? != xattr_names(temp)? {
         warnings.push(MetadataWarning::mismatch("xattr names differ"));
     }
     Ok(TempVerification {
@@ -1536,13 +1538,20 @@ fn file_hash(path: &Path) -> io::Result<[u8; 32]> {
 
 fn xattr_names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
     let path = c_path(path)?;
-    let length = unsafe { listxattr(path.as_ptr(), std::ptr::null_mut(), 0, 0) };
+    let length = unsafe { listxattr(path.as_ptr(), std::ptr::null_mut(), 0, XATTR_NOFOLLOW) };
     if length < 0 {
         return Err(io::Error::last_os_error());
     }
     let mut raw = vec![0_u8; length as usize];
     if length > 0 {
-        let actual = unsafe { listxattr(path.as_ptr(), raw.as_mut_ptr().cast(), raw.len(), 0) };
+        let actual = unsafe {
+            listxattr(
+                path.as_ptr(),
+                raw.as_mut_ptr().cast(),
+                raw.len(),
+                XATTR_NOFOLLOW,
+            )
+        };
         if actual < 0 {
             return Err(io::Error::last_os_error());
         }

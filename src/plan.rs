@@ -597,7 +597,8 @@ pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
     walk(&header_pair.source, false, |path, entry| {
         stats.scanned += 1;
         let destination_path = header_pair.destination.join(path);
-        let replaces_directory = is_directory(&destination_path)?;
+        let replaces_directory = is_directory(&destination_path)?
+            && !contains_machinery(&destination_path);
         let old = entry_at(&destination_path)?;
         let classification = classify_source_entry(
             path,
@@ -638,72 +639,63 @@ pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
         crate::ndjson::stdout(&row).map_err(io::Error::other)
     })
     .map_err(|e| scan_error(&header_pair.source, e))?;
-    let source_directories = scan_directories(&header_pair.source)
-        .map_err(|error| scan_error(&header_pair.source, error))?;
-    let destination_directories = if header_pair.destination.is_dir() {
-        scan_directories(&header_pair.destination)
-            .map_err(|error| scan_error(&header_pair.destination, error))?
-    } else {
-        BTreeSet::new()
-    };
-    for path in source_directories.difference(&destination_directories) {
-        let source_directory = header_pair.source.join(path);
-        if fs::read_dir(&source_directory)
-            .map_err(|error| scan_error(&source_directory, error))?
-            .next()
-            .transpose()
-            .map_err(|error| scan_error(&source_directory, error))?
-            .is_some()
+    walk_leaf_directories(&header_pair.source, |path| {
+        if fs::symlink_metadata(header_pair.destination.join(path))
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
         {
-            continue;
+            return Ok(());
         }
         let action = Action {
-            rel_path: path.clone(),
+            rel_path: path.to_path_buf(),
             bytes: 0,
             source_mtime: None,
             old_bytes: None,
             reason: "new directory".into(),
             structural_conflict: None,
         };
-        emit(plan_action_row(&plan_id, PlanOperation::Copy, &action))?;
+        crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Copy, &action))
+            .map_err(io::Error::other)?;
         stats.copies += 1;
         stats.scanned += 1;
-    }
-    let mut streamed_directory_deletes = BTreeSet::new();
+        Ok(())
+    })
+    .map_err(|error| scan_error(&header_pair.source, error))?;
     if header_pair.destination.is_dir() {
         if header_pair.mode == Mode::Mirror {
-            for path in destination_directories.difference(&source_directories) {
-                let destination_directory = header_pair.destination.join(path);
-                if destination_directories
-                    .difference(&source_directories)
-                    .any(|ancestor| ancestor != path && path.starts_with(ancestor))
-                    || contains_machinery(&destination_directory)
-                    || fs::symlink_metadata(header_pair.source.join(path)).is_ok()
-                {
-                    continue;
-                }
-                let action = Action {
-                    rel_path: path.clone(),
-                    bytes: 0,
-                    source_mtime: None,
-                    old_bytes: Some(0),
-                    reason: "directory not in source".into(),
-                    structural_conflict: None,
-                };
-                emit(plan_action_row(&plan_id, PlanOperation::Delete, &action))?;
-                streamed_directory_deletes.insert(path.clone());
-                stats.deletes += 1;
-                stats.scanned += 1;
-            }
+            walk_destination_directory_deletes(
+                &header_pair.source,
+                &header_pair.destination,
+                |path| {
+                    let action = Action {
+                        rel_path: path.to_path_buf(),
+                        bytes: 0,
+                        source_mtime: None,
+                        old_bytes: Some(0),
+                        reason: "directory not in source".into(),
+                        structural_conflict: None,
+                    };
+                    crate::ndjson::stdout(&plan_action_row(
+                        &plan_id,
+                        PlanOperation::Delete,
+                        &action,
+                    ))
+                    .map_err(io::Error::other)?;
+                    stats.deletes += 1;
+                    stats.scanned += 1;
+                    Ok(())
+                },
+            )
+            .map_err(|error| scan_error(&header_pair.destination, error))?;
         }
         walk(
             &header_pair.destination,
             setup.skip_apple_double,
             |path, entry| {
-                if streamed_directory_deletes
-                    .iter()
-                    .any(|directory| path.starts_with(directory))
-                    || has_file_ancestor(&header_pair.source, path)?
+                if has_collapsed_destination_ancestor(
+                    &header_pair.source,
+                    &header_pair.destination,
+                    path,
+                )? || has_file_ancestor(&header_pair.source, path)?
                 {
                     return Ok(());
                 }
@@ -809,6 +801,119 @@ fn is_directory(path: &Path) -> io::Result<bool> {
         }
         Err(error) => Err(error),
     }
+}
+
+fn walk_leaf_directories(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    fn recurse(
+        root: &Path,
+        directory: &Path,
+        visit: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let mut has_content = false;
+        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if is_machinery(&entry.file_name()) {
+                continue;
+            }
+            has_content = true;
+            let path = entry.path();
+            if fs::symlink_metadata(&path)?.file_type().is_dir() {
+                recurse(root, &path, visit)?;
+            }
+        }
+        if directory != root && !has_content {
+            visit(
+                directory
+                    .strip_prefix(root)
+                    .expect("walked directory is under root"),
+            )?;
+        }
+        Ok(has_content)
+    }
+
+    recurse(root, root, &mut visit)?;
+    Ok(())
+}
+
+fn walk_destination_directory_deletes(
+    source_root: &Path,
+    destination_root: &Path,
+    mut visit: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    fn recurse(
+        source_root: &Path,
+        destination_root: &Path,
+        directory: &Path,
+        visit: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if is_machinery(&entry.file_name()) {
+                continue;
+            }
+            let path = entry.path();
+            if !fs::symlink_metadata(&path)?.file_type().is_dir() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(destination_root)
+                .expect("walked directory is under destination");
+            match fs::symlink_metadata(source_root.join(relative)) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    recurse(source_root, destination_root, &path, visit)?;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    if contains_machinery(&path) {
+                        recurse(source_root, destination_root, &path, visit)?;
+                    } else {
+                        visit(relative)?;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    recurse(source_root, destination_root, destination_root, &mut visit)
+}
+
+fn has_collapsed_destination_ancestor(
+    source_root: &Path,
+    destination_root: &Path,
+    path: &Path,
+) -> io::Result<bool> {
+    let mut ancestor = path.parent();
+    while let Some(relative) = ancestor {
+        let destination = destination_root.join(relative);
+        match fs::symlink_metadata(source_root.join(relative)) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                if destination.is_dir() && !contains_machinery(&destination) {
+                    return Ok(true);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        ancestor = relative.parent();
+    }
+    Ok(false)
 }
 
 fn has_file_ancestor(root: &Path, path: &Path) -> io::Result<bool> {
