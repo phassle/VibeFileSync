@@ -308,6 +308,7 @@ impl RunReporter {
 }
 
 pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
+    install_interrupt_handler()?;
     configured_pair(config_path, pair_name)?;
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, initial_plan) = plan::build(config_path, pair_name, options.excludes)?;
@@ -324,6 +325,7 @@ pub(crate) fn run_reviewed(
     reviewed_pair: crate::config::Pair,
     initial_plan: plan::Plan,
 ) -> Result<i32, AppError> {
+    install_interrupt_handler()?;
     let configured = configured_pair(config_path, pair_name)?;
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, notices) = crate::preconditions::resolve_pair(&configured)?;
@@ -366,9 +368,6 @@ fn execute_reviewed_plan(
     mut initial_plan: plan::Plan,
     render_plan: bool,
 ) -> Result<i32, AppError> {
-    crate::interrupt::install().map_err(|error| {
-        AppError::Interrupted(format!("could not install signal handler: {error}"))
-    })?;
     let RunOptions {
         yes,
         permanent_delete,
@@ -716,6 +715,12 @@ fn execute_reviewed_plan(
     } else {
         Ok(1)
     }
+}
+
+fn install_interrupt_handler() -> Result<(), AppError> {
+    crate::interrupt::install().map_err(|error| {
+        AppError::Interrupted(format!("could not install signal handler: {error}"))
+    })
 }
 
 /// A reconciliation scan is authoritative about the destination, but it must
