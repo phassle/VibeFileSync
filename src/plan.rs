@@ -11,7 +11,7 @@
 //! Everything here is strictly read-only — `plan` never writes to the
 //! source or destination.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -172,37 +172,50 @@ pub fn compute(
         destination_entries: dest.len(),
         ..Plan::default()
     };
-    let is_excluded = |rel: &Path| excludes.iter().any(|e| Path::new(e) == rel);
+    let is_excluded = |rel: &Path| excludes.iter().any(|exclude| Path::new(exclude) == rel);
+    let mut actionable_paths = BTreeSet::new();
 
     for (rel, src) in source {
-        if is_excluded(rel) {
-            plan.excluded += 1;
-            continue;
-        }
-
         if src.is_symlink && !supports_symlinks {
-            plan.errors.push(PlanError {
-                rel_path: rel.clone(),
-                message: "symlink not supported on exFAT destination".to_string(),
-            });
+            actionable_paths.insert(rel.clone());
+            if is_excluded(rel) {
+                plan.excluded += 1;
+            } else {
+                plan.errors.push(PlanError {
+                    rel_path: rel.clone(),
+                    message: "symlink not supported on exFAT destination".to_string(),
+                });
+            }
             continue;
         }
 
         match dest.get(rel) {
-            None => plan.copies.push(Action {
-                rel_path: rel.clone(),
-                bytes: src.size,
-                old_bytes: None,
-                reason: "new".to_string(),
-            }),
-            Some(dst) => {
-                if let Some(reason) = change_reason(src, dst) {
-                    plan.updates.push(Action {
+            None => {
+                actionable_paths.insert(rel.clone());
+                if is_excluded(rel) {
+                    plan.excluded += 1;
+                } else {
+                    plan.copies.push(Action {
                         rel_path: rel.clone(),
                         bytes: src.size,
-                        old_bytes: Some(dst.size),
-                        reason: reason.to_string(),
+                        old_bytes: None,
+                        reason: "new".to_string(),
                     });
+                }
+            }
+            Some(dst) => {
+                if let Some(reason) = change_reason(src, dst) {
+                    actionable_paths.insert(rel.clone());
+                    if is_excluded(rel) {
+                        plan.excluded += 1;
+                    } else {
+                        plan.updates.push(Action {
+                            rel_path: rel.clone(),
+                            bytes: src.size,
+                            old_bytes: Some(dst.size),
+                            reason: reason.to_string(),
+                        });
+                    }
                 } else {
                     plan.unchanged += 1;
                 }
@@ -217,6 +230,7 @@ pub fn compute(
             if source.contains_key(rel) {
                 continue;
             }
+            actionable_paths.insert(rel.clone());
             if is_excluded(rel) {
                 plan.excluded += 1;
                 continue;
@@ -232,10 +246,7 @@ pub fn compute(
 
     plan.unknown_excludes = excludes
         .iter()
-        .filter(|excluded| {
-            let path = Path::new(excluded);
-            !source.contains_key(path) && !(mode == Mode::Mirror && dest.contains_key(path))
-        })
+        .filter(|excluded| !actionable_paths.contains(Path::new(excluded)))
         .cloned()
         .collect();
 
@@ -650,14 +661,14 @@ fn stream_source_entry(
     }
 
     counts.scanned += 1;
-    if excludes
+    let is_excluded = excludes
         .iter()
-        .any(|exclude| Path::new(exclude) == relative)
-    {
-        counts.excluded += 1;
-        return Ok(());
-    }
+        .any(|exclude| Path::new(exclude) == relative);
     if source_metadata.file_type().is_symlink() && !supports_symlinks {
+        if is_excluded {
+            counts.excluded += 1;
+            return Ok(());
+        }
         counts.errors += 1;
         return emit(JsonPlanAction::Error {
             path: relative.to_path_buf(),
@@ -666,6 +677,10 @@ fn stream_source_entry(
     }
     match destination {
         None => {
+            if is_excluded {
+                counts.excluded += 1;
+                return Ok(());
+            }
             counts.copies += 1;
             emit(JsonPlanAction::Copy {
                 path: relative.to_path_buf(),
@@ -689,6 +704,10 @@ fn stream_source_entry(
             };
             match change_reason(&source_entry, &destination_entry) {
                 Some(reason) => {
+                    if is_excluded {
+                        counts.excluded += 1;
+                        return Ok(());
+                    }
                     counts.updates += 1;
                     emit(JsonPlanAction::Update {
                         path: relative.to_path_buf(),

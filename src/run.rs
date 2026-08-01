@@ -120,6 +120,14 @@ fn run_impl(
     }
     plan::report_unknown_excludes(&initial_plan);
 
+    if !initial_plan.errors.is_empty() {
+        eprintln!(
+            "vibesync: run blocked by {} plan error(s)",
+            initial_plan.errors.len()
+        );
+        return Ok(EXIT_BLOCKED_PLAN);
+    }
+
     let run_warnings = crate::preconditions::check_run(
         &pair,
         &initial_plan,
@@ -128,14 +136,6 @@ fn run_impl(
     )?;
     for warning in &run_warnings {
         eprintln!("{warning}");
-    }
-
-    if !initial_plan.errors.is_empty() {
-        eprintln!(
-            "vibesync: run blocked by {} plan error(s)",
-            initial_plan.errors.len()
-        );
-        return Ok(EXIT_BLOCKED_PLAN);
     }
 
     if !options.yes && !confirm(json_output)? {
