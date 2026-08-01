@@ -350,10 +350,6 @@ fn run_impl(
             action,
             journal.run_id(),
             options.permanent_delete,
-            plan.deletes.iter().any(|deletion| {
-                deletion.rel_path != action.rel_path
-                    && deletion.rel_path.starts_with(&action.rel_path)
-            }),
             json_output.then_some(ProgressDetails {
                 run_id: journal.run_id(),
                 operation,
@@ -559,7 +555,6 @@ fn copy_file(
     action: &Action,
     run_id: &str,
     permanent_delete: bool,
-    replace_emptied_directory: bool,
     progress: Option<ProgressDetails<'_>>,
 ) -> io::Result<ActionOutcome> {
     let source_before = fs::metadata(source)?;
@@ -568,11 +563,14 @@ fn copy_file(
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
     let result = (|| {
-        if replace_emptied_directory
+        if source_before.file_type().is_file()
             && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir())
-            && fs::read_dir(destination)?.next().is_none()
+            && !remove_empty_directory_tree(destination)?
         {
-            fs::remove_dir(destination)?;
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination path is a non-empty directory",
+            ));
         }
         copyfile_all_but_acls(source, temp, progress)?;
         crash_at("copy_complete");
@@ -918,6 +916,25 @@ fn remove_file(
     }
 }
 
+/// Removes an empty directory tree bottom-up after the reviewed child files
+/// have been moved to SafetyNet. Any unplanned entry keeps the obstruction
+/// intact, so a COPY never broadens a reviewed deletion into recursive data
+/// removal.
+fn remove_empty_directory_tree(directory: &Path) -> io::Result<bool> {
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if fs::symlink_metadata(&path)?.file_type().is_dir() {
+            if !remove_empty_directory_tree(&path)? {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+    fs::remove_dir(directory)?;
+    Ok(true)
+}
+
 /// Makes the old version visible in SafetyNet with its relative path kept
 /// intact. It is a same-volume rename rooted at the destination, never a
 /// copy, so the prior version remains independently restorable with Finder
@@ -1228,7 +1245,6 @@ mod tests {
             &action,
             "20260716T120000Z",
             false,
-            false,
             None,
         );
 
@@ -1266,7 +1282,6 @@ mod tests {
             &temp,
             &action,
             "20260716T120000Z",
-            false,
             false,
             None,
         );

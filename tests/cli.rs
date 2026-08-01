@@ -423,7 +423,14 @@ fn run_json_emits_a_pure_versioned_event_stream() {
 fn run_json_reports_partial_failures_without_non_json_stdout() {
     let fx = Fixture::new();
     fx.write_source("blocked.txt", "would be partial");
-    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    fs::create_dir_all(fx.destination.path().join("blocked.txt/_SafetyNet")).unwrap();
+    fs::write(
+        fx.destination
+            .path()
+            .join("blocked.txt/_SafetyNet/retained.txt"),
+        "must not be removed",
+    )
+    .unwrap();
     fx.add_photos_pair();
 
     let output = fx
@@ -655,7 +662,7 @@ fn plan_json_preserves_mirror_file_directory_conflict_actions() {
 
     let source_file = Fixture::new();
     source_file.write_source("node", "new file");
-    source_file.write_dest("node/old.txt", "old child");
+    source_file.write_dest("node/subdir/old.txt", "old child");
     source_file.add_photos_pair();
     let events = ndjson(
         &source_file
@@ -670,7 +677,7 @@ fn plan_json_preserves_mirror_file_directory_conflict_actions() {
         .any(|event| { event["op"] == "copy" && event["path"] == "node" }));
     assert!(events
         .iter()
-        .any(|event| { event["op"] == "delete" && event["path"] == "node/old.txt" }));
+        .any(|event| { event["op"] == "delete" && event["path"] == "node/subdir/old.txt" }));
     let output = source_file
         .cmd()
         .args(["run", "photos", "--yes", "--json"])
@@ -679,6 +686,21 @@ fn plan_json_preserves_mirror_file_directory_conflict_actions() {
     assert_eq!(output.status.code(), Some(EXIT_OK));
     assert_eq!(
         fs::read_to_string(source_file.destination.path().join("node")).unwrap(),
+        "new file"
+    );
+
+    let empty_directory = Fixture::new();
+    empty_directory.write_source("empty", "new file");
+    fs::create_dir(empty_directory.destination.path().join("empty")).unwrap();
+    empty_directory.add_photos_pair();
+    let output = empty_directory
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert_eq!(
+        fs::read_to_string(empty_directory.destination.path().join("empty")).unwrap(),
         "new file"
     );
 }
@@ -1238,9 +1260,16 @@ fn a_failed_copy_stops_remaining_mutations() {
     let fx = Fixture::new();
     fx.write_source("blocked.txt", "would be partial if published");
     fx.write_source("good.txt", "this copy should still finish");
-    // Directories are not plan entries, so this models a destination object
-    // appearing after the fresh scan; Slice 3 must refuse to replace it.
-    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    // The reserved subtree is never a planned delete, so it models an
+    // unreviewed obstruction that a COPY must not remove recursively.
+    fs::create_dir_all(fx.destination.path().join("blocked.txt/_SafetyNet")).unwrap();
+    fs::write(
+        fx.destination
+            .path()
+            .join("blocked.txt/_SafetyNet/retained.txt"),
+        "must not be removed",
+    )
+    .unwrap();
     fx.write_dest("would-be-deleted.txt", "keep me");
     fx.add_photos_pair();
 
