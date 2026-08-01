@@ -6,6 +6,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use crate::failure::FailureReason;
 use crate::journal::{Operation, RunStats};
 use crate::plan::{Action, Plan};
 
@@ -108,12 +109,12 @@ pub fn action_failed(
     context: Context<'_>,
     operation: Operation,
     action: &Action,
-    reason: &str,
+    reason: FailureReason,
 ) -> Value {
     json!({
         "schema": context.schema, "type": "action_failed", "run_id": context.run_id,
         "op": operation, "path": path_text(&action.rel_path), "result": "failed",
-        "bytes": action.bytes, "reason": crate::failure::normalize(reason), "warnings": [],
+        "bytes": action.bytes, "reason": reason, "warnings": [],
     })
 }
 
@@ -171,18 +172,18 @@ mod tests {
     }
 
     #[test]
-    fn journal_failure_uses_normalized_reason_codes() {
+    fn journal_failure_uses_typed_reason_codes() {
         let mismatch = action_failed(
             journal_context(),
             Operation::Copy,
             &action(),
-            "verify mismatch: size differs",
+            FailureReason::VerifyMismatch,
         );
         let source_changed = action_failed(
             journal_context(),
             Operation::Copy,
             &action(),
-            "source changed during copy",
+            FailureReason::SourceChanged,
         );
 
         assert_eq!(mismatch["reason"], "verify_mismatch");

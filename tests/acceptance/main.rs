@@ -6,6 +6,7 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -240,7 +241,12 @@ fn full_crash_and_fault_matrix_passes_on_real_filesystems() {
     exercise_update_replacement_parity(&images[0].1, images[0].0);
     exercise_f1_source_rewrite(&images[0].1, images[0].0);
     exercise_f2_truncated_temp(&images[0].1, images[0].0);
-    exercise_f3_stripped_xattr(&images[0].1, images[0].0);
+    for (filesystem, image) in &images {
+        exercise_metadata_matrix(image, *filesystem);
+    }
+    for (filesystem, image) in &images {
+        exercise_f3_stripped_xattr(image, *filesystem);
+    }
     exercise_f4_hash_tier_boundary(&images[0].1, images[0].0);
     exercise_f5_enospc();
     exercise_f6_strays(&images);
@@ -500,6 +506,179 @@ fn exercise_f3_stripped_xattr(image: &MountedImage, filesystem: Filesystem) {
         fs::read_to_string(case.destination.join("new.txt")).unwrap(),
         CONTENT
     );
+}
+
+fn exercise_metadata_matrix(image: &MountedImage, filesystem: Filesystem) {
+    let case = Case::create(image, filesystem, "metadata-matrix");
+    let source = case.source.path().join("new.txt");
+    let destination = case.destination.join("new.txt");
+    set_xattr_text(&source, "com.vibesync.acceptance", "custom-value");
+    set_resource_fork(&source, b"resource-fork");
+    set_xattr_hex(
+        &source,
+        "com.apple.FinderInfo",
+        &format!("54455854{}", "00".repeat(28)),
+    );
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+    let timestamped = Command::new("touch")
+        .args(["-t", "202001010000.01"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_command_success("metadata fixture timestamp", &timestamped);
+
+    let output = case
+        .command()
+        .args(["run", &case.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_command_success(&format!("{} metadata run", filesystem.slug), &output);
+    let events = output_events(&output);
+    let start = events
+        .iter()
+        .find(|event| event["type"] == "run_start")
+        .unwrap();
+    let degradations: Vec<_> = start["degradations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    let expected = if filesystem.slug == "exfat" {
+        vec![
+            "posix_permissions",
+            "acls",
+            "bsd_flags",
+            "timestamp_granularity",
+        ]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(degradations, expected, "{} degradations", filesystem.slug);
+
+    for name in ["com.vibesync.acceptance", "com.apple.FinderInfo"] {
+        assert_eq!(
+            read_xattr_hex(&source, name),
+            read_xattr_hex(&destination, name),
+            "{} must preserve {name}",
+            filesystem.slug
+        );
+    }
+    assert_eq!(
+        fs::read(source.join("..namedfork/rsrc")).unwrap(),
+        fs::read(destination.join("..namedfork/rsrc")).unwrap(),
+        "{} must preserve the resource fork",
+        filesystem.slug
+    );
+    let source_mtime = fs::metadata(&source).unwrap().modified().unwrap();
+    let destination_mtime = fs::metadata(&destination).unwrap().modified().unwrap();
+    let delta = source_mtime
+        .duration_since(destination_mtime)
+        .unwrap_or_else(|_| destination_mtime.duration_since(source_mtime).unwrap());
+    let allowed = if filesystem.slug == "exfat" {
+        Duration::from_millis(10)
+    } else {
+        Duration::ZERO
+    };
+    assert!(
+        delta <= allowed,
+        "{} timestamp delta {delta:?} exceeds {allowed:?}",
+        filesystem.slug
+    );
+    if filesystem.slug == "apfs" {
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            "APFS preserves POSIX mode"
+        );
+    }
+
+    let old_fork = read_xattr_hex(&destination, "com.apple.ResourceFork");
+    fs::write(&source, "replacement data\n").unwrap();
+    set_resource_fork(&source, b"replacement-fork");
+    let replacement_fork = read_xattr_hex(&source, "com.apple.ResourceFork");
+    let replacement = case
+        .command()
+        .args(["run", &case.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_command_success(
+        &format!("{} metadata replacement", filesystem.slug),
+        &replacement,
+    );
+    let replacement_events = output_events(&replacement);
+    let done = replacement_events
+        .iter()
+        .find(|event| event["type"] == "action_done")
+        .unwrap();
+    let archived = Path::new(done["safety_net"].as_str().unwrap());
+    assert_eq!(
+        read_xattr_hex(&destination, "com.apple.ResourceFork"),
+        replacement_fork,
+        "{} must publish the replacement resource fork",
+        filesystem.slug
+    );
+    assert_eq!(
+        read_xattr_hex(archived, "com.apple.ResourceFork"),
+        old_fork,
+        "{} must archive the prior resource fork",
+        filesystem.slug
+    );
+}
+
+fn set_xattr_text(path: &Path, name: &str, value: &str) {
+    let output = Command::new("xattr")
+        .args(["-w", name, value])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_command_success(&format!("set {name}"), &output);
+}
+
+fn set_xattr_hex(path: &Path, name: &str, value: &str) {
+    let output = Command::new("xattr")
+        .args(["-wx", name, value])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_command_success(&format!("set {name}"), &output);
+}
+
+fn set_resource_fork(path: &Path, value: &[u8]) {
+    let _ = Command::new("xattr")
+        .args(["-d", "com.apple.ResourceFork"])
+        .arg(path)
+        .output()
+        .unwrap();
+    let resource_source = path.with_extension("vibesync-resource.r");
+    let hex: String = value.iter().map(|byte| format!("{byte:02X}")).collect();
+    fs::write(
+        &resource_source,
+        format!("data 'TEST' (128) {{ $\"{hex}\" }};\n"),
+    )
+    .unwrap();
+    let output = Command::new("Rez")
+        .arg(&resource_source)
+        .args(["-o"])
+        .arg(path)
+        .output()
+        .unwrap();
+    fs::remove_file(resource_source).unwrap();
+    assert_command_success("create valid resource fork", &output);
+}
+
+fn read_xattr_hex(path: &Path, name: &str) -> String {
+    let output = Command::new("xattr")
+        .args(["-px", name])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_command_success(&format!("read {name}"), &output);
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .split_whitespace()
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 fn exercise_f4_hash_tier_boundary(image: &MountedImage, filesystem: Filesystem) {

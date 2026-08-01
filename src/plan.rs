@@ -158,38 +158,49 @@ fn walk(
     skip_apple_double: bool,
     mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
 ) -> io::Result<usize> {
+    enum Pending {
+        Directory(PathBuf),
+        File(PathBuf, Entry),
+    }
+
     let mut count = 0;
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![Pending::Directory(root.to_path_buf())];
 
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if is_machinery(&entry.file_name())
-                || (skip_apple_double && is_apple_double(&entry.path(), &entry.file_name()))
-            {
-                continue;
+    while let Some(pending) = stack.pop() {
+        match pending {
+            Pending::File(path, scanned) => {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("read_dir path is under root");
+                visit(rel, &scanned)?;
+                count += 1;
             }
-
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path)?;
-            let file_type = meta.file_type();
-
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
+            Pending::Directory(dir) => {
+                let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
+                entries.sort_by_key(|entry| entry.file_name());
+                for entry in entries.into_iter().rev() {
+                    if is_machinery(&entry.file_name())
+                        || (skip_apple_double && is_apple_double(&entry.path(), &entry.file_name()))
+                    {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let meta = fs::symlink_metadata(&path)?;
+                    let file_type = meta.file_type();
+                    if file_type.is_dir() {
+                        stack.push(Pending::Directory(path));
+                    } else {
+                        stack.push(Pending::File(
+                            path,
+                            Entry {
+                                size: meta.len(),
+                                mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                                is_symlink: file_type.is_symlink(),
+                            },
+                        ));
+                    }
+                }
             }
-
-            let rel = path
-                .strip_prefix(root)
-                .expect("read_dir path is under root")
-                .to_path_buf();
-            let scanned = Entry {
-                size: meta.len(),
-                mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                is_symlink: file_type.is_symlink(),
-            };
-            visit(&rel, &scanned)?;
-            count += 1;
         }
     }
 
@@ -767,20 +778,24 @@ fn prepare(config_path: &Path, pair_name: &str) -> Result<PlanSetup, AppError> {
             pair.source.display()
         )));
     }
-    let destination_type = pair
-        .destination
-        .is_dir()
-        .then(|| volume::filesystem_type(&pair.destination).ok())
-        .flatten();
+    let destination_type = if pair.destination.is_dir() {
+        Some(
+            volume::filesystem_type(&pair.destination)
+                .map_err(|error| scan_error(&pair.destination, error))?,
+        )
+    } else {
+        None
+    };
     let is_exfat = destination_type
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("exfat"));
     let supports_symlinks = !is_exfat;
-    let mtime_tolerance = if is_exfat {
-        Duration::from_secs(2)
-    } else {
-        Duration::ZERO
-    };
+    let mtime_tolerance = destination_type
+        .as_deref()
+        .map(volume::timestamp_granularity_for)
+        .transpose()
+        .map_err(|error| scan_error(&pair.destination, error))?
+        .unwrap_or(Duration::ZERO);
     Ok(PlanSetup {
         pair,
         supports_symlinks,
@@ -938,24 +953,37 @@ fn walk_stray_temps(
     root: &Path,
     mut visit: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<usize> {
+    enum Pending {
+        Directory(PathBuf),
+        Stray(PathBuf),
+    }
+
     if !root.is_dir() {
         return Ok(0);
     }
     let mut count = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if entry.file_name() == "_SafetyNet" {
-                continue;
-            }
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_dir() {
-                stack.push(path);
-            } else if is_stray_temp(&entry.file_name()) {
+    let mut stack = vec![Pending::Directory(root.to_path_buf())];
+    while let Some(pending) = stack.pop() {
+        match pending {
+            Pending::Stray(path) => {
                 visit(path.strip_prefix(root).expect("entry is under root"))?;
                 count += 1;
+            }
+            Pending::Directory(dir) => {
+                let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
+                entries.sort_by_key(|entry| entry.file_name());
+                for entry in entries.into_iter().rev() {
+                    if entry.file_name() == "_SafetyNet" {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_dir() {
+                        stack.push(Pending::Directory(path));
+                    } else if is_stray_temp(&entry.file_name()) {
+                        stack.push(Pending::Stray(path));
+                    }
+                }
             }
         }
     }
@@ -1041,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn exfat_timestamp_granularity_does_not_replan_a_published_file() {
+    fn timestamp_granularity_does_not_replan_a_published_file() {
         let source = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 11))]);
         let destination = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 10))]);
 

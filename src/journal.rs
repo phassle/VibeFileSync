@@ -153,7 +153,7 @@ impl Journal {
         &mut self,
         operation: Operation,
         action: &Action,
-        reason: &str,
+        reason: crate::failure::FailureReason,
     ) -> io::Result<()> {
         self.append(
             crate::event::action_failed(

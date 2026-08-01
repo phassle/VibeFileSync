@@ -8,6 +8,7 @@ use std::io;
 use std::os::raw::{c_int, c_void};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Mirrors `<sys/attr.h>`'s `struct attrlist`. `bitmapcount` must be
 /// `ATTR_BIT_MAP_COUNT` (5); the rest select which attribute groups to
@@ -132,6 +133,27 @@ pub fn expected_degradations(destination: &Path) -> Vec<&'static str> {
     }
 }
 
+/// Timestamp precision of the destination filesystem. Verification must not
+/// guess: an unknown filesystem is an unsupported metadata contract rather
+/// than an implicit one-second tolerance.
+pub fn timestamp_granularity(path: &Path) -> io::Result<Duration> {
+    let kind = filesystem_type(path)?;
+    timestamp_granularity_for(&kind)
+}
+
+pub fn timestamp_granularity_for(kind: &str) -> io::Result<Duration> {
+    match kind.to_ascii_lowercase().as_str() {
+        "apfs" => Ok(Duration::ZERO),
+        "exfat" => Ok(Duration::from_millis(10)),
+        "msdos" => Ok(Duration::from_secs(2)),
+        "hfs" => Ok(Duration::from_secs(1)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("unknown timestamp granularity for filesystem '{kind}'"),
+        )),
+    }
+}
+
 /// Finds the root of a currently mounted volume by its pinned UUID. This is
 /// deliberately a mount-table scan rather than a pathname heuristic: a
 /// remount at `/Volumes/Backup 1` must not be mistaken for the old path.
@@ -230,5 +252,29 @@ mod tests {
         let fs = filesystem_type(Path::new("/")).expect("root volume has a filesystem type");
         assert!(!fs.is_empty());
         assert!(fs.is_ascii());
+    }
+
+    #[test]
+    fn reports_actual_supported_timestamp_granularities() {
+        assert_eq!(timestamp_granularity_for("apfs").unwrap(), Duration::ZERO);
+        assert_eq!(
+            timestamp_granularity_for("exfat").unwrap(),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            timestamp_granularity_for("msdos").unwrap(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            timestamp_granularity_for("hfs").unwrap(),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_timestamp_granularity() {
+        let error = timestamp_granularity_for("mysteryfs").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("mysteryfs"));
     }
 }

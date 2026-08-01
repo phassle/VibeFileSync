@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
+use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action, StructuralConflict};
 
@@ -250,7 +251,7 @@ impl RunReporter {
         run_id: &str,
         operation: Operation,
         action: &Action,
-        error: &io::Error,
+        failure: &ActionFailure,
     ) -> Result<(), AppError> {
         match self {
             Self::Json => crate::ndjson::stdout(&crate::event::action_failed(
@@ -260,15 +261,15 @@ impl RunReporter {
                 },
                 operation,
                 action,
-                &error.to_string(),
+                failure.reason(),
             )),
             Self::Human => {
                 eprintln!(
-                    "vibesync: {} {} failed: {error}",
+                    "vibesync: {} {} failed: {failure}",
                     operation.as_str().to_ascii_uppercase(),
                     action.rel_path.display()
                 );
-                if error.raw_os_error() == Some(libc::ENOSPC) {
+                if failure.reason() == FailureReason::DestinationFull {
                     eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
                 }
                 Ok(())
@@ -437,11 +438,12 @@ fn execute_reviewed_plan(
                 reporter.cleaned(stray);
             }
             Err(error) => {
+                let failure = ActionFailure::from(error);
                 stats.counts.failed += 1;
                 journal
-                    .action_failed(Operation::Cleanup, &action, &error.to_string())
+                    .action_failed(Operation::Cleanup, &action, failure.reason())
                     .map_err(journal_runtime_error)?;
-                reporter.action_failed(journal.run_id(), Operation::Cleanup, &action, &error)?;
+                reporter.action_failed(journal.run_id(), Operation::Cleanup, &action, &failure)?;
                 journal.summary(&stats).map_err(journal_runtime_error)?;
                 reporter.summary(journal.run_id(), &stats)?;
                 return Ok(1);
@@ -468,11 +470,14 @@ fn execute_reviewed_plan(
             .action_start(*operation, action, None, None)
             .map_err(journal_runtime_error)?;
         reporter.action_start(journal.run_id(), *operation, action)?;
-        let error = io::Error::other("changed during reconciliation; rerun required");
+        let failure = ActionFailure::new(
+            FailureReason::ReconciliationChanged,
+            io::Error::other("changed during reconciliation; rerun required"),
+        );
         journal
-            .action_failed(*operation, action, &error.to_string())
+            .action_failed(*operation, action, failure.reason())
             .map_err(journal_runtime_error)?;
-        reporter.action_failed(journal.run_id(), *operation, action, &error)?;
+        reporter.action_failed(journal.run_id(), *operation, action, &failure)?;
         stats.counts.failed += 1;
     }
     for error in &plan.errors {
@@ -590,13 +595,13 @@ fn execute_reviewed_plan(
                     }
                 }
             }
-            Err(error) => {
+            Err(failure) => {
                 stats.counts.failed += 1;
                 journal
-                    .action_failed(operation, action, &error.to_string())
+                    .action_failed(operation, action, failure.reason())
                     .map_err(journal_runtime_error)?;
-                reporter.action_failed(journal.run_id(), operation, action, &error)?;
-                if error.kind() != io::ErrorKind::InvalidData {
+                reporter.action_failed(journal.run_id(), operation, action, &failure)?;
+                if failure.kind() != io::ErrorKind::InvalidData {
                     journal.summary(&stats).map_err(journal_runtime_error)?;
                     reporter.summary(journal.run_id(), &stats)?;
                     return Ok(1);
@@ -721,11 +726,12 @@ fn execute_delete_action(
             )?;
         }
         Err(error) => {
+            let failure = ActionFailure::from(error);
             stats.counts.failed += 1;
             journal
-                .action_failed(Operation::Delete, action, &error.to_string())
+                .action_failed(Operation::Delete, action, failure.reason())
                 .map_err(journal_runtime_error)?;
-            reporter.action_failed(journal.run_id(), Operation::Delete, action, &error)?;
+            reporter.action_failed(journal.run_id(), Operation::Delete, action, &failure)?;
         }
     }
     Ok(())
@@ -765,7 +771,7 @@ fn copy_file(
     action: &Action,
     options: CopyOptions<'_>,
     progress: &mut impl FnMut(u64) -> io::Result<()>,
-) -> io::Result<ActionOutcome> {
+) -> Result<ActionOutcome, ActionFailure> {
     let CopyOptions {
         run_id,
         permanent_delete,
@@ -780,7 +786,7 @@ fn copy_file(
         .parent()
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
-    let result = (|| {
+    let result: Result<ActionOutcome, ActionFailure> = (|| {
         if fs::symlink_metadata(source)?.file_type().is_file()
             && fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.file_type().is_dir())
             && !remove_reviewed_empty_directories(
@@ -789,10 +795,10 @@ fn copy_file(
                 reviewed_empty_directories,
             )?
         {
-            return Err(io::Error::new(
+            return Err(ActionFailure::from(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "destination path is a non-empty or unreviewed directory",
-            ));
+            )));
         }
         #[cfg(all(feature = "fault-injection", debug_assertions))]
         File::create(temp)?;
@@ -817,7 +823,9 @@ fn copy_file(
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
             .is_some_and(|path| Path::new(&path) == action.rel_path)
         {
-            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            return Err(ActionFailure::from(io::Error::from_raw_os_error(
+                libc::ENOSPC,
+            )));
         }
         fully_sync(temp)?;
         // Narrow issue-22 process-seam injection. ADR-0009's generic
@@ -832,7 +840,7 @@ fn copy_file(
             }; 2];
             let path = c_path(temp)?;
             if unsafe { libc::utimes(path.as_ptr(), epoch.as_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
+                return Err(io::Error::last_os_error().into());
             }
         }
         let verification = verify_temp(source, temp, action.bytes, full_verify)?;
@@ -1319,13 +1327,16 @@ impl TempVerification {
         self.size_mismatch || self.content_mismatch
     }
 
-    fn data_mismatch_error(&self) -> io::Error {
+    fn data_mismatch_error(&self) -> ActionFailure {
         let detail = if self.size_mismatch {
             "verify mismatch: size differs"
         } else {
             "verify mismatch: content differs"
         };
-        io::Error::new(io::ErrorKind::InvalidData, detail)
+        ActionFailure::new(
+            FailureReason::VerifyMismatch,
+            io::Error::new(io::ErrorKind::InvalidData, detail),
+        )
     }
 }
 
@@ -1347,20 +1358,14 @@ fn verify_temp(
             .duration_since(source_mtime)
             .expect("opposite order works")
     });
-    let destination_type = crate::volume::filesystem_type(temp).unwrap_or_default();
-    let timestamp_granularity = if destination_type.eq_ignore_ascii_case("exfat") {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_secs(1)
-    };
+    let timestamp_granularity = crate::volume::timestamp_granularity(temp)?;
     if delta > timestamp_granularity {
         warnings.push("modified time differs".to_string());
     }
-    // exFAT does not preserve POSIX extended attributes. They are an
-    // expected degradation, so they are outside this standard-tier spot
-    // check; capable filesystems must preserve the complete name set.
-    if !destination_type.eq_ignore_ascii_case("exfat") && xattr_names(source)? != xattr_names(temp)?
-    {
+    // macOS preserves extended attributes on exFAT through AppleDouble
+    // sidecars. Compare the file-facing name set on every filesystem; the
+    // scanner keeps the backing `._*` machinery out of sync content.
+    if xattr_names(source)? != xattr_names(temp)? {
         warnings.push("xattr names differ".to_string());
     }
     Ok(TempVerification {
@@ -1374,12 +1379,12 @@ fn revalidate_source(
     source: &Path,
     planned_source_mtime: std::time::SystemTime,
     planned_size: u64,
-) -> io::Result<()> {
+) -> Result<(), ActionFailure> {
     let source_final = fs::metadata(source)?;
     if source_final.len() != planned_size || source_final.modified()? != planned_source_mtime {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "source changed during copy",
+        return Err(ActionFailure::new(
+            FailureReason::SourceChanged,
+            io::Error::new(io::ErrorKind::InvalidData, "source changed during copy"),
         ));
     }
     Ok(())

@@ -589,6 +589,37 @@ fn plan_json_stream_has_versioned_rows_in_contract_order_and_pure_stdout() {
 }
 
 #[test]
+fn plan_json_action_order_is_deterministic_for_nested_trees() {
+    let fx = Fixture::new();
+    fx.write_source("b.txt", "b");
+    fx.write_source("a/z.txt", "z");
+    fx.write_source("a/a.txt", "a");
+    fx.write_dest("d.txt", "d");
+    fx.write_dest("c/x.txt", "x");
+    fx.add_photos_pair();
+
+    let action_paths = || {
+        let output = fx
+            .cmd()
+            .args(["plan", "photos", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(EXIT_OK));
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["type"] == "action")
+            .map(|row| row["path"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let expected = ["a/a.txt", "a/z.txt", "b.txt", "c/x.txt", "d.txt"];
+    assert_eq!(action_paths(), expected);
+    assert_eq!(action_paths(), expected);
+}
+
+#[test]
 fn relocated_json_plan_reports_notice_on_stderr_and_keeps_stdout_ndjson_only() {
     let fx = Fixture::new();
     let source = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -1331,6 +1362,69 @@ fn metadata_mismatch_publishes_structured_warning_and_exits_zero() {
         fs::read_to_string(fx.destination.path().join("metadata.txt")).unwrap(),
         "verified data"
     );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn apfs_one_second_mtime_delta_is_an_unexpected_metadata_mismatch() {
+    let fx = Fixture::new();
+    fx.write_source("metadata.txt", "verified data");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "apfs")
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:touch -A -000001 \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let done = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "metadata.txt")
+        .unwrap();
+    assert!(done["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning["code"] == "metadata_mismatch"
+            && warning["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("modified time"))
+    }));
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn unknown_filesystem_metadata_contract_aborts_before_mutation() {
+    let fx = Fixture::new();
+    fx.write_source("metadata.txt", "new data");
+    fx.write_dest("metadata.txt", "old");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "mysteryfs")
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("unknown timestamp granularity for filesystem 'mysteryfs'"));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("metadata.txt")).unwrap(),
+        "old"
+    );
+    assert!(!fx.destination.path().join("_SafetyNet").exists());
 }
 
 // --- Slice 11: Generic transition fault injection (issue #25) ---
@@ -3100,7 +3194,7 @@ fn post_cleanup_new_plan_error_is_partial_and_never_executes_unreviewed_scope() 
     assert!(rows.iter().any(|row| {
         row["type"] == "action_failed"
             && row["path"] == "drift.txt"
-            && row["reason"] == "changed during reconciliation; rerun required"
+            && row["reason"] == "reconciliation_changed"
     }));
     assert_eq!(rows.last().unwrap()["result"], "partial");
 }
