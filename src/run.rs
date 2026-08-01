@@ -402,7 +402,9 @@ fn execute_reviewed_plan(
         return Ok(EXIT_OK);
     }
 
-    install_interrupt_handler()?;
+    let blocked_signals = crate::interrupt::block().map_err(|error| {
+        AppError::Interrupted(format!("could not block interruption signals: {error}"))
+    })?;
     let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
     journal
         .run_start(pair_name, &initial_plan, &run_warnings, &degradations)
@@ -415,6 +417,10 @@ fn execute_reviewed_plan(
         &run_warnings,
         &initial_plan,
     )?;
+    install_interrupt_handler()?;
+    blocked_signals.restore().map_err(|error| {
+        AppError::Interrupted(format!("could not restore interruption signals: {error}"))
+    })?;
     crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
     let mut stats = RunStats {
         counts: Counts {
