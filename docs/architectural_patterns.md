@@ -58,7 +58,7 @@ Keep the append-only Journal as forensic/history output, never planning authorit
 
 ## Deterministic, versioned boundaries
 
-Prefer behavior scripts and agents can classify without heuristics.
+Prefer deterministic behavior that scripts and agents can classify without heuristics.
 
 - `BTreeMap` makes config pairs and scan results stable (`src/config.rs:50`, `src/plan.rs:105`).
 - Strict `deny_unknown_fields` and config version checks abort on drift (`src/config.rs:31`, `src/config.rs:113`).
