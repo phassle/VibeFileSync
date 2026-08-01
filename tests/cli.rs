@@ -1030,6 +1030,46 @@ fn run_excludes_exact_plan_json_paths_and_reports_unknown_paths() {
         .contains("exclude path not found in plan: missing.txt"));
 }
 
+#[test]
+fn exclusions_only_match_unfiltered_action_and_error_rows() {
+    let fx = Fixture::new();
+    fx.write_source("unchanged.txt", "same");
+    fs::hard_link(
+        fx.source.path().join("unchanged.txt"),
+        fx.destination.path().join("unchanged.txt"),
+    )
+    .unwrap();
+    fx.write_dest("destination-only.txt", "existing");
+    fx.add_pair("photos", "update");
+
+    let output = fx
+        .cmd()
+        .args([
+            "plan",
+            "photos",
+            "--exclude",
+            "unchanged.txt",
+            "--exclude",
+            "destination-only.txt",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("unchanged 1"), "{stdout}");
+    assert!(stdout.contains("excluded 0"), "{stdout}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("exclude path not found in plan: unchanged.txt"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("exclude path not found in plan: destination-only.txt"),
+        "{stderr}"
+    );
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn included_error_blocks_yes_and_interactive_runs_until_excluded() {
@@ -1068,6 +1108,30 @@ fn included_error_blocks_yes_and_interactive_runs_until_excluded() {
         "safe"
     );
     assert!(!fx.destination.path().join("link").exists());
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn included_plan_error_takes_precedence_over_a_failing_run_precondition() {
+    let fx = Fixture::new();
+    fx.write_source("safe.txt", "safe");
+    std::os::unix::fs::symlink("target", fx.source.path().join("link")).unwrap();
+    fx.add_photos_pair();
+    let before = Fixture::snapshot(fx.destination.path());
+
+    let output = fx
+        .cmd()
+        .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+        .env("VIBESYNC_TEST_AVAILABLE_BYTES", "0")
+        .args(["run", "photos", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_BLOCKED_PLAN));
+    assert_eq!(Fixture::snapshot(fx.destination.path()), before);
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("run blocked by 1 plan error(s)"));
 }
 
 #[test]
