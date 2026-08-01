@@ -12,7 +12,7 @@
 //! source or destination.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -195,17 +195,25 @@ fn walk(
     skip_apple_double: bool,
     mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
 ) -> io::Result<usize> {
-    enum Pending {
-        Directory(PathBuf),
-        File(PathBuf, Entry),
-    }
-
-    let mut count = 0;
-    let mut stack = vec![Pending::Directory(root.to_path_buf())];
-
-    while let Some(pending) = stack.pop() {
-        match pending {
-            Pending::File(path, scanned) => {
+    fn recurse(
+        root: &Path,
+        directory: &Path,
+        skip_apple_double: bool,
+        visit: &mut impl FnMut(&Path, &Entry) -> io::Result<()>,
+        count: &mut usize,
+    ) -> io::Result<()> {
+        for_each_sorted_entry(directory, |entry| {
+            if is_machinery(&entry.file_name())
+                || (skip_apple_double && is_apple_double(&entry.path(), &entry.file_name()))
+            {
+                return Ok(());
+            }
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path)?;
+            let file_type = meta.file_type();
+            if file_type.is_dir() {
+                recurse(root, &path, skip_apple_double, visit, count)?;
+            } else {
                 #[cfg(all(feature = "fault-injection", debug_assertions))]
                 if let Ok(delay) = std::env::var("VIBESYNC_TEST_PLAN_SCAN_DELAY_MS") {
                     std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
@@ -213,39 +221,47 @@ fn walk(
                 let rel = path
                     .strip_prefix(root)
                     .expect("read_dir path is under root");
-                visit(rel, &scanned)?;
-                count += 1;
+                visit(
+                    rel,
+                    &Entry {
+                        size: meta.len(),
+                        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                        is_symlink: file_type.is_symlink(),
+                    },
+                )?;
+                *count += 1;
             }
-            Pending::Directory(dir) => {
-                let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
-                entries.sort_by_key(|entry| entry.file_name());
-                for entry in entries.into_iter().rev() {
-                    if is_machinery(&entry.file_name())
-                        || (skip_apple_double && is_apple_double(&entry.path(), &entry.file_name()))
-                    {
-                        continue;
-                    }
-                    let path = entry.path();
-                    let meta = fs::symlink_metadata(&path)?;
-                    let file_type = meta.file_type();
-                    if file_type.is_dir() {
-                        stack.push(Pending::Directory(path));
-                    } else {
-                        stack.push(Pending::File(
-                            path,
-                            Entry {
-                                size: meta.len(),
-                                mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                                is_symlink: file_type.is_symlink(),
-                            },
-                        ));
-                    }
-                }
-            }
-        }
+            Ok(())
+        })
     }
 
+    let mut count = 0;
+    recurse(root, root, skip_apple_double, &mut visit, &mut count)?;
     Ok(count)
+}
+
+fn for_each_sorted_entry(
+    directory: &Path,
+    mut visit: impl FnMut(fs::DirEntry) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut previous: Option<OsString> = None;
+    loop {
+        let mut next: Option<fs::DirEntry> = None;
+        for candidate in fs::read_dir(directory)? {
+            let candidate = candidate?;
+            let name = candidate.file_name();
+            if previous.as_ref().is_some_and(|previous| name <= *previous)
+                || next.as_ref().is_some_and(|next| name >= next.file_name())
+            {
+                continue;
+            }
+            next = Some(candidate);
+        }
+        let Some(next) = next else { break };
+        previous = Some(next.file_name());
+        visit(next)?;
+    }
+    Ok(())
 }
 
 /// Computes the Dry-run diff. Pure over the two scanned trees:
@@ -691,12 +707,16 @@ pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
             &header_pair.destination,
             setup.skip_apple_double,
             |path, entry| {
-                if has_collapsed_destination_ancestor(
-                    &header_pair.source,
-                    &header_pair.destination,
-                    path,
-                )? || has_file_ancestor(&header_pair.source, path)?
-                {
+                let collapsed = header_pair.mode == Mode::Mirror
+                    && has_collapsed_destination_ancestor(
+                        &header_pair.source,
+                        &header_pair.destination,
+                        path,
+                    )?;
+                if collapsed || has_file_ancestor(&header_pair.source, path)? {
+                    if header_pair.mode == Mode::Mirror {
+                        stats.scanned += 1;
+                    }
                     return Ok(());
                 }
                 let source = fs::symlink_metadata(header_pair.source.join(path));
@@ -813,18 +833,17 @@ fn walk_leaf_directories(
         visit: &mut impl FnMut(&Path) -> io::Result<()>,
     ) -> io::Result<bool> {
         let mut has_content = false;
-        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
+        for_each_sorted_entry(directory, |entry| {
             if is_machinery(&entry.file_name()) {
-                continue;
+                return Ok(());
             }
             has_content = true;
             let path = entry.path();
             if fs::symlink_metadata(&path)?.file_type().is_dir() {
                 recurse(root, &path, visit)?;
             }
-        }
+            Ok(())
+        })?;
         if directory != root && !has_content {
             visit(
                 directory
@@ -850,15 +869,13 @@ fn walk_destination_directory_deletes(
         directory: &Path,
         visit: &mut impl FnMut(&Path) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
+        for_each_sorted_entry(directory, |entry| {
             if is_machinery(&entry.file_name()) {
-                continue;
+                return Ok(());
             }
             let path = entry.path();
             if !fs::symlink_metadata(&path)?.file_type().is_dir() {
-                continue;
+                return Ok(());
             }
             let relative = path
                 .strip_prefix(destination_root)
@@ -882,8 +899,8 @@ fn walk_destination_directory_deletes(
                 }
                 Err(error) => return Err(error),
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     recurse(source_root, destination_root, destination_root, &mut visit)
@@ -1113,6 +1130,7 @@ fn add_directory_actions(
             reason: "new directory".into(),
             structural_conflict: None,
         });
+        plan.scanned += 1;
         plan.directory_copies.insert(path.clone());
     }
     if mode == Mode::Mirror {
@@ -1138,6 +1156,7 @@ fn add_directory_actions(
                 reason: "directory not in source".into(),
                 structural_conflict: None,
             });
+            plan.scanned += 1;
             plan.directory_deletes.insert(path.clone());
         }
     }

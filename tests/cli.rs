@@ -1080,6 +1080,11 @@ fn mirror_preserves_empty_directory_shape_while_update_remains_additive() {
     assert!(rows.iter().any(|row| {
         row["type"] == "action" && row["op"] == "delete" && row["path"] == "destination-empty"
     }));
+    assert_eq!(rows.last().unwrap()["counts"]["scanned"], 2);
+    let human = mirror.cmd().args(["plan", "photos"]).output().unwrap();
+    assert!(String::from_utf8(human.stdout)
+        .unwrap()
+        .contains("Scanned 2"));
     mirror
         .cmd()
         .args(["run", "photos", "--yes"])
