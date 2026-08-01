@@ -9,6 +9,8 @@ use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 
 const CONTENT: &str = "complete source contents\n";
 
@@ -37,6 +39,10 @@ struct MountedImage {
 
 impl MountedImage {
     fn create(filesystem: Filesystem) -> Self {
+        Self::create_sized(filesystem, "128m")
+    }
+
+    fn create_sized(filesystem: Filesystem, size: &str) -> Self {
         let root = tempfile::Builder::new()
             .prefix(&format!("vibesync-{}-acceptance-", filesystem.slug))
             .tempdir()
@@ -54,7 +60,7 @@ impl MountedImage {
             .args([
                 "create",
                 "-size",
-                "128m",
+                size,
                 "-type",
                 "SPARSE",
                 "-fs",
@@ -135,6 +141,15 @@ struct Case {
 
 impl Case {
     fn create(image: &MountedImage, filesystem: Filesystem, transition: &str) -> Self {
+        Self::create_mode(image, filesystem, transition, "mirror")
+    }
+
+    fn create_mode(
+        image: &MountedImage,
+        filesystem: Filesystem,
+        transition: &str,
+        mode: &str,
+    ) -> Self {
         let pair = format!("n-{}-{}", filesystem.slug, transition.replace('_', "-"));
         let xdg = tempfile::tempdir().expect("case config home");
         let home = tempfile::tempdir().expect("case state home");
@@ -179,7 +194,7 @@ impl Case {
                 "--destination",
                 case.destination.to_str().unwrap(),
                 "--mode",
-                "mirror",
+                mode,
             ])
             .output()
             .expect("pair add starts");
@@ -212,14 +227,30 @@ impl Case {
 }
 
 #[test]
-fn new_file_crash_transitions_converge_on_apfs_and_exfat() {
+fn full_crash_and_fault_matrix_passes_on_real_filesystems() {
     let mut images: Vec<_> = FILESYSTEMS
         .iter()
         .copied()
         .map(|filesystem| (filesystem, MountedImage::create(filesystem)))
         .collect();
 
-    for (filesystem, image) in &images {
+    exercise_new_file_crash_transitions(&images);
+    exercise_replacement_crash_transitions(&images);
+    exercise_deletion_crash_transitions(&images);
+    exercise_update_replacement_parity(&images[0].1, images[0].0);
+    exercise_f1_source_rewrite(&images[0].1, images[0].0);
+    exercise_f2_truncated_temp(&images[0].1, images[0].0);
+    exercise_f3_stripped_xattr(&images[0].1, images[0].0);
+    exercise_f4_hash_tier_boundary(&images[0].1, images[0].0);
+    exercise_f5_enospc();
+    exercise_f6_strays(&images);
+    exercise_f8_concurrent_run(&images[0].1, images[0].0);
+
+    detach_all(&mut images);
+}
+
+fn exercise_new_file_crash_transitions(images: &[(Filesystem, MountedImage)]) {
+    for (filesystem, image) in images {
         for transition in [
             "temp_created",
             "copy_complete",
@@ -231,18 +262,572 @@ fn new_file_crash_transitions_converge_on_apfs_and_exfat() {
             exercise_new_file_cell(image, *filesystem, transition);
         }
     }
+}
 
-    let mut teardown_errors = Vec::new();
-    for (filesystem, image) in &mut images {
-        if let Err(error) = image.detach() {
-            teardown_errors.push(format!("{} teardown: {error}", filesystem.slug));
+fn exercise_replacement_crash_transitions(images: &[(Filesystem, MountedImage)]) {
+    for (filesystem, image) in images {
+        for transition in [
+            "temp_created",
+            "copy_complete",
+            "verify_complete",
+            "source_revalidated",
+            "archived",
+            "publish_complete",
+            "action_done_written",
+        ] {
+            exercise_replacement_cell(image, *filesystem, transition);
         }
     }
+}
+
+fn exercise_deletion_crash_transitions(images: &[(Filesystem, MountedImage)]) {
+    for (filesystem, image) in images {
+        for transition in ["archived", "action_done_written"] {
+            exercise_deletion_cell(image, *filesystem, transition);
+        }
+    }
+}
+
+fn exercise_deletion_cell(image: &MountedImage, filesystem: Filesystem, transition: &str) {
+    let label = format!("{}:deletion:{transition}", filesystem.slug);
+    let case = Case::create(image, filesystem, &format!("deletion-{transition}"));
+    fs::remove_file(case.source.path().join("new.txt")).unwrap();
+    fs::write(
+        case.destination.join("deleted.txt"),
+        "old deleted content\n",
+    )
+    .unwrap();
+
+    let crashed = case
+        .command()
+        .env("VIBESYNC_TEST_CRASH_AT", transition)
+        .args(["run", &case.pair, "--yes"])
+        .output()
+        .expect("deletion crash starts");
+    assert_eq!(crashed.status.signal(), Some(libc::SIGABRT), "{label}");
+    let journals = case.journals();
+    let journal = fs::read_to_string(&journals[0]).unwrap();
+    let run_id = journals[0].file_stem().unwrap().to_str().unwrap();
+    let archive = case
+        .destination
+        .join("_SafetyNet")
+        .join(run_id)
+        .join("deleted.txt");
+
     assert!(
-        teardown_errors.is_empty(),
-        "suite-owned image teardown failed after every detach was attempted: {}",
-        teardown_errors.join("; ")
+        !case.destination.join("deleted.txt").exists(),
+        "{label}: I1"
     );
+    assert_eq!(
+        fs::read_to_string(&archive).unwrap(),
+        "old deleted content\n",
+        "{label}: I1 archived deletion"
+    );
+    assert!(machinery_temps(&case.destination).is_empty(), "{label}: I2");
+    assert_crashed_records_are_honest(&case, &label, &journal, transition);
+    assert_plan_hides_machinery(&case, &label);
+    assert_eq!(
+        fs::read_to_string(case.destination.join("_SafetyNet/manual/protected.txt")).unwrap(),
+        "protected\n",
+        "{label}: I5 post-crash machinery"
+    );
+
+    let rerun = case
+        .command()
+        .args(["run", &case.pair, "--yes"])
+        .output()
+        .expect("deletion convergence rerun starts");
+    assert_command_success(&format!("{label}: I3 rerun"), &rerun);
+    assert!(
+        !case.destination.join("deleted.txt").exists(),
+        "{label}: I3"
+    );
+    assert_eq!(
+        fs::read_to_string(&archive).unwrap(),
+        "old deleted content\n",
+        "{label}: I1 post-rerun"
+    );
+    assert!(
+        machinery_temps(&case.destination).is_empty(),
+        "{label}: I2 post-rerun"
+    );
+    assert_eq!(
+        fs::read_to_string(case.destination.join("_SafetyNet/manual/protected.txt")).unwrap(),
+        "protected\n",
+        "{label}: I5"
+    );
+    assert_eq!(
+        assert_plan_hides_machinery(&case, &label),
+        0,
+        "{label}: I3/I5"
+    );
+    let rerun_events = assert_rerun_records_are_honest(&case, &label, &journals[0], &journal);
+    assert!(
+        !rerun_events
+            .iter()
+            .any(|event| event["type"] == "action_start"),
+        "{label}: D1/D2 rerun must plan and execute no actions"
+    );
+    assert_eq!(
+        rerun_events.last().unwrap()["counts"]["planned"],
+        0,
+        "{label}: D1/D2 rerun plan must be empty"
+    );
+}
+
+fn exercise_update_replacement_parity(image: &MountedImage, filesystem: Filesystem) {
+    let mirror = Case::create_mode(image, filesystem, "u1-mirror", "mirror");
+    let update = Case::create_mode(image, filesystem, "u1-update", "update");
+    for case in [&mirror, &update] {
+        fs::write(case.destination.join("new.txt"), "old\n").unwrap();
+    }
+
+    let mirror_output = mirror
+        .command()
+        .args(["run", &mirror.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    let update_output = update
+        .command()
+        .args(["run", &update.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_command_success("U1 Mirror", &mirror_output);
+    assert_command_success("U1 Update", &update_output);
+
+    assert_eq!(
+        visible_files(&mirror.destination, false),
+        visible_files(&update.destination, false),
+        "U1 destination parity"
+    );
+    assert_eq!(
+        safety_net_payloads(&mirror.destination),
+        safety_net_payloads(&update.destination),
+        "U1 SafetyNet parity"
+    );
+    assert_eq!(
+        normalized_action_events(&mirror.journals()[0]),
+        normalized_action_events(&update.journals()[0]),
+        "U1 Journal action parity"
+    );
+}
+
+fn exercise_f1_source_rewrite(image: &MountedImage, filesystem: Filesystem) {
+    let case = Case::create(image, filesystem, "f1-source-rewrite");
+    fs::write(case.destination.join("new.txt"), "old\n").unwrap();
+
+    let failed = case
+        .command()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:printf 'rewritten source with different size\\n' > \"$VIBESYNC_TEST_SOURCE\"",
+        )
+        .args(["run", &case.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1), "F1 exit");
+    assert_event_reason(&failed, "source_changed");
+    assert_eq!(
+        fs::read_to_string(case.destination.join("new.txt")).unwrap(),
+        "old\n"
+    );
+    assert!(safety_net_files_named(&case.destination, "new.txt").is_empty());
+
+    let rerun = case
+        .command()
+        .args(["run", &case.pair, "--yes"])
+        .output()
+        .unwrap();
+    assert_command_success("F1 rerun", &rerun);
+    assert_eq!(
+        fs::read_to_string(case.destination.join("new.txt")).unwrap(),
+        "rewritten source with different size\n"
+    );
+}
+
+fn exercise_f2_truncated_temp(image: &MountedImage, filesystem: Filesystem) {
+    let case = Case::create(image, filesystem, "f2-truncated-temp");
+    fs::write(case.destination.join("new.txt"), "old\n").unwrap();
+
+    let failed = case
+        .command()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:: > \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", &case.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1), "F2 exit");
+    assert_event_reason(&failed, "verify_mismatch");
+    assert_eq!(
+        fs::read_to_string(case.destination.join("new.txt")).unwrap(),
+        "old\n"
+    );
+    assert!(
+        machinery_temps(&case.destination).is_empty(),
+        "F2 removes rejected temp"
+    );
+}
+
+fn exercise_f3_stripped_xattr(image: &MountedImage, filesystem: Filesystem) {
+    let case = Case::create(image, filesystem, "f3-xattr");
+    let xattr = Command::new("xattr")
+        .args(["-w", "com.vibesync.acceptance", "kept"])
+        .arg(case.source.path().join("new.txt"))
+        .output()
+        .unwrap();
+    assert_command_success("F3 fixture xattr", &xattr);
+
+    let output = case
+        .command()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:xattr -d com.vibesync.acceptance \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", &case.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_command_success("F3 run", &output);
+    let events = output_events(&output);
+    let done = events
+        .iter()
+        .find(|event| event["type"] == "action_done")
+        .unwrap();
+    assert_eq!(done["warnings"][0]["code"], "metadata_mismatch");
+    assert!(events.last().unwrap()["warnings"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        fs::read_to_string(case.destination.join("new.txt")).unwrap(),
+        CONTENT
+    );
+}
+
+fn exercise_f4_hash_tier_boundary(image: &MountedImage, filesystem: Filesystem) {
+    let standard = Case::create(image, filesystem, "f4-standard");
+    let full = Case::create(image, filesystem, "f4-full");
+    for case in [&standard, &full] {
+        fs::write(case.source.path().join("new.txt"), "ABCD").unwrap();
+        fs::write(case.destination.join("new.txt"), "old").unwrap();
+    }
+    let injection = "copy_complete:printf X | dd of=\"$VIBESYNC_TEST_TEMP\" bs=1 seek=2 conv=notrunc 2>/dev/null";
+
+    let standard_output = standard
+        .command()
+        .env("VIBESYNC_TEST_EXEC_AT", injection)
+        .args(["run", &standard.pair, "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_command_success("F4 standard", &standard_output);
+    assert_eq!(
+        fs::read_to_string(standard.destination.join("new.txt")).unwrap(),
+        "ABXD"
+    );
+
+    let full_output = full
+        .command()
+        .env("VIBESYNC_TEST_EXEC_AT", injection)
+        .args(["run", &full.pair, "--json", "--yes", "--verify"])
+        .output()
+        .unwrap();
+    assert_eq!(full_output.status.code(), Some(1), "F4 full exit");
+    assert_event_reason(&full_output, "verify_mismatch");
+    assert_eq!(
+        fs::read_to_string(full.destination.join("new.txt")).unwrap(),
+        "old"
+    );
+}
+
+fn exercise_f5_enospc() {
+    for filesystem in FILESYSTEMS {
+        let mut image = MountedImage::create_sized(filesystem, "32m");
+        let case = Case::create(&image, filesystem, "f5-enospc");
+        fs::write(case.source.path().join("new.txt"), vec![b'n'; 1024 * 1024]).unwrap();
+        fs::write(case.destination.join("new.txt"), "old\n").unwrap();
+        let filler = case.destination.join("filler.bin");
+
+        let failed = case
+            .command()
+            .env(
+                "VIBESYNC_TEST_EXEC_AT",
+                "temp_created:dd if=/dev/zero of=\"$(dirname \"$VIBESYNC_TEST_DESTINATION\")/filler.bin\" bs=1m count=128 2>/dev/null || true",
+            )
+            .args(["run", &case.pair, "--json", "--yes", "--ignore-space-check"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            failed.status.code(),
+            Some(1),
+            "F5 {} expected ENOSPC: stdout={} stderr={}",
+            filesystem.slug,
+            String::from_utf8_lossy(&failed.stdout),
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert_event_reason(&failed, "destination_full");
+        assert_eq!(
+            fs::read_to_string(case.destination.join("new.txt")).unwrap(),
+            "old\n",
+            "F5 {}: I1 old version",
+            filesystem.slug
+        );
+        assert!(
+            safety_net_files_named(&case.destination, "new.txt").is_empty(),
+            "F5 {}: I1 failure occurred before archive",
+            filesystem.slug
+        );
+        assert!(
+            machinery_temps(&case.destination).is_empty(),
+            "F5: I2 temp cleanup"
+        );
+        let events = output_events(&failed);
+        assert_eq!(
+            events.last().unwrap()["result"],
+            "partial",
+            "F5: I4 honest summary"
+        );
+        assert_plan_hides_machinery(&case, &format!("F5 {}", filesystem.slug));
+
+        fs::remove_file(&filler).unwrap();
+        let rerun = case
+            .command()
+            .args(["run", &case.pair, "--yes"])
+            .output()
+            .unwrap();
+        assert_command_success(&format!("F5 {} rerun", filesystem.slug), &rerun);
+        assert_eq!(
+            fs::read(case.destination.join("new.txt")).unwrap(),
+            vec![b'n'; 1024 * 1024],
+            "F5 {}: I3 converged",
+            filesystem.slug
+        );
+        assert!(
+            safety_net_files_named(&case.destination, "new.txt")
+                .iter()
+                .any(|path| fs::read_to_string(path).unwrap() == "old\n"),
+            "F5 {}: I1 old replacement survived the convergence rerun",
+            filesystem.slug
+        );
+        assert!(
+            machinery_temps(&case.destination).is_empty(),
+            "F5: I3 cleanup"
+        );
+        assert_eq!(
+            fs::read_to_string(case.destination.join("_SafetyNet/manual/protected.txt")).unwrap(),
+            "protected\n",
+            "F5 {}: I5 machinery",
+            filesystem.slug
+        );
+        assert_eq!(
+            assert_plan_hides_machinery(&case, &format!("F5 {} post-rerun", filesystem.slug)),
+            0,
+            "F5 {}: I3/I5 post-rerun plan",
+            filesystem.slug
+        );
+        assert!(
+            case.journals().iter().any(|journal| {
+                fs::read_to_string(journal).unwrap().lines().any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .ok()
+                        .is_some_and(|event| {
+                            event["type"] == "summary" && event["result"] == "success"
+                        })
+                })
+            }),
+            "F5 {}: I4 rerun Journal must complete honestly",
+            filesystem.slug
+        );
+        image.detach().unwrap();
+    }
+}
+
+fn exercise_f6_strays(images: &[(Filesystem, MountedImage)]) {
+    for (filesystem, image) in images {
+        let case = Case::create(image, *filesystem, "f6-strays");
+        let stray = case.destination.join(".orphan.vibesync-tmp-fabricated");
+        fs::write(&stray, "orphaned").unwrap();
+        let before = tree_payloads(&case.destination);
+        for args in [vec!["plan", &case.pair], vec!["status", &case.pair]] {
+            let output = case.command().args(args).output().unwrap();
+            assert_command_success("F6 read-only command", &output);
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(".orphan.vibesync-tmp-fabricated"),
+                "F6 command did not report the planted stray: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(
+                tree_payloads(&case.destination),
+                before,
+                "F6 read-only claim"
+            );
+        }
+        let run = case
+            .command()
+            .args(["run", &case.pair, "--yes"])
+            .output()
+            .unwrap();
+        assert_command_success("F6 cleanup run", &run);
+        assert!(!stray.exists(), "F6 stray cleaned");
+        let journal = fs::read_to_string(case.journals().last().unwrap()).unwrap();
+        assert!(
+            journal.contains("\"op\":\"cleanup\""),
+            "F6 cleanup journaled"
+        );
+    }
+}
+
+fn exercise_f8_concurrent_run(image: &MountedImage, filesystem: Filesystem) {
+    let case = Case::create(image, filesystem, "f8-lock");
+    let mut first = case
+        .command()
+        .env("VIBESYNC_TEST_EXEC_AT", "temp_created:sleep 2")
+        .args(["run", &case.pair, "--yes"])
+        .spawn()
+        .unwrap();
+    let mut reached_transition = false;
+    for _ in 0..100 {
+        if !machinery_temps(&case.destination).is_empty() {
+            reached_transition = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        reached_transition,
+        "F8 first run did not reach the held transition"
+    );
+    let before_second = tree_payloads(&case.destination);
+    let second = case
+        .command()
+        .args(["run", &case.pair, "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(2), "F8 lock contention");
+    assert!(String::from_utf8_lossy(&second.stderr).contains("already in progress"));
+    assert_eq!(
+        tree_payloads(&case.destination),
+        before_second,
+        "F8 second run wrote"
+    );
+    assert!(first.wait().unwrap().success(), "F8 first run completes");
+}
+
+fn exercise_replacement_cell(image: &MountedImage, filesystem: Filesystem, transition: &str) {
+    let label = format!("{}:replacement:{transition}", filesystem.slug);
+    let case = Case::create(image, filesystem, &format!("replacement-{transition}"));
+    fs::write(case.destination.join("new.txt"), "old\n").expect("old replacement fixture");
+
+    let crashed = case
+        .command()
+        .env("VIBESYNC_TEST_CRASH_AT", transition)
+        .args(["run", &case.pair, "--yes"])
+        .output()
+        .expect("replacement crash starts");
+    assert_eq!(crashed.status.signal(), Some(libc::SIGABRT), "{label}");
+
+    let crashed_journals = case.journals();
+    assert_eq!(crashed_journals.len(), 1, "{label}: one crashed Journal");
+    let crashed_journal = fs::read_to_string(&crashed_journals[0]).unwrap();
+    let run_id = crashed_journals[0].file_stem().unwrap().to_str().unwrap();
+    let final_path = case.destination.join("new.txt");
+    let archive = case
+        .destination
+        .join("_SafetyNet")
+        .join(run_id)
+        .join("new.txt");
+    let archived = matches!(
+        transition,
+        "archived" | "publish_complete" | "action_done_written"
+    );
+    let published = matches!(transition, "publish_complete" | "action_done_written");
+
+    // I1/I2: before the archive boundary the complete old version remains
+    // live; after it, that exact version is safe in the crashed Run folder.
+    assert_eq!(archive.exists(), archived, "{label}: I1 archive boundary");
+    if archived {
+        assert_eq!(
+            fs::read_to_string(&archive).unwrap(),
+            "old\n",
+            "{label}: I1 archived old version"
+        );
+    }
+    match (archived, published) {
+        (false, false) => assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            "old\n",
+            "{label}: I1 old version remains live"
+        ),
+        (true, false) => assert!(!final_path.exists(), "{label}: R5 accepted window"),
+        (true, true) => assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            CONTENT,
+            "{label}: I2 only complete content is Published"
+        ),
+        (false, true) => unreachable!(),
+    }
+    assert_eq!(
+        sibling_temps(&case.destination).is_empty(),
+        published,
+        "{label}: I2 temp boundary"
+    );
+
+    assert_crashed_records_are_honest(&case, &label, &crashed_journal, transition);
+    assert_plan_hides_machinery(&case, &label);
+    assert_eq!(
+        fs::read_to_string(case.destination.join("_SafetyNet/manual/protected.txt")).unwrap(),
+        "protected\n",
+        "{label}: I5 Mirror touched protected machinery"
+    );
+
+    let rerun = case
+        .command()
+        .args(["run", &case.pair, "--yes"])
+        .output()
+        .expect("replacement convergence rerun starts");
+    assert_command_success(&format!("{label}: I3 rerun"), &rerun);
+    assert_eq!(
+        fs::read_to_string(&final_path).unwrap(),
+        CONTENT,
+        "{label}: I3"
+    );
+    assert!(
+        safety_net_files_named(&case.destination, "new.txt")
+            .iter()
+            .any(|path| fs::read_to_string(path).unwrap() == "old\n"),
+        "{label}: I1 old version survived rerun"
+    );
+    assert!(machinery_temps(&case.destination).is_empty(), "{label}: I3");
+    assert_eq!(
+        visible_files(case.source.path(), false),
+        visible_files(&case.destination, filesystem.slug == "exfat"),
+        "{label}: I3 destination converged"
+    );
+    assert_eq!(
+        fs::read_to_string(case.destination.join("_SafetyNet/manual/protected.txt")).unwrap(),
+        "protected\n",
+        "{label}: I5 post-rerun machinery"
+    );
+    let rerun_events =
+        assert_rerun_records_are_honest(&case, &label, &crashed_journals[0], &crashed_journal);
+    let recopied = rerun_events.iter().any(|event| {
+        event["type"] == "action_start"
+            && matches!(event["op"].as_str(), Some("copy" | "update"))
+            && event["path"] == "new.txt"
+    });
+    assert_eq!(
+        recopied, !published,
+        "{label}: R1-R5 must re-plan the copy; R6/R7 must not recopy"
+    );
+    let cleanup_journaled = rerun_events.iter().any(|event| {
+        event["type"] == "action_done"
+            && event["op"] == "cleanup"
+            && event["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(".new.txt.vibesync-tmp-"))
+    });
+    assert_eq!(
+        cleanup_journaled, !published,
+        "{label}: R1-R5 stray cleanup Journal boundary"
+    );
+    assert_eq!(assert_plan_hides_machinery(&case, &label), 0, "{label}: I5");
 }
 
 fn exercise_new_file_cell(image: &MountedImage, filesystem: Filesystem, transition: &str) {
@@ -323,14 +908,7 @@ fn exercise_new_file_cell(image: &MountedImage, filesystem: Filesystem, transiti
 
     // I4: the killed run is permanently summary-less and status derives the
     // interrupted result from that external Journal evidence.
-    assert!(
-        !crashed_journal.lines().any(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .is_some_and(|event| event["type"] == "summary")
-        }),
-        "{label}: I4 crash Journal claimed completion"
-    );
+    assert_crashed_records_are_honest(&case, &label, &crashed_journal, transition);
     if transition == "action_done_written" {
         let types: Vec<_> = crashed_journal
             .lines()
@@ -341,26 +919,7 @@ fn exercise_new_file_cell(image: &MountedImage, filesystem: Filesystem, transiti
             ["run_start", "action_start", "action_done"],
             "{label}: N6 must contain action_done with only summary missing"
         );
-    } else {
-        assert!(
-            !crashed_journal.lines().any(|line| {
-                serde_json::from_str::<Value>(line)
-                    .ok()
-                    .is_some_and(|event| event["type"] == "action_done")
-            }),
-            "{label}: N1-N5 must crash before action_done is written"
-        );
     }
-    let status = case
-        .command()
-        .args(["status", &case.pair])
-        .output()
-        .expect("status starts");
-    assert_command_success(&format!("{label}: status"), &status);
-    assert!(
-        String::from_utf8_lossy(&status.stdout).contains("Result: interrupted"),
-        "{label}: I4 status must report interruption"
-    );
 
     // I5: plan may report the temp as machinery, but no action may copy or
     // delete a temp or SafetyNet path as user content.
@@ -413,31 +972,8 @@ fn exercise_new_file_cell(image: &MountedImage, filesystem: Filesystem, transiti
         "{label}: I5 post-rerun SafetyNet"
     );
 
-    let journals = case.journals();
-    assert_eq!(journals.len(), 2, "{label}: rerun Journal retained");
-    let rerun_path = journals
-        .iter()
-        .find(|path| *path != &crashed_journals[0])
-        .expect("rerun Journal differs from crashed Journal");
-    let rerun_journal = fs::read_to_string(rerun_path).unwrap();
-    let crashed_journal_after_rerun = fs::read_to_string(&crashed_journals[0]).unwrap();
-    assert_eq!(
-        crashed_journal_after_rerun, crashed_journal,
-        "{label}: I4 rerun must never append to the crashed Journal"
-    );
-    assert!(
-        !crashed_journal_after_rerun.contains("\"type\":\"summary\""),
-        "{label}: I4 crashed Journal must remain summary-less after rerun"
-    );
-    let rerun_events: Vec<Value> = rerun_journal
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("complete rerun Journal line"))
-        .collect();
-    assert_eq!(
-        rerun_events.last().unwrap()["type"],
-        "summary",
-        "{label}: I4 rerun completion"
-    );
+    let rerun_events =
+        assert_rerun_records_are_honest(&case, &label, &crashed_journals[0], &crashed_journal);
     if published {
         assert!(
             !rerun_events.iter().any(|event| {
@@ -476,6 +1012,189 @@ fn sibling_temps(destination: &Path) -> Vec<PathBuf> {
                 .starts_with(".new.txt.vibesync-tmp-")
         })
         .collect()
+}
+
+fn safety_net_files_named(destination: &Path, name: &str) -> Vec<PathBuf> {
+    let root = destination.join("_SafetyNet");
+    if !root.exists() {
+        return Vec::new();
+    }
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| {
+            let candidate = entry.unwrap().path().join(name);
+            candidate.exists().then_some(candidate)
+        })
+        .collect()
+}
+
+fn safety_net_payloads(destination: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let root = destination.join("_SafetyNet");
+    let mut payloads = BTreeMap::new();
+    if !root.exists() {
+        return payloads;
+    }
+    for run in fs::read_dir(root).unwrap() {
+        let run = run.unwrap().path();
+        if run.is_dir() {
+            for (path, bytes) in tree_payloads(&run) {
+                payloads.insert(path, bytes);
+            }
+        }
+    }
+    payloads
+}
+
+fn tree_payloads(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(root, root, &mut files);
+    files
+}
+
+fn output_events(output: &Output) -> Vec<Value> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("run output is NDJSON"))
+        .collect()
+}
+
+fn assert_event_reason(output: &Output, reason: &str) {
+    assert!(
+        output_events(output)
+            .iter()
+            .any(|event| event["type"] == "action_failed" && event["reason"] == reason),
+        "missing action_failed reason {reason}: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn normalized_action_events(journal: &Path) -> Vec<Value> {
+    fs::read_to_string(journal)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("action_start" | "action_done" | "summary")
+            )
+        })
+        .map(|event| {
+            let safety_net = event["safety_net"].as_str().map(|path| {
+                let after_root = path
+                    .split_once("_SafetyNet/")
+                    .expect("SafetyNet event path contains its root")
+                    .1;
+                after_root
+                    .split_once('/')
+                    .expect("SafetyNet event path contains a Run id")
+                    .1
+                    .to_string()
+            });
+            serde_json::json!({
+                "type": event["type"],
+                "op": event["op"],
+                "path": event["path"],
+                "bytes": event["bytes"],
+                "counts": event["counts"],
+                "result": event["result"],
+                "verified": event["verified"],
+                "warnings": event["warnings"],
+                "safety_net": safety_net,
+            })
+        })
+        .collect()
+}
+
+fn assert_crashed_records_are_honest(case: &Case, label: &str, journal: &str, transition: &str) {
+    assert!(
+        !journal.contains("\"type\":\"summary\""),
+        "{label}: I4 summary"
+    );
+    let has_done = journal.contains("\"type\":\"action_done\"");
+    assert_eq!(
+        has_done,
+        transition == "action_done_written",
+        "{label}: I4 action_done boundary"
+    );
+    let status = case
+        .command()
+        .args(["status", &case.pair])
+        .output()
+        .expect("status starts");
+    assert_command_success(&format!("{label}: status"), &status);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("Result: interrupted"),
+        "{label}: I4 status"
+    );
+    let history = case
+        .command()
+        .args(["history", &case.pair])
+        .output()
+        .expect("history starts");
+    assert_command_success(&format!("{label}: history"), &history);
+    assert!(
+        String::from_utf8_lossy(&history.stdout).contains("interrupted"),
+        "{label}: F7 history"
+    );
+}
+
+fn assert_rerun_records_are_honest(
+    case: &Case,
+    label: &str,
+    crashed_path: &Path,
+    crashed_before: &str,
+) -> Vec<Value> {
+    assert_eq!(
+        fs::read_to_string(crashed_path).unwrap(),
+        crashed_before,
+        "{label}: I4 rerun changed crashed Journal"
+    );
+    let journals = case.journals();
+    assert_eq!(journals.len(), 2, "{label}: I4 retained two Journals");
+    let rerun = journals
+        .iter()
+        .find(|path| path.as_path() != crashed_path)
+        .unwrap();
+    let events: Vec<Value> = fs::read_to_string(rerun)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events.last().unwrap()["type"],
+        "summary",
+        "{label}: I4 rerun"
+    );
+    events
+}
+
+fn detach_all(images: &mut [(Filesystem, MountedImage)]) {
+    let mut errors = Vec::new();
+    for (filesystem, image) in images {
+        if let Err(error) = image.detach() {
+            errors.push(format!("{} teardown: {error}", filesystem.slug));
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "suite image teardown: {}",
+        errors.join("; ")
+    );
 }
 
 fn machinery_temps(destination: &Path) -> Vec<PathBuf> {

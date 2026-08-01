@@ -1,0 +1,21 @@
+name: Crash and fault acceptance matrix
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: APFS and exFAT convergence invariants
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the real-filesystem acceptance matrix
+        run: cargo test --locked --features fault-injection --test acceptance
