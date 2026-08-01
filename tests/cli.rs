@@ -619,6 +619,39 @@ fn plan_json_action_order_is_deterministic_for_nested_trees() {
     assert_eq!(action_paths(), expected);
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn plan_json_emits_actions_before_the_scan_finishes() {
+    let fx = Fixture::new();
+    for index in 0..100 {
+        fx.write_source(&format!("{index:03}.txt"), "data");
+    }
+    fx.add_photos_pair();
+
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut child = ProcessCommand::new(binary.get_program())
+        .args(["plan", "photos", "--json"])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .env("VIBESYNC_TEST_PLAN_SCAN_DELAY_MS", "5")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let start: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    let action: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(start["type"], "plan_start");
+    assert_eq!(action["type"], "action");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "first action must cross stdout while later entries are still scanning"
+    );
+    for line in lines {
+        let _: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(EXIT_OK));
+}
+
 #[test]
 fn relocated_json_plan_reports_notice_on_stderr_and_keeps_stdout_ndjson_only() {
     let fx = Fixture::new();
@@ -934,6 +967,43 @@ fn structural_replacement_gate_failure_leaves_destination_and_safetynet_untouche
         }
         assert!(!fx.destination.path().join("_SafetyNet").exists());
     }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn structural_delete_has_one_lifecycle_across_multiple_dependent_copies() {
+    let fx = Fixture::new();
+    fx.write_source("docs/a.txt", "first");
+    fx.write_source("docs/b.txt", "second");
+    fx.write_dest("docs", "old blocker");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:test \"$VIBESYNC_TEST_RELATIVE_PATH\" != \"docs/a.txt\" || truncate -s 1 \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", "photos", "--json", "--yes", "--verify"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL), "{output:?}");
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let delete_events: Vec<_> = rows
+        .iter()
+        .filter(|row| row["op"] == "delete" && row["path"] == "docs")
+        .map(|row| row["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(delete_events, ["action_start", "action_done"]);
+    assert!(!fx.destination.path().join("docs/a.txt").exists());
+    assert_eq!(
+        fs::read_to_string(fx.destination.path().join("docs/b.txt")).unwrap(),
+        "second"
+    );
 }
 
 #[test]
@@ -1815,6 +1885,7 @@ fn release_binary_with_fault_feature_contains_no_environment_hooks() {
         "VIBESYNC_TEST_ENOSPC_PATH",
         "VIBESYNC_TEST_WARNING_PATH",
         "VIBESYNC_TEST_COPY_CHUNK_DELAY_MS",
+        "VIBESYNC_TEST_PLAN_SCAN_DELAY_MS",
         "VIBESYNC_TEST_TRANSITION",
         "VIBESYNC_TEST_RELATIVE_PATH",
         "VIBESYNC_TEST_SOURCE",

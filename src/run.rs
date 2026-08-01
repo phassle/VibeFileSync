@@ -308,7 +308,6 @@ impl RunReporter {
 }
 
 pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
-    install_interrupt_handler()?;
     configured_pair(config_path, pair_name)?;
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, initial_plan) = plan::build(config_path, pair_name, options.excludes)?;
@@ -325,7 +324,6 @@ pub(crate) fn run_reviewed(
     reviewed_pair: crate::config::Pair,
     initial_plan: plan::Plan,
 ) -> Result<i32, AppError> {
-    install_interrupt_handler()?;
     let configured = configured_pair(config_path, pair_name)?;
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, notices) = crate::preconditions::resolve_pair(&configured)?;
@@ -415,6 +413,7 @@ fn execute_reviewed_plan(
         &run_warnings,
         &initial_plan,
     )?;
+    install_interrupt_handler()?;
     let mut stats = RunStats {
         counts: Counts {
             planned: initial_plan.copies.len()
@@ -512,6 +511,7 @@ fn execute_reviewed_plan(
     retain_reviewed_actions(&mut plan, &initial_plan);
     plan::drop_orphan_structural_deletions(&mut plan);
     let mut completed_structural_deletes = std::collections::BTreeSet::new();
+    let mut started_structural_deletes = std::collections::BTreeSet::new();
     for (operation, action) in plan
         .copies
         .iter()
@@ -540,10 +540,12 @@ fn execute_reviewed_plan(
             journal.run_id(),
         );
         if let Some(deletion) = structural_delete {
-            journal
-                .action_start(Operation::Delete, deletion, None, None)
-                .map_err(journal_runtime_error)?;
-            reporter.action_start(journal.run_id(), Operation::Delete, deletion)?;
+            if started_structural_deletes.insert(deletion.rel_path.clone()) {
+                journal
+                    .action_start(Operation::Delete, deletion, None, None)
+                    .map_err(journal_runtime_error)?;
+                reporter.action_start(journal.run_id(), Operation::Delete, deletion)?;
+            }
         }
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
@@ -659,36 +661,26 @@ fn execute_reviewed_plan(
                     return Err(AppError::Interrupted(failure.to_string()));
                 }
                 stats.counts.failed += 1;
-                if let Some(deletion) = structural_delete {
-                    stats.counts.failed += 1;
-                    let dependency_failure = ActionFailure::new(
-                        FailureReason::DependencyFailed,
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "dependent copy did not pass its publish gate",
-                        ),
-                    );
-                    journal
-                        .action_failed(Operation::Delete, deletion, FailureReason::DependencyFailed)
-                        .map_err(journal_runtime_error)?;
-                    reporter.action_failed(
-                        journal.run_id(),
-                        Operation::Delete,
-                        deletion,
-                        &dependency_failure,
-                    )?;
-                }
                 journal
                     .action_failed(operation, action, failure.reason())
                     .map_err(journal_runtime_error)?;
                 reporter.action_failed(journal.run_id(), operation, action, &failure)?;
                 if failure.kind() != io::ErrorKind::InvalidData {
+                    if let Some(deletion) = structural_delete {
+                        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
+                    }
                     journal.summary(&stats).map_err(journal_runtime_error)?;
                     reporter.summary(journal.run_id(), &stats)?;
                     return Ok(1);
                 }
             }
         }
+    }
+    for deletion in plan.deletes.iter().filter(|deletion| {
+        started_structural_deletes.contains(&deletion.rel_path)
+            && !completed_structural_deletes.contains(&deletion.rel_path)
+    }) {
+        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
     }
     for action in plan
         .deletes
@@ -721,6 +713,26 @@ fn install_interrupt_handler() -> Result<(), AppError> {
     crate::interrupt::install().map_err(|error| {
         AppError::Interrupted(format!("could not install signal handler: {error}"))
     })
+}
+
+fn fail_structural_delete(
+    deletion: &Action,
+    journal: &mut Journal,
+    reporter: &RunReporter,
+    stats: &mut RunStats,
+) -> Result<(), AppError> {
+    stats.counts.failed += 1;
+    let failure = ActionFailure::new(
+        FailureReason::DependencyFailed,
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dependent copies did not pass the publish gate",
+        ),
+    );
+    journal
+        .action_failed(Operation::Delete, deletion, FailureReason::DependencyFailed)
+        .map_err(journal_runtime_error)?;
+    reporter.action_failed(journal.run_id(), Operation::Delete, deletion, &failure)
 }
 
 /// A reconciliation scan is authoritative about the destination, but it must

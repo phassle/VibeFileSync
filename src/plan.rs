@@ -64,6 +64,17 @@ pub struct Action {
     pub structural_conflict: Option<StructuralConflict>,
 }
 
+fn destination_directory_replacement(path: &Path) -> Action {
+    Action {
+        rel_path: path.to_path_buf(),
+        bytes: 0,
+        source_mtime: None,
+        old_bytes: Some(0),
+        reason: "replaced by source file".into(),
+        structural_conflict: Some(StructuralConflict::DestinationDirectory),
+    }
+}
+
 /// A per-file plan error — surfaced as an ERRORS row rather than crashing
 /// the whole plan (e.g. a symlink bound for an exFAT destination).
 #[derive(Debug, Clone, PartialEq)]
@@ -195,6 +206,10 @@ fn walk(
     while let Some(pending) = stack.pop() {
         match pending {
             Pending::File(path, scanned) => {
+                #[cfg(all(feature = "fault-injection", debug_assertions))]
+                if let Ok(delay) = std::env::var("VIBESYNC_TEST_PLAN_SCAN_DELAY_MS") {
+                    std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
+                }
                 let rel = path
                     .strip_prefix(root)
                     .expect("read_dir path is under root");
@@ -568,52 +583,274 @@ pub fn run(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
 /// Emits the versioned Dry-run contract from the same fresh [`Plan`] used by
 /// human review and Run, so every surface names the exact same action set.
 pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
-    let (pair, plan) = build(config_path, pair_name, &[])?;
+    let setup = prepare(config_path, pair_name)?;
+    for notice in &setup.notices {
+        eprintln!("{notice}");
+    }
+    let header_pair = setup.pair;
     let plan_id = plan_id();
     emit(serde_json::json!({
         "schema": "vibefilesync.plan/v1", "type": "plan_start", "plan_id": plan_id,
-        "pair": pair_name, "mode": pair.mode, "dry_run": true
+        "pair": pair_name, "mode": header_pair.mode, "dry_run": true
     }))?;
-    for (operation, actions) in [
-        (PlanOperation::Copy, plan.copies.as_slice()),
-        (PlanOperation::Update, plan.updates.as_slice()),
-        (PlanOperation::Delete, plan.deletes.as_slice()),
-    ] {
-        for action in actions {
-            emit(plan_action_row(&plan_id, operation, action))?;
+    let mut stats = StreamStats::default();
+    walk(&header_pair.source, false, |path, entry| {
+        stats.scanned += 1;
+        let destination_path = header_pair.destination.join(path);
+        let replaces_directory = is_directory(&destination_path)?;
+        let old = entry_at(&destination_path)?;
+        let classification = classify_source_entry(
+            path,
+            entry,
+            old.as_ref(),
+            setup.supports_symlinks,
+            setup.mtime_tolerance,
+        );
+        let row = match classification {
+            SourceClassification::Action(op, action) => {
+                if replaces_directory {
+                    crate::ndjson::stdout(&plan_action_row(&plan_id, op, &action))
+                        .map_err(io::Error::other)?;
+                    let replacement = destination_directory_replacement(path);
+                    crate::ndjson::stdout(&plan_action_row(
+                        &plan_id,
+                        PlanOperation::Delete,
+                        &replacement,
+                    ))
+                    .map_err(io::Error::other)?;
+                    stats.increment(op);
+                    stats.deletes += 1;
+                    return Ok(());
+                }
+                stats.increment(op);
+                plan_action_row(&plan_id, op, &action)
+            }
+            SourceClassification::Error(error) => {
+                stats.errors += 1;
+                serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","plan_id":plan_id,"op":PlanOperation::Error,"path":error.rel_path.to_string_lossy(),"reason":error.message})
+            }
+            SourceClassification::Unchanged => {
+                stats.unchanged += 1;
+                return Ok(());
+            }
+            SourceClassification::Excluded => unreachable!("public Plan has no exclusions"),
+        };
+        crate::ndjson::stdout(&row).map_err(io::Error::other)
+    })
+    .map_err(|e| scan_error(&header_pair.source, e))?;
+    let source_directories = scan_directories(&header_pair.source)
+        .map_err(|error| scan_error(&header_pair.source, error))?;
+    let destination_directories = if header_pair.destination.is_dir() {
+        scan_directories(&header_pair.destination)
+            .map_err(|error| scan_error(&header_pair.destination, error))?
+    } else {
+        BTreeSet::new()
+    };
+    for path in source_directories.difference(&destination_directories) {
+        let source_directory = header_pair.source.join(path);
+        if fs::read_dir(&source_directory)
+            .map_err(|error| scan_error(&source_directory, error))?
+            .next()
+            .transpose()
+            .map_err(|error| scan_error(&source_directory, error))?
+            .is_some()
+        {
+            continue;
         }
-    }
-    for error in &plan.errors {
-        emit(serde_json::json!({
-            "schema": "vibefilesync.plan/v1", "type": "action", "plan_id": plan_id,
-            "op": PlanOperation::Error, "path": error.rel_path.to_string_lossy(),
-            "reason": error.message
-        }))?;
-    }
-    for path in &plan.strays {
         let action = Action {
             rel_path: path.clone(),
-            bytes: fs::symlink_metadata(pair.destination.join(path))
-                .map_err(|error| scan_error(&pair.destination.join(path), error))?
-                .len(),
+            bytes: 0,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "new directory".into(),
+            structural_conflict: None,
+        };
+        emit(plan_action_row(&plan_id, PlanOperation::Copy, &action))?;
+        stats.copies += 1;
+        stats.scanned += 1;
+    }
+    let mut streamed_directory_deletes = BTreeSet::new();
+    if header_pair.destination.is_dir() {
+        if header_pair.mode == Mode::Mirror {
+            for path in destination_directories.difference(&source_directories) {
+                let destination_directory = header_pair.destination.join(path);
+                if destination_directories
+                    .difference(&source_directories)
+                    .any(|ancestor| ancestor != path && path.starts_with(ancestor))
+                    || contains_machinery(&destination_directory)
+                    || fs::symlink_metadata(header_pair.source.join(path)).is_ok()
+                {
+                    continue;
+                }
+                let action = Action {
+                    rel_path: path.clone(),
+                    bytes: 0,
+                    source_mtime: None,
+                    old_bytes: Some(0),
+                    reason: "directory not in source".into(),
+                    structural_conflict: None,
+                };
+                emit(plan_action_row(&plan_id, PlanOperation::Delete, &action))?;
+                streamed_directory_deletes.insert(path.clone());
+                stats.deletes += 1;
+                stats.scanned += 1;
+            }
+        }
+        walk(
+            &header_pair.destination,
+            setup.skip_apple_double,
+            |path, entry| {
+                if streamed_directory_deletes
+                    .iter()
+                    .any(|directory| path.starts_with(directory))
+                    || has_file_ancestor(&header_pair.source, path)?
+                {
+                    return Ok(());
+                }
+                let source = fs::symlink_metadata(header_pair.source.join(path));
+                let (reason, structural_conflict) = match source {
+                    Ok(metadata) if metadata.file_type().is_dir() => (
+                        "replaced by source directory",
+                        Some(StructuralConflict::DestinationFile),
+                    ),
+                    Ok(_) => return Ok(()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) && header_pair.mode == Mode::Mirror =>
+                    {
+                        ("not in source", None)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(error),
+                };
+                stats.scanned += 1;
+                let action = Action {
+                    rel_path: path.to_path_buf(),
+                    bytes: entry.size,
+                    source_mtime: None,
+                    old_bytes: Some(entry.size),
+                    reason: reason.into(),
+                    structural_conflict,
+                };
+                crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Delete, &action))
+                    .map_err(io::Error::other)?;
+                stats.deletes += 1;
+                Ok(())
+            },
+        )
+        .map_err(|error| scan_error(&header_pair.destination, error))?;
+    }
+    walk_stray_temps(&header_pair.destination, |path| {
+        let bytes = fs::symlink_metadata(header_pair.destination.join(path))?.len();
+        let action = Action {
+            rel_path: path.to_path_buf(),
+            bytes,
             source_mtime: None,
             old_bytes: None,
             reason: "abandoned temp".into(),
             structural_conflict: None,
         };
-        emit(plan_action_row(&plan_id, PlanOperation::Cleanup, &action))?;
-    }
+        crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Cleanup, &action))
+            .map_err(io::Error::other)?;
+        stats.cleanup += 1;
+        Ok(())
+    })
+    .map_err(|error| scan_error(&header_pair.destination, error))?;
     emit(serde_json::json!({
         "schema": "vibefilesync.plan/v1", "type": "summary", "plan_id": plan_id,
         "counts": {
-            "copy": plan.copies.len(), "update": plan.updates.len(),
-            "delete": plan.deletes.len(), "error": plan.errors.len(),
-            "cleanup": plan.strays.len(), "scanned": plan.scanned,
-            "unchanged": plan.unchanged, "excluded": plan.excluded
+            "copy": stats.copies, "update": stats.updates, "delete": stats.deletes,
+            "error": stats.errors, "cleanup": stats.cleanup, "scanned": stats.scanned,
+            "unchanged": stats.unchanged, "excluded": stats.excluded
         }
     }))?;
     Ok(crate::error::EXIT_OK)
 }
+
+fn entry_at(path: &Path) -> io::Result<Option<Entry>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(None),
+        Ok(metadata) => Ok(Some(Entry {
+            size: metadata.len(),
+            mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            is_symlink: metadata.file_type().is_symlink(),
+        })),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_directory(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn has_file_ancestor(root: &Path, path: &Path) -> io::Result<bool> {
+    let mut ancestor = path.parent();
+    while let Some(relative) = ancestor {
+        match fs::symlink_metadata(root.join(relative)) {
+            Ok(metadata) if !metadata.file_type().is_dir() => return Ok(true),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        ancestor = relative.parent();
+    }
+    Ok(false)
+}
+
+#[derive(Default)]
+struct StreamStats {
+    copies: usize,
+    updates: usize,
+    deletes: usize,
+    errors: usize,
+    cleanup: usize,
+    scanned: usize,
+    unchanged: usize,
+    excluded: usize,
+}
+
+impl StreamStats {
+    fn increment(&mut self, operation: PlanOperation) {
+        match operation {
+            PlanOperation::Copy => self.copies += 1,
+            PlanOperation::Update => self.updates += 1,
+            _ => unreachable!("source actions are copy/update only"),
+        }
+    }
+}
+
 fn plan_action_row(plan_id: &str, op: PlanOperation, action: &Action) -> serde_json::Value {
     let mut row = serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","plan_id":plan_id,"op":op,"path":action.rel_path.to_string_lossy(),"reason":action.reason,"bytes":action.bytes});
     if let Some(bytes) = action.old_bytes {
@@ -887,14 +1124,7 @@ fn add_structural_replacements(
             existing.reason = "replaced by source file".into();
             existing.structural_conflict = Some(StructuralConflict::DestinationDirectory);
         } else {
-            structural.push(Action {
-                rel_path: copy.rel_path.clone(),
-                bytes: 0,
-                source_mtime: None,
-                old_bytes: Some(0),
-                reason: "replaced by source file".into(),
-                structural_conflict: Some(StructuralConflict::DestinationDirectory),
-            });
+            structural.push(destination_directory_replacement(&copy.rel_path));
         }
         plan.directory_deletes.insert(copy.rel_path.clone());
     }
