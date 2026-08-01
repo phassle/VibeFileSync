@@ -26,6 +26,7 @@ const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
 const F_FULLFSYNC: libc::c_int = 51;
 const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 extern "C" {
     fn copyfile(
@@ -232,12 +233,8 @@ fn run_impl(
         return Ok(EXIT_BLOCKED_PLAN);
     }
     for (operation, action) in missing_reviewed_actions(&initial_plan, &plan) {
-        let source = match operation {
-            Operation::Copy | Operation::Update => Some(pair.source.join(&action.rel_path)),
-            Operation::Delete | Operation::Cleanup => None,
-        };
         journal
-            .action_start(operation, action, source.as_deref(), None)
+            .action_start(operation, action, None, None)
             .map_err(journal_runtime_error)?;
         if let Some(stream) = stream.as_mut() {
             stream.action_start(journal.run_id(), operation, action)?;
@@ -674,7 +671,7 @@ impl ProgressObserver {
                     }
                     last_bytes = copied;
                 }
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(PROGRESS_POLL_INTERVAL);
             }
             Ok(())
         });
@@ -715,6 +712,7 @@ fn write_progress(
     bytes: u64,
     total_bytes: u64,
 ) -> io::Result<()> {
+    let bytes = bytes.min(total_bytes);
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(
         &mut stdout,
