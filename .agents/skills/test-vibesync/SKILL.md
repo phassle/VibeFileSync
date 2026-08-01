@@ -5,7 +5,7 @@ description: "Run and interpret VibeSync's Rust checks and safety tests. Use aft
 
 # Test VibeSync
 
-Run on Darwin arm64. Unit tests exercise pure seams; `tests/cli.rs:20` spawns the real binary against isolated config/temp trees.
+Run on Darwin arm64. Unit tests exercise pure seams; `tests/cli.rs:24` spawns the real binary against isolated config/temp trees.
 
 ## Targeted loop
 
@@ -22,6 +22,6 @@ Run on Darwin arm64. Unit tests exercise pure seams; `tests/cli.rs:20` spawns th
 4. Run `cargo test --locked --features fault-injection`.
 5. Report passed/failed counts and every skipped gate.
 
-The feature-gated suite covers low-space and mid-copy ENOSPC controls at `src/preconditions.rs:161` and `src/run.rs:148`. Relevant integration assertions: `tests/cli.rs:1063` and `tests/cli.rs:1090`.
+The feature-gated suite covers low-space and mid-copy ENOSPC controls at `src/preconditions.rs:161` and `src/run.rs:582`. Relevant integration assertions: `tests/cli.rs:1575` and `tests/cli.rs:1602`.
 
-Test observable guarantees: no unreviewed mutation (`tests/cli.rs:710`), no partial final path (`tests/cli.rs:789`), old version archived before replacement (`tests/cli.rs:877`), machinery untouched (`tests/cli.rs:648`). Read `docs/adr/0009-acceptance-test-harness.md:1` only when changing crash/convergence coverage.
+Test observable guarantees: no unreviewed mutation (`tests/cli.rs:1210`), no partial final path (`tests/cli.rs:1289`), old version archived before replacement (`tests/cli.rs:1389`), machinery untouched (`tests/cli.rs:990`), fresh-scan convergence (`tests/cli.rs:1943`). Read `docs/adr/0009-acceptance-test-harness.md:1` only when changing crash/convergence coverage.

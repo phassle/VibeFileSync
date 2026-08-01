@@ -34,4 +34,4 @@ Follow manual gitflow (`docs/agents/git-workflow.md:1`). No CI workflow, release
 5. Delete the release branch after both integrations succeed.
 6. Report commit ids, merges, tests, binary path, and anything intentionally not published.
 
-Normal feature/docs PRs still target `develop`; only release/hotfix integration advances `main` (`AGENTS.md:78`).
+Normal feature/docs PRs still target `develop`; only release/hotfix integration advances `main` (`docs/agents/git-workflow.md:5`).
