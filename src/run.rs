@@ -297,6 +297,53 @@ impl RunReporter {
 }
 
 pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
+    configured_pair(config_path, pair_name)?;
+    let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
+    let (pair, initial_plan) = plan::build(config_path, pair_name, options.excludes)?;
+    execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, true)
+}
+
+/// Executes the exact plan confirmed by another human surface. The ordinary
+/// reconciliation scan still owns filesystem truth, but can only retain work
+/// present in `initial_plan`; newly discovered work waits for the next run.
+pub(crate) fn run_reviewed(
+    config_path: &Path,
+    pair_name: &str,
+    options: RunOptions<'_>,
+    reviewed_pair: crate::config::Pair,
+    initial_plan: plan::Plan,
+) -> Result<i32, AppError> {
+    let configured = configured_pair(config_path, pair_name)?;
+    let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
+    let (pair, notices) = crate::preconditions::resolve_pair(&configured)?;
+    for notice in notices {
+        eprintln!("{notice}");
+    }
+    if pair != reviewed_pair {
+        return Err(AppError::Precondition(
+            "Folder pair changed during TUI review; reopen the TUI before running".to_string(),
+        ));
+    }
+    execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, false)
+}
+
+fn configured_pair(config_path: &Path, pair_name: &str) -> Result<crate::config::Pair, AppError> {
+    let config = crate::config::load(config_path)?;
+    config
+        .pairs
+        .get(pair_name)
+        .cloned()
+        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))
+}
+
+fn execute_reviewed_plan(
+    config_path: &Path,
+    pair_name: &str,
+    options: RunOptions<'_>,
+    pair: crate::config::Pair,
+    initial_plan: plan::Plan,
+    render_plan: bool,
+) -> Result<i32, AppError> {
     let RunOptions {
         yes,
         permanent_delete,
@@ -307,14 +354,10 @@ pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Resu
         excludes,
     } = options;
     let reporter = RunReporter::new(json_output);
-    let config = crate::config::load(config_path)?;
-    if !config.pairs.contains_key(pair_name) {
-        return Err(AppError::Usage(format!("pair '{pair_name}' not found")));
-    }
-    let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
-    let (pair, initial_plan) = plan::build(config_path, pair_name, excludes)?;
     plan::report_unknown_excludes(&initial_plan);
-    reporter.plan(&initial_plan, pair_name, pair.mode);
+    if render_plan {
+        reporter.plan(&initial_plan, pair_name, pair.mode);
+    }
 
     if !initial_plan.errors.is_empty() {
         reporter.blocked(initial_plan.errors.len());

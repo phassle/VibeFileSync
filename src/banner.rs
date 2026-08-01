@@ -3,10 +3,29 @@
 
 use std::io::{self, IsTerminal, Write};
 
-const WORDMARK: &str = "V I B E S Y N C";
-const TAGLINE: &str = "one-way file sync with SafetyNet · plan → review → run";
+pub(crate) const WORDMARK: &str = "V I B E S Y N C";
+pub(crate) const TAGLINE: &str = "one-way file sync with SafetyNet · plan → review → run";
+pub(crate) const MARK_TOP: [&str; 3] = ["◢", "█", "◣"];
+pub(crate) const MARK_BOTTOM: [&str; 3] = ["◥", "█", "◤"];
 const PLAIN_BANNER: &str =
     "V I B E S Y N C — one-way file sync with SafetyNet · plan → review → run";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderMode {
+    Suppressed,
+    Plain,
+    Full,
+}
+
+pub(crate) fn header_mode() -> HeaderMode {
+    if std::env::var_os("VIBESYNC_NO_BANNER").is_some_and(|value| value == "1") {
+        HeaderMode::Suppressed
+    } else if std::env::var_os("NO_COLOR").is_some() {
+        HeaderMode::Plain
+    } else {
+        HeaderMode::Full
+    }
+}
 
 /// Whether these argv values select an idle surface.  This is intentionally
 /// checked before clap renders help, because clap exits after doing so.
@@ -27,16 +46,20 @@ pub fn render_startup_header(plain: bool) -> String {
     // The literal truecolor escapes are static; there is deliberately no
     // redraw or capability-probing protocol in v1.
     format!(
-        "  \x1b[38;2;34;211;238m◢\x1b[38;2;168;85;247m█\x1b[38;2;236;72;153m◣\x1b[0m  \x1b[1m{WORDMARK}\x1b[0m\n  \x1b[38;2;34;211;238m◥\x1b[38;2;168;85;247m█\x1b[38;2;236;72;153m◤\x1b[0m\n       \x1b[2m{TAGLINE}\x1b[0m"
+        "  \x1b[38;2;34;211;238m{}\x1b[38;2;168;85;247m{}\x1b[38;2;236;72;153m{}\x1b[0m  \x1b[1m{WORDMARK}\x1b[0m\n  \x1b[38;2;34;211;238m{}\x1b[38;2;168;85;247m{}\x1b[38;2;236;72;153m{}\x1b[0m\n       \x1b[2m{TAGLINE}\x1b[0m",
+        MARK_TOP[0],
+        MARK_TOP[1],
+        MARK_TOP[2],
+        MARK_BOTTOM[0],
+        MARK_BOTTOM[1],
+        MARK_BOTTOM[2],
     )
 }
 
 /// Writes the static banner to stderr only when it is safe to decorate a
 /// person-facing terminal.  All callers can invoke this unconditionally.
 pub fn print_if_enabled() {
-    if !io::stderr().is_terminal()
-        || std::env::var_os("VIBESYNC_NO_BANNER").is_some_and(|v| v == "1")
-    {
+    if !io::stderr().is_terminal() || header_mode() == HeaderMode::Suppressed {
         return;
     }
 
@@ -44,7 +67,7 @@ pub fn print_if_enabled() {
     let _ = writeln!(
         stderr,
         "{}",
-        render_startup_header(std::env::var_os("NO_COLOR").is_some())
+        render_startup_header(header_mode() == HeaderMode::Plain)
     );
 }
 
