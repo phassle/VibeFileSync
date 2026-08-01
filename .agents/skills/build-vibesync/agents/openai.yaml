@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build VibeSync"
+  short_description: "Compile and smoke-test the macOS CLI"
+  default_prompt: "Use $build-vibesync to compile and smoke-test the VibeSync CLI."

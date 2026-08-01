@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release VibeSync"
+  short_description: "Cut and verify a gitflow release"
+  default_prompt: "Use $release-vibesync to cut and verify a VibeSync release."
