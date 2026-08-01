@@ -583,25 +583,30 @@ fn stream_stray_temps(
     if !root.is_dir() {
         return Ok(0);
     }
+    stream_stray_directory(root, root, emit)
+}
+
+fn stream_stray_directory(
+    root: &Path,
+    directory: &Path,
+    emit: &mut impl FnMut(&Path, u64) -> Result<(), AppError>,
+) -> Result<usize, AppError> {
     let mut count = 0;
-    let mut directories = vec![root.to_path_buf()];
-    while let Some(directory) = directories.pop() {
-        for entry in fs::read_dir(&directory).map_err(|error| scan_error(&directory, error))? {
-            let entry = entry.map_err(|error| scan_error(&directory, error))?;
-            if entry.file_name() == "_SafetyNet" {
-                continue;
-            }
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|error| scan_error(&path, error))?;
-            if metadata.file_type().is_dir() {
-                directories.push(path);
-            } else if is_stray_temp(&entry.file_name()) {
-                let relative = path
-                    .strip_prefix(root)
-                    .expect("streamed temp is under its destination root");
-                emit(relative, metadata.len())?;
-                count += 1;
-            }
+    for entry in fs::read_dir(directory).map_err(|error| scan_error(directory, error))? {
+        let entry = entry.map_err(|error| scan_error(directory, error))?;
+        if entry.file_name() == "_SafetyNet" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| scan_error(&path, error))?;
+        if metadata.file_type().is_dir() {
+            count += stream_stray_directory(root, &path, emit)?;
+        } else if is_stray_temp(&entry.file_name()) {
+            let relative = path
+                .strip_prefix(root)
+                .expect("streamed temp is under its destination root");
+            emit(relative, metadata.len())?;
+            count += 1;
         }
     }
     Ok(count)
@@ -707,9 +712,7 @@ fn stream_destination_deletes(
                 counts,
                 emit,
             )?;
-        } else if fs::symlink_metadata(&source_path)
-            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-        {
+        } else if source_path_is_absent(&source_path) {
             counts.scanned += 1;
             if excludes
                 .iter()
@@ -726,6 +729,15 @@ fn stream_destination_deletes(
         }
     }
     Ok(())
+}
+
+fn source_path_is_absent(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        )
+    })
 }
 
 fn emit_plan_action(

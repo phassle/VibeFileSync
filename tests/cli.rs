@@ -403,6 +403,10 @@ fn run_json_emits_a_pure_versioned_event_stream() {
     assert_eq!(events[2]["result"], "done");
     assert_eq!(events[2]["verified"], "standard");
     assert!(events[2]["safety_net"].is_string());
+    assert!(
+        !events.iter().any(|event| event["type"] == "progress"),
+        "small copies never emit progress"
+    );
     assert_eq!(events[3]["type"], "summary");
     assert!(events[3]["warnings"].is_number());
     assert!(
@@ -434,6 +438,34 @@ fn run_json_reports_partial_failures_without_non_json_stdout() {
     assert!(events[2]["reason"].is_string());
     assert_eq!(events[3]["type"], "summary");
     assert_eq!(events[3]["result"], "partial");
+}
+
+#[test]
+fn run_json_records_cleanup_and_delete_actions() {
+    let fx = Fixture::new();
+    fx.write_dest("gone.txt", "obsolete");
+    fx.write_dest(".gone.txt.vibesync-tmp-old-run", "abandoned");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--yes", "--json", "--allow-empty-source"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let events = ndjson(&output.stdout);
+    let cleanup = events
+        .iter()
+        .find(|event| event["type"] == "action_done" && event["op"] == "cleanup")
+        .expect("cleanup emits action_done");
+    assert!(cleanup["verified"].is_null());
+    let deletion = events
+        .iter()
+        .find(|event| event["type"] == "action_done" && event["op"] == "delete")
+        .expect("delete emits action_done");
+    assert!(deletion["safety_net"].is_string());
+    assert!(deletion["verified"].is_null());
 }
 
 #[test]
@@ -567,6 +599,47 @@ fn plan_json_streams_versioned_actions_between_start_and_summary() {
     assert!(events[1..events.len() - 1]
         .iter()
         .any(|event| event["op"] == "cleanup" && event["reason"] == "abandoned temp"));
+}
+
+#[test]
+fn plan_json_preserves_mirror_file_directory_conflict_actions() {
+    let source_directory = Fixture::new();
+    source_directory.write_source("docs/new.txt", "new");
+    source_directory.write_dest("docs", "old file");
+    source_directory.add_photos_pair();
+    let events = ndjson(
+        &source_directory
+            .cmd()
+            .args(["plan", "photos", "--json"])
+            .output()
+            .unwrap()
+            .stdout,
+    );
+    assert!(events
+        .iter()
+        .any(|event| { event["op"] == "delete" && event["path"] == "docs" }));
+    assert!(events
+        .iter()
+        .any(|event| { event["op"] == "copy" && event["path"] == "docs/new.txt" }));
+
+    let source_file = Fixture::new();
+    source_file.write_source("node", "new file");
+    source_file.write_dest("node/old.txt", "old child");
+    source_file.add_photos_pair();
+    let events = ndjson(
+        &source_file
+            .cmd()
+            .args(["plan", "photos", "--json"])
+            .output()
+            .unwrap()
+            .stdout,
+    );
+    assert!(events
+        .iter()
+        .any(|event| { event["op"] == "copy" && event["path"] == "node" }));
+    assert!(events
+        .iter()
+        .any(|event| { event["op"] == "delete" && event["path"] == "node/old.txt" }));
 }
 
 fn ndjson(stdout: &[u8]) -> Vec<serde_json::Value> {
