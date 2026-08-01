@@ -8,7 +8,12 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -18,6 +23,8 @@ use crate::plan::{self, Action};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
 const F_FULLFSYNC: libc::c_int = 51;
+const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 extern "C" {
     fn copyfile(
@@ -283,6 +290,11 @@ fn run_impl(
             action,
             journal.run_id(),
             options.permanent_delete,
+            json_output.then_some(ProgressDetails {
+                run_id: journal.run_id(),
+                operation,
+                action,
+            }),
         ) {
             Ok(outcome) => {
                 journal
@@ -464,6 +476,7 @@ fn confirm(json_output: bool) -> Result<bool, AppError> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_file(
     destination_root: &Path,
     source: &Path,
@@ -472,6 +485,7 @@ fn copy_file(
     action: &Action,
     run_id: &str,
     permanent_delete: bool,
+    progress: Option<ProgressDetails<'_>>,
 ) -> io::Result<ActionOutcome> {
     let source_before = fs::metadata(source)?;
     let parent = destination
@@ -479,7 +493,7 @@ fn copy_file(
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
     let result = (|| {
-        copyfile_all_but_acls(source, temp)?;
+        copyfile_all_but_acls(source, temp, progress)?;
         crash_at("copy_complete");
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
@@ -516,6 +530,74 @@ fn copy_file(
     result
 }
 
+struct ProgressDetails<'a> {
+    run_id: &'a str,
+    operation: Operation,
+    action: &'a Action,
+}
+
+struct ProgressObserver {
+    done: Arc<AtomicBool>,
+    worker: thread::JoinHandle<io::Result<()>>,
+}
+
+impl ProgressObserver {
+    fn start(temp: &Path, details: ProgressDetails<'_>) -> Option<Self> {
+        if details.action.bytes < PROGRESS_THRESHOLD {
+            return None;
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::clone(&done);
+        let temp = temp.to_path_buf();
+        let run_id = details.run_id.to_string();
+        let operation = details.operation.as_str();
+        let path = path_text(&details.action.rel_path);
+        let total_bytes = details.action.bytes;
+        let worker = thread::spawn(move || {
+            let mut last_bytes = 0;
+            let mut last_emit = None;
+            while !worker_done.load(Ordering::Acquire) {
+                if let Ok(metadata) = fs::metadata(&temp) {
+                    let copied = metadata.len();
+                    if copied > last_bytes
+                        && last_emit
+                            .is_none_or(|instant: Instant| instant.elapsed() >= PROGRESS_INTERVAL)
+                    {
+                        let mut stdout = io::stdout().lock();
+                        serde_json::to_writer(
+                            &mut stdout,
+                            &json!({
+                                "schema": "vibefilesync.run/v1",
+                                "type": "progress",
+                                "run_id": run_id,
+                                "op": operation,
+                                "path": path,
+                                "bytes": copied,
+                                "total_bytes": total_bytes,
+                            }),
+                        )
+                        .map_err(io::Error::other)?;
+                        stdout.write_all(b"\n")?;
+                        stdout.flush()?;
+                        last_emit = Some(Instant::now());
+                    }
+                    last_bytes = copied;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        });
+        Some(Self { done, worker })
+    }
+
+    fn finish(self) -> io::Result<()> {
+        self.done.store(true, Ordering::Release);
+        self.worker
+            .join()
+            .map_err(|_| io::Error::other("progress observer panicked"))?
+    }
+}
+
 #[cfg(feature = "fault-injection")]
 fn crash_at(transition: &str) {
     if std::env::var("VIBESYNC_TEST_CRASH_AT").ok().as_deref() == Some(transition) {
@@ -533,10 +615,9 @@ struct ActionOutcome {
 
 /// The live agent stream is intentionally separate from the durable Journal:
 /// the Journal stays the forensic record, while this writer is a pure stdout
-/// transport for a caller that is already watching the process.  `copyfile`
-/// exposes no byte-progress callback, so this implementation deliberately
-/// emits no synthetic `progress` rows; claiming progress after a completed
-/// copy would violate the contract.
+/// transport for a caller that is already watching the process. Large-copy
+/// progress is observed from the growing temp file while `copyfile` runs, so
+/// every reported byte count reflects data already present on the destination.
 struct JsonRunStream;
 
 impl JsonRunStream {
@@ -780,7 +861,12 @@ fn temporary_path(destination: &Path, run_id: &str) -> PathBuf {
     }
 }
 
-fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
+fn copyfile_all_but_acls(
+    source: &Path,
+    destination: &Path,
+    progress: Option<ProgressDetails<'_>>,
+) -> io::Result<()> {
+    let observer = progress.and_then(|details| ProgressObserver::start(destination, details));
     let source = c_path(source)?;
     let destination = c_path(destination)?;
     let result = unsafe {
@@ -791,6 +877,9 @@ fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
             COPYFILE_ALL_WITHOUT_ACLS,
         )
     };
+    if let Some(observer) = observer {
+        observer.finish()?;
+    }
     if result == 0 {
         Ok(())
     } else {
@@ -1010,6 +1099,7 @@ mod tests {
             &action,
             "20260716T120000Z",
             false,
+            None,
         );
 
         assert!(result.is_err());
@@ -1047,6 +1137,7 @@ mod tests {
             &action,
             "20260716T120000Z",
             false,
+            None,
         );
 
         assert!(result.is_err());

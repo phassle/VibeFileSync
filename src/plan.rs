@@ -426,6 +426,7 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
             .is_dir()
             .then_some(pair.destination.as_path()),
         Path::new(""),
+        pair.mode,
         supports_symlinks,
         excludes,
         &mut counts,
@@ -442,9 +443,7 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         )?;
     }
 
-    let strays =
-        stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
-    for stray in &strays {
+    let cleanup = stream_stray_temps(&pair.destination, &mut |stray, bytes| {
         emit(
             &mut stdout,
             json!({
@@ -454,10 +453,10 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
                 "op": "cleanup",
                 "path": path_text(stray),
                 "reason": "abandoned temp",
-                "bytes": fs::metadata(pair.destination.join(stray)).map(|metadata| metadata.len()).unwrap_or(0),
+                "bytes": bytes,
             }),
-        )?;
-    }
+        )
+    })?;
     emit(
         &mut stdout,
         json!({
@@ -469,7 +468,7 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
                 "update": counts.updates,
                 "delete": counts.deletes,
                 "error": counts.errors,
-                "cleanup": strays.len(),
+                "cleanup": cleanup,
                 "scanned": counts.scanned,
                 "unchanged": counts.unchanged,
                 "excluded": counts.excluded,
@@ -516,6 +515,7 @@ fn stream_source_tree(
     source: &Path,
     destination: Option<&Path>,
     relative: &Path,
+    mode: Mode,
     supports_symlinks: bool,
     excludes: &[String],
     counts: &mut JsonPlanCounts,
@@ -532,15 +532,30 @@ fn stream_source_tree(
         let source_metadata =
             fs::symlink_metadata(&source_path).map_err(|error| scan_error(&source_path, error))?;
         if source_metadata.file_type().is_dir() {
-            let destination_directory = destination_path.as_deref().filter(|path| {
-                fs::symlink_metadata(path)
-                    .map(|metadata| metadata.file_type().is_dir())
-                    .unwrap_or(false)
-            });
+            let destination_directory = match destination_path.as_deref() {
+                Some(path) => match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => Some(path),
+                    Ok(metadata) => {
+                        if mode == Mode::Mirror {
+                            counts.scanned += 1;
+                            counts.deletes += 1;
+                            emit(JsonPlanAction::Delete {
+                                path: child_relative.clone(),
+                                bytes: metadata.len(),
+                            })?;
+                        }
+                        None
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(scan_error(path, error)),
+                },
+                None => None,
+            };
             stream_source_tree(
                 &source_path,
                 destination_directory,
                 &child_relative,
+                mode,
                 supports_symlinks,
                 excludes,
                 counts,
@@ -559,6 +574,37 @@ fn stream_source_tree(
         }
     }
     Ok(())
+}
+
+fn stream_stray_temps(
+    root: &Path,
+    emit: &mut impl FnMut(&Path, u64) -> Result<(), AppError>,
+) -> Result<usize, AppError> {
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| scan_error(&directory, error))? {
+            let entry = entry.map_err(|error| scan_error(&directory, error))?;
+            if entry.file_name() == "_SafetyNet" {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| scan_error(&path, error))?;
+            if metadata.file_type().is_dir() {
+                directories.push(path);
+            } else if is_stray_temp(&entry.file_name()) {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("streamed temp is under its destination root");
+                emit(relative, metadata.len())?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 #[allow(clippy::too_many_arguments)]

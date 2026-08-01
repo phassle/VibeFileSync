@@ -437,6 +437,49 @@ fn run_json_reports_partial_failures_without_non_json_stdout() {
 }
 
 #[test]
+fn run_json_reports_throttled_live_progress_for_large_copies() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.source.path().join("large.bin"),
+        vec![7_u8; 32 * 1024 * 1024],
+    )
+    .unwrap();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let events = ndjson(&output.stdout);
+    let start = events
+        .iter()
+        .position(|event| event["type"] == "action_start" && event["path"] == "large.bin")
+        .unwrap();
+    let done = events
+        .iter()
+        .position(|event| event["type"] == "action_done" && event["path"] == "large.bin")
+        .unwrap();
+    let progress: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "progress" && event["path"] == "large.bin")
+        .collect();
+    assert!(
+        !progress.is_empty(),
+        "large copy emitted no progress: {events:#?}"
+    );
+    assert!(progress.iter().all(|(index, event)| {
+        *index > start
+            && *index < done
+            && event["bytes"].as_u64().is_some_and(|bytes| bytes > 0)
+            && event["bytes"].as_u64() <= event["total_bytes"].as_u64()
+    }));
+}
+
+#[test]
 fn run_json_confirmation_and_cancellation_stay_on_stderr() {
     let fx = Fixture::new();
     fx.write_source("photo.txt", "would copy if approved");
