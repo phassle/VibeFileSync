@@ -1,16 +1,21 @@
 //! `vibesync`: hot-path verbs top-level, management namespaced, per
 //! ADR-0004. Implemented so far: Folder-pair management, the human Dry-run,
-//! safe `run`/`prune`, and Journal-backed `status`/`history`; the TUI and
-//! streaming JSON plan/run surfaces remain later slices.
+//! safe `run`/`prune`, Journal-backed `status`/`history`, and streaming
+//! NDJSON plan/run surfaces, and the thin action-list TUI.
 
 mod banner;
 mod config;
 mod error;
+mod event;
+mod failure;
+mod interrupt;
 mod journal;
+mod ndjson;
 mod pair;
 mod plan;
 mod preconditions;
 mod run;
+mod tui;
 mod volume;
 
 use std::path::PathBuf;
@@ -41,9 +46,6 @@ enum Command {
         /// Stream the plan as NDJSON (schema `vibefilesync.plan/v1`).
         #[arg(long)]
         json: bool,
-        /// Exclude an exact plan path (repeatable); glob-free per ADR-0004.
-        #[arg(long, value_name = "PATH")]
-        exclude: Vec<String>,
     },
     /// Execute a run for a Folder pair.
     Run {
@@ -63,6 +65,9 @@ enum Command {
         /// Skip the free-space preflight check.
         #[arg(long)]
         ignore_space_check: bool,
+        /// Fully hash-verify source and copied data before Publish.
+        #[arg(long)]
+        verify: bool,
         /// Exclude an exact plan path (repeatable); glob-free per ADR-0004.
         #[arg(long, value_name = "PATH")]
         exclude: Vec<String>,
@@ -153,15 +158,11 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
     config::load(config_path)?;
 
     match command {
-        Command::Plan {
-            pair,
-            json,
-            exclude,
-        } => {
+        Command::Plan { pair, json } => {
             if *json {
-                return plan::run_json(config_path, pair, exclude);
+                return plan::run_json(config_path, pair);
             }
-            plan::run(config_path, pair, exclude)
+            plan::run(config_path, pair)
         }
         Command::Run {
             pair,
@@ -170,29 +171,21 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             permanent_delete,
             allow_empty_source,
             ignore_space_check,
+            verify,
             exclude,
-        } => {
-            if *json {
-                return run::run_json(
-                    config_path,
-                    pair,
-                    *yes,
-                    *permanent_delete,
-                    *allow_empty_source,
-                    *ignore_space_check,
-                    exclude,
-                );
-            }
-            run::run(
-                config_path,
-                pair,
-                *yes,
-                *permanent_delete,
-                *allow_empty_source,
-                *ignore_space_check,
-                exclude,
-            )
-        }
+        } => run::run(
+            config_path,
+            pair,
+            run::RunOptions {
+                yes: *yes,
+                permanent_delete: *permanent_delete,
+                allow_empty_source: *allow_empty_source,
+                ignore_space_check: *ignore_space_check,
+                json_output: *json,
+                full_verify: *verify,
+                excludes: exclude,
+            },
+        ),
         Command::Status { pair } => journal::status(config_path, pair),
         Command::History { pair, json } => {
             if *json {
@@ -202,10 +195,7 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             }
         }
         Command::Prune { pair } => run::prune(config_path, pair),
-        Command::Tui { pair } => Ok(not_yet_implemented(
-            "tui",
-            pair.as_deref().unwrap_or("<all pairs>"),
-        )),
+        Command::Tui { pair } => tui::run(config_path, pair.as_deref()),
         Command::Pair { action } => run_pair(action, config_path),
     }
 }
@@ -235,9 +225,4 @@ fn run_pair(action: &PairCommand, config_path: &std::path::Path) -> Result<i32, 
             Ok(error::EXIT_OK)
         }
     }
-}
-
-fn not_yet_implemented(verb: &str, pair: &str) -> i32 {
-    eprintln!("vibesync {verb}: not yet implemented (pair: {pair})");
-    error::EXIT_UNIMPLEMENTED
 }

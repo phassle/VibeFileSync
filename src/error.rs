@@ -1,7 +1,5 @@
 //! Errors that cross the CLI boundary, each carrying the exit code its
-//! class maps to under ADR-0004's exit-code taxonomy (the subset this
-//! slice uses: 2 precondition abort, 4 interrupted run, 64 usage, plus
-//! 69 for this slice's own "not yet implemented" verbs).
+//! class maps to under ADR-0004's exit-code taxonomy.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -15,10 +13,6 @@ pub const EXIT_BLOCKED_PLAN: i32 = 3;
 /// A run started but could not complete reliably.
 pub const EXIT_INTERRUPTED: i32 = 4;
 pub const EXIT_USAGE: i32 = 64;
-/// BSD sysexits `EX_UNAVAILABLE`. Used for verbs this slice hasn't
-/// implemented yet — deliberately distinct from ADR-0004's exit 1, which
-/// is reserved for a completed run with ≥1 failed action.
-pub const EXIT_UNIMPLEMENTED: i32 = 69;
 
 #[derive(Debug)]
 pub enum AppError {

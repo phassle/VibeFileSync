@@ -159,7 +159,7 @@ fn enforce_space(required: u64, available: u64, ignore_space_check: bool) -> Res
 }
 
 fn available_space(path: &Path) -> io::Result<u64> {
-    #[cfg(feature = "fault-injection")]
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
     if let Some(value) = std::env::var_os("VIBESYNC_TEST_AVAILABLE_BYTES") {
         return value.to_string_lossy().parse().map_err(|_| {
             io::Error::new(
@@ -247,20 +247,26 @@ mod tests {
             copies: vec![crate::plan::Action {
                 rel_path: PathBuf::from("new"),
                 bytes: 10,
+                source_mtime: None,
                 old_bytes: None,
                 reason: String::new(),
+                structural_conflict: None,
             }],
             updates: vec![crate::plan::Action {
                 rel_path: PathBuf::from("changed"),
                 bytes: 20,
-                old_bytes: None,
+                source_mtime: None,
+                old_bytes: Some(5),
                 reason: String::new(),
+                structural_conflict: None,
             }],
             deletes: vec![crate::plan::Action {
                 rel_path: PathBuf::from("removed"),
                 bytes: 9_999,
-                old_bytes: None,
+                source_mtime: None,
+                old_bytes: Some(9_999),
                 reason: String::new(),
+                structural_conflict: None,
             }],
             ..Plan::default()
         };

@@ -11,6 +11,8 @@ The Journal design for v1:
 7. **Restart reconciliation = cleanup + fresh scan, never replay.** The next real run of a pair deletes `.*.vibesync-tmp-*` strays during its scan (journaled and reported); `plan` and `status` are strictly read-only on the destination and only report strays. A crash between archive and publish needs no rule: the destination path is absent, the old version is in `_SafetyNet/<run-id>/`, and the rerun plans a fresh copy (ADR-0001's accepted window converging on its own).
 8. **Locking: per-pair `flock`** on `runs/<pair-name>/.lock`. Mutating commands (`run`, `prune`) take it exclusively; contention is a fail-fast precondition abort (exit 2, "run already in progress") — no queueing. `flock` dies with the process, so a crashed run leaves no stale lock. Documented limitation: the lock lives on the Mac and cannot exclude a *different machine* writing the same destination volume.
 
+Before the first v1 release, feature #14 used ADR-0004's explicit pre-release schema exception to finalize `journal/v1` with ADR-0008's structured `{code, detail}` warnings and the same normalized failure reason codes as `run/v1`. Acceptance tests freeze that final shape. No released consumer observed the earlier provisional string-warning/raw-reason form; additive-only compatibility applies from the first release onward.
+
 ## Consequences
 
 - `status` and `history` parse journal files directly; `history --json` is nearly a pass-through of stored events.

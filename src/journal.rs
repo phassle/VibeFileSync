@@ -83,45 +83,20 @@ impl Journal {
         pair_name: &str,
         plan: &Plan,
         run_warnings: &[String],
+        degradations: &[&str],
     ) -> io::Result<()> {
-        let mut actions = Vec::new();
-        actions.extend(
-            plan.copies
-                .iter()
-                .map(|action| planned(Operation::Copy, action)),
+        let actions = crate::event::planned_actions(plan);
+        let mut event = crate::event::run_start(
+            crate::event::Context {
+                schema: SCHEMA,
+                run_id: &self.run_id,
+            },
+            pair_name,
+            run_warnings,
+            degradations,
         );
-        actions.extend(
-            plan.updates
-                .iter()
-                .map(|action| planned(Operation::Update, action)),
-        );
-        actions.extend(
-            plan.deletes
-                .iter()
-                .map(|action| planned(Operation::Delete, action)),
-        );
-        actions.extend(plan.strays.iter().map(|stray| {
-            planned(
-                Operation::Cleanup,
-                &Action {
-                    rel_path: stray.clone(),
-                    bytes: 0,
-                    old_bytes: None,
-                    reason: "abandoned temp".to_string(),
-                },
-            )
-        }));
-        self.append(
-            json!({
-                "schema": SCHEMA,
-                "type": "run_start",
-                "run_id": self.run_id,
-                "pair": pair_name,
-                "planned_actions": actions,
-                "warnings": run_warnings,
-            }),
-            true,
-        )
+        event["planned_actions"] = actions.into();
+        self.append(event, true)
     }
 
     pub fn action_start(
@@ -131,27 +106,25 @@ impl Journal {
         source: Option<&Path>,
         temp: Option<&Path>,
     ) -> io::Result<()> {
-        let source_identity = source.map(fs::metadata).transpose()?.map(|metadata| {
-            let modified_ns = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos().to_string());
-            json!({ "size": metadata.len(), "modified_ns": modified_ns })
-        });
-        self.append(
-            json!({
-                "schema": SCHEMA,
-                "type": "action_start",
-                "run_id": self.run_id,
-                "op": operation,
-                "path": path_text(&action.rel_path),
-                "bytes": action.bytes,
-                "temp_path": temp.map(path_text),
-                "source_identity": source_identity,
-            }),
-            false,
-        )
+        let source_identity = source
+            .map(fs::symlink_metadata)
+            .transpose()?
+            .map(|metadata| {
+                let modified_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos().to_string());
+                json!({ "size": metadata.len(), "modified_ns": modified_ns })
+            });
+        let context = crate::event::Context {
+            schema: SCHEMA,
+            run_id: &self.run_id,
+        };
+        let mut event = crate::event::action_start(context, operation, action);
+        event["temp_path"] = temp.map_or(Value::Null, |path| json!(path_text(path)));
+        event["source_identity"] = source_identity.unwrap_or(Value::Null);
+        self.append(event, false)
     }
 
     pub fn action_done(
@@ -159,21 +132,22 @@ impl Journal {
         operation: Operation,
         action: &Action,
         safety_net: Option<&Path>,
-        warnings: &[String],
+        warnings: &[crate::event::MetadataWarning],
+        verified: Option<crate::event::VerificationTier>,
     ) -> io::Result<()> {
         self.append(
-            json!({
-                "schema": SCHEMA,
-                "type": "action_done",
-                "run_id": self.run_id,
-                "op": operation,
-                "path": path_text(&action.rel_path),
-                "result": "done",
-                "bytes": action.bytes,
-                "verified": if matches!(operation, Operation::Copy | Operation::Update) { json!("standard") } else { Value::Null },
-                "safety_net": safety_net.map(path_text),
-                "warnings": warnings,
-            }),
+            crate::event::action_done(
+                crate::event::Context {
+                    schema: SCHEMA,
+                    run_id: &self.run_id,
+                },
+                operation,
+                action,
+                safety_net,
+                warnings,
+                verified,
+                true,
+            ),
             false,
         )
     }
@@ -182,35 +156,31 @@ impl Journal {
         &mut self,
         operation: Operation,
         action: &Action,
-        reason: &str,
+        reason: crate::failure::FailureReason,
     ) -> io::Result<()> {
         self.append(
-            json!({
-                "schema": SCHEMA,
-                "type": "action_failed",
-                "run_id": self.run_id,
-                "op": operation,
-                "path": path_text(&action.rel_path),
-                "result": "failed",
-                "bytes": action.bytes,
-                "reason": reason,
-                "warnings": [],
-            }),
+            crate::event::action_failed(
+                crate::event::Context {
+                    schema: SCHEMA,
+                    run_id: &self.run_id,
+                },
+                operation,
+                action,
+                reason,
+            ),
             false,
         )
     }
 
     pub fn summary(&mut self, stats: &RunStats) -> io::Result<()> {
         self.append(
-            json!({
-                "schema": SCHEMA,
-                "type": "summary",
-                "run_id": self.run_id,
-                "result": if stats.counts.failed == 0 { "success" } else { "partial" },
-                "counts": stats.counts,
-                "bytes": stats.bytes,
-                "warnings": stats.warnings,
-            }),
+            crate::event::summary(
+                crate::event::Context {
+                    schema: SCHEMA,
+                    run_id: &self.run_id,
+                },
+                stats,
+            ),
             true,
         )
     }
@@ -222,6 +192,11 @@ impl Journal {
             self.file.sync_all()?;
         }
         Ok(())
+    }
+
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -564,14 +539,6 @@ fn local_time(run_id: &str) -> String {
             .to_string_lossy()
             .into_owned()
     }
-}
-
-fn planned(operation: Operation, action: &Action) -> Value {
-    json!({
-        "op": operation,
-        "path": path_text(&action.rel_path),
-        "bytes": action.bytes,
-    })
 }
 
 fn path_text(path: &Path) -> String {

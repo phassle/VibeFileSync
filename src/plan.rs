@@ -12,14 +12,11 @@
 //! source or destination.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
-use std::io::Write;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde_json::json;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, Mode};
 use crate::error::AppError;
@@ -28,7 +25,7 @@ use crate::volume;
 /// Where archived old versions would go. A Dry-run has no Run id yet (a Run
 /// id is only minted when a run actually starts, per CONTEXT.md), so the
 /// annotation uses a placeholder rather than inventing a timestamp.
-const SAFETYNET_NOTE: &str = "→ _SafetyNet/<run-id>/";
+pub(crate) const SAFETYNET_NOTE: &str = "→ _SafetyNet/<run-id>/";
 
 /// A single scanned file (or symlink). Directories are traversed but never
 /// themselves an [`Entry`] — the plan operates at file granularity.
@@ -42,13 +39,40 @@ pub struct Entry {
 /// One planned file operation, carrying what the human diff row shows. The
 /// operation itself (copy/update/delete) is encoded by which [`Plan`] vector
 /// the action lives in, so it isn't repeated as a field here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StructuralConflict {
+    DestinationFile,
+    DestinationDirectory,
+}
+
+impl StructuralConflict {
+    pub(crate) fn has_dependent_copy(self, deletion: &Path, copy: &Path) -> bool {
+        match self {
+            Self::DestinationDirectory => copy == deletion,
+            Self::DestinationFile => copy.starts_with(deletion),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
     pub rel_path: PathBuf,
     pub bytes: u64,
-    /// Size of the destination version being replaced or archived, if any.
+    pub source_mtime: Option<SystemTime>,
     pub old_bytes: Option<u64>,
     pub reason: String,
+    pub structural_conflict: Option<StructuralConflict>,
+}
+
+fn destination_directory_replacement(path: &Path) -> Action {
+    Action {
+        rel_path: path.to_path_buf(),
+        bytes: 0,
+        source_mtime: None,
+        old_bytes: Some(0),
+        reason: "replaced by source file".into(),
+        structural_conflict: Some(StructuralConflict::DestinationDirectory),
+    }
 }
 
 /// A per-file plan error — surfaced as an ERRORS row rather than crashing
@@ -57,6 +81,24 @@ pub struct Action {
 pub struct PlanError {
     pub rel_path: PathBuf,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PlanOperation {
+    Copy,
+    Update,
+    Delete,
+    Cleanup,
+    Error,
+}
+
+#[derive(Debug)]
+enum SourceClassification {
+    Action(PlanOperation, Action),
+    Error(PlanError),
+    Excluded,
+    Unchanged,
 }
 
 /// The computed Dry-run diff for one Folder pair.
@@ -83,14 +125,16 @@ pub struct Plan {
     /// Sibling dot-temps left by an interrupted run. They are never sync
     /// content, but read commands report them and a real run cleans them.
     pub strays: Vec<PathBuf>,
+    pub directory_copies: BTreeSet<PathBuf>,
+    pub directory_deletes: BTreeSet<PathBuf>,
 }
 
 /// Is `name` sync machinery the scanner must never treat as content?
 ///
 /// `_SafetyNet/` is the archive tree; `.*.vibesync-tmp-*` are in-flight
 /// Publish temps. Neither is ever synced, and neither is ever planned for
-/// deletion (invariant I5) — skipping them here is what makes that true on
-/// both the source and destination side.
+/// deletion (invariant I5). AppleDouble files require content-aware handling
+/// because `._notes` can also be a legitimate user filename.
 fn is_machinery(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name == "_SafetyNet"
@@ -98,46 +142,126 @@ fn is_machinery(name: &OsStr) -> bool {
             && (name.contains(".vibesync-tmp-") || name.starts_with("._vibesync-run-")))
 }
 
+fn is_apple_double(path: &Path, name: &OsStr) -> bool {
+    if !name.to_string_lossy().starts_with("._") {
+        return false;
+    }
+    let mut magic = [0_u8; 4];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == [0x00, 0x05, 0x16, 0x07]
+}
+
 /// Recursively collects every file and symlink under `root`, keyed by path
 /// relative to `root`, skipping machinery. `BTreeMap` keeps the output
 /// deterministically sorted. Symlinks are recorded via `symlink_metadata`
 /// (never followed), so a symlinked directory is one entry, not a subtree.
-fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
-    let mut map = BTreeMap::new();
-    let mut stack = vec![root.to_path_buf()];
+fn scan(root: &Path, skip_apple_double: bool) -> io::Result<BTreeMap<PathBuf, Entry>> {
+    let mut entries = BTreeMap::new();
+    walk(root, skip_apple_double, |path, entry| {
+        entries.insert(path.to_path_buf(), entry.clone());
+        Ok(())
+    })?;
+    Ok(entries)
+}
 
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
+fn scan_directories(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
+    let mut directories = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries.into_iter().rev() {
             if is_machinery(&entry.file_name()) {
                 continue;
             }
+            let path = entry.path();
+            if fs::symlink_metadata(&path)?.file_type().is_dir() {
+                directories.insert(
+                    path.strip_prefix(root)
+                        .expect("read_dir path is under root")
+                        .to_path_buf(),
+                );
+                stack.push(path);
+            }
+        }
+    }
+    Ok(directories)
+}
 
+fn walk(
+    root: &Path,
+    skip_apple_double: bool,
+    mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
+) -> io::Result<usize> {
+    fn recurse(
+        root: &Path,
+        directory: &Path,
+        skip_apple_double: bool,
+        visit: &mut impl FnMut(&Path, &Entry) -> io::Result<()>,
+        count: &mut usize,
+    ) -> io::Result<()> {
+        for_each_sorted_entry(directory, |entry| {
+            if is_machinery(&entry.file_name())
+                || (skip_apple_double && is_apple_double(&entry.path(), &entry.file_name()))
+            {
+                return Ok(());
+            }
             let path = entry.path();
             let meta = fs::symlink_metadata(&path)?;
             let file_type = meta.file_type();
-
             if file_type.is_dir() {
-                stack.push(path);
-                continue;
+                recurse(root, &path, skip_apple_double, visit, count)?;
+            } else {
+                #[cfg(all(feature = "fault-injection", debug_assertions))]
+                if let Ok(delay) = std::env::var("VIBESYNC_TEST_PLAN_SCAN_DELAY_MS") {
+                    std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("read_dir path is under root");
+                visit(
+                    rel,
+                    &Entry {
+                        size: meta.len(),
+                        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                        is_symlink: file_type.is_symlink(),
+                    },
+                )?;
+                *count += 1;
             }
-
-            let rel = path
-                .strip_prefix(root)
-                .expect("read_dir path is under root")
-                .to_path_buf();
-            map.insert(
-                rel,
-                Entry {
-                    size: meta.len(),
-                    mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    is_symlink: file_type.is_symlink(),
-                },
-            );
-        }
+            Ok(())
+        })
     }
 
-    Ok(map)
+    let mut count = 0;
+    recurse(root, root, skip_apple_double, &mut visit, &mut count)?;
+    Ok(count)
+}
+
+fn for_each_sorted_entry(
+    directory: &Path,
+    mut visit: impl FnMut(fs::DirEntry) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut previous: Option<OsString> = None;
+    loop {
+        let mut next: Option<fs::DirEntry> = None;
+        for candidate in fs::read_dir(directory)? {
+            let candidate = candidate?;
+            let name = candidate.file_name();
+            if previous.as_ref().is_some_and(|previous| name <= *previous)
+                || next.as_ref().is_some_and(|next| name >= next.file_name())
+            {
+                continue;
+            }
+            next = Some(candidate);
+        }
+        let Some(next) = next else { break };
+        previous = Some(next.file_name());
+        visit(next)?;
+    }
+    Ok(())
 }
 
 /// Computes the Dry-run diff. Pure over the two scanned trees:
@@ -151,12 +275,14 @@ fn scan(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
 ///   an ERRORS row instead of a COPY/UPDATE.
 ///
 /// `excludes` are exact relative-path strings (as the diff prints them,
-/// ADR-0004); a matching candidate is dropped and counted in `excluded`.
+/// ADR-0004); a matching unfiltered action/error row is dropped and counted
+/// in `excluded`.
 pub fn compute(
     source: &BTreeMap<PathBuf, Entry>,
     dest: &BTreeMap<PathBuf, Entry>,
     mode: Mode,
     supports_symlinks: bool,
+    mtime_tolerance: Duration,
     excludes: &[String],
 ) -> Plan {
     // `scanned` is the count of files the plan actually reasons about, so
@@ -167,60 +293,19 @@ pub fn compute(
     // in Mirror mode.
     let dest_only = || dest.keys().filter(|p| !source.contains_key(*p)).count();
     let mut plan = Plan {
-        scanned: source.len() + if mode == Mode::Mirror { dest_only() } else { 0 },
+        scanned: if mode == Mode::Mirror { dest_only() } else { 0 },
         source_entries: source.len(),
         destination_entries: dest.len(),
         ..Plan::default()
     };
-    let is_excluded = |rel: &Path| excludes.iter().any(|exclude| Path::new(exclude) == rel);
     let mut actionable_paths = BTreeSet::new();
-
     for (rel, src) in source {
-        if src.is_symlink && !supports_symlinks {
-            actionable_paths.insert(rel.clone());
-            if is_excluded(rel) {
-                plan.excluded += 1;
-            } else {
-                plan.errors.push(PlanError {
-                    rel_path: rel.clone(),
-                    message: "symlink not supported on exFAT destination".to_string(),
-                });
-            }
-            continue;
+        let classification =
+            classify_source_entry(rel, src, dest.get(rel), supports_symlinks, mtime_tolerance);
+        if let Some(path) = actionable_path(&classification) {
+            actionable_paths.insert(path.to_path_buf());
         }
-
-        match dest.get(rel) {
-            None => {
-                actionable_paths.insert(rel.clone());
-                if is_excluded(rel) {
-                    plan.excluded += 1;
-                } else {
-                    plan.copies.push(Action {
-                        rel_path: rel.clone(),
-                        bytes: src.size,
-                        old_bytes: None,
-                        reason: "new".to_string(),
-                    });
-                }
-            }
-            Some(dst) => {
-                if let Some(reason) = change_reason(src, dst) {
-                    actionable_paths.insert(rel.clone());
-                    if is_excluded(rel) {
-                        plan.excluded += 1;
-                    } else {
-                        plan.updates.push(Action {
-                            rel_path: rel.clone(),
-                            bytes: src.size,
-                            old_bytes: Some(dst.size),
-                            reason: reason.to_string(),
-                        });
-                    }
-                } else {
-                    plan.unchanged += 1;
-                }
-            }
-        }
+        record_classification(&mut plan, apply_excludes(classification, excludes));
     }
 
     // Removals are Mirror-only. In Update nothing at the destination is
@@ -231,15 +316,17 @@ pub fn compute(
                 continue;
             }
             actionable_paths.insert(rel.clone());
-            if is_excluded(rel) {
+            if excludes.iter().any(|excluded| Path::new(excluded) == rel) {
                 plan.excluded += 1;
                 continue;
             }
             plan.deletes.push(Action {
                 rel_path: rel.clone(),
                 bytes: dst.size,
+                source_mtime: None,
                 old_bytes: Some(dst.size),
                 reason: "not in source".to_string(),
+                structural_conflict: None,
             });
         }
     }
@@ -260,15 +347,124 @@ pub(crate) fn report_unknown_excludes(plan: &Plan) {
         eprintln!("vibesync: exclude path not found in plan: {excluded}");
     }
 }
+
+fn structural_dependency_satisfied(deletion: &Action, copies: &[Action]) -> bool {
+    match deletion.structural_conflict {
+        Some(conflict) => copies
+            .iter()
+            .any(|copy| conflict.has_dependent_copy(&deletion.rel_path, &copy.rel_path)),
+        None => true,
+    }
+}
+
+/// A structural delete exists only to unblock a reviewed Publish. If review
+/// filtering or reconciliation removes every dependent COPY, the delete must
+/// disappear too so destination content is never archived on its own.
+pub(crate) fn drop_orphan_structural_deletions(plan: &mut Plan) -> usize {
+    let before = plan.deletes.len();
+    plan.deletes
+        .retain(|deletion| structural_dependency_satisfied(deletion, &plan.copies));
+    let removed = before - plan.deletes.len();
+    plan.excluded += removed;
+    removed
+}
+
+/// Classifies and records one source entry for both buffered human plans and
+/// incremental JSON plans. Returning the row lets the streaming caller emit
+/// immediately without reimplementing the classification decision tree.
+fn classify_source_entry(
+    rel: &Path,
+    source: &Entry,
+    destination: Option<&Entry>,
+    supports_symlinks: bool,
+    mtime_tolerance: Duration,
+) -> SourceClassification {
+    if source.is_symlink && !supports_symlinks {
+        let error = PlanError {
+            rel_path: rel.to_path_buf(),
+            message: "symlink not supported on exFAT destination".to_string(),
+        };
+        return SourceClassification::Error(error);
+    }
+    match destination {
+        None => SourceClassification::Action(
+            PlanOperation::Copy,
+            Action {
+                rel_path: rel.to_path_buf(),
+                bytes: source.size,
+                source_mtime: Some(source.mtime),
+                old_bytes: None,
+                reason: "new".to_string(),
+                structural_conflict: None,
+            },
+        ),
+        Some(old) => match change_reason(source, old, mtime_tolerance) {
+            Some(reason) => SourceClassification::Action(
+                PlanOperation::Update,
+                Action {
+                    rel_path: rel.to_path_buf(),
+                    bytes: source.size,
+                    source_mtime: Some(source.mtime),
+                    old_bytes: Some(old.size),
+                    reason: reason.to_string(),
+                    structural_conflict: None,
+                },
+            ),
+            None => SourceClassification::Unchanged,
+        },
+    }
+}
+
+fn actionable_path(classification: &SourceClassification) -> Option<&Path> {
+    match classification {
+        SourceClassification::Action(_, action) => Some(&action.rel_path),
+        SourceClassification::Error(error) => Some(&error.rel_path),
+        SourceClassification::Excluded | SourceClassification::Unchanged => None,
+    }
+}
+
+fn apply_excludes(
+    classification: SourceClassification,
+    excludes: &[String],
+) -> SourceClassification {
+    let excluded = actionable_path(&classification).is_some_and(|path| {
+        excludes
+            .iter()
+            .any(|candidate| Path::new(candidate) == path)
+    });
+    if excluded {
+        SourceClassification::Excluded
+    } else {
+        classification
+    }
+}
+
+fn record_classification(plan: &mut Plan, classification: SourceClassification) {
+    plan.scanned += 1;
+    match classification {
+        SourceClassification::Action(PlanOperation::Copy, action) => plan.copies.push(action),
+        SourceClassification::Action(PlanOperation::Update, action) => plan.updates.push(action),
+        SourceClassification::Action(_, _) => unreachable!("source rows are copy/update only"),
+        SourceClassification::Error(error) => plan.errors.push(error),
+        SourceClassification::Excluded => plan.excluded += 1,
+        SourceClassification::Unchanged => plan.unchanged += 1,
+    }
+}
+
 /// Why a file present on both sides needs an UPDATE, or `None` if it is
 /// unchanged. Size is the cheap, decisive signal; mtime catches
 /// same-size edits (with the documented cross-filesystem granularity risk).
-fn change_reason(src: &Entry, dst: &Entry) -> Option<&'static str> {
+fn change_reason(src: &Entry, dst: &Entry, mtime_tolerance: Duration) -> Option<&'static str> {
     if src.is_symlink != dst.is_symlink {
         Some("type changed")
     } else if src.size != dst.size {
         Some("size differs")
-    } else if src.mtime != dst.mtime {
+    } else if src
+        .mtime
+        .duration_since(dst.mtime)
+        .unwrap_or_else(|_| dst.mtime.duration_since(src.mtime).unwrap_or_default())
+        > mtime_tolerance
+    {
         Some("modified")
     } else {
         None
@@ -372,7 +568,7 @@ fn push_errors(out: &mut String, rows: &[PlanError], width: usize) {
     out.push('\n');
 }
 
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -394,440 +590,403 @@ fn human_size(bytes: u64) -> String {
 /// source would render the whole destination as deletions, exactly the
 /// blast radius we refuse to imply. A missing destination is fine — it just
 /// reads as empty (a first sync), so everything plans as COPY.
-pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
-    let (pair, plan) = build(config_path, pair_name, excludes)?;
-    report_unknown_excludes(&plan);
+pub fn run(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
+    let (pair, plan) = build(config_path, pair_name, &[])?;
     print!("{}", render(&plan, pair_name, pair.mode));
     Ok(crate::error::EXIT_OK)
 }
 
-/// Emits the agent-facing Dry-run stream.  Each record is written and
-/// flushed independently so consumers can process rows as soon as planning
-/// has produced them; stdout contains NDJSON only (ADR-0003/0004).
-///
-/// A plan is deliberately not a Run: it gets an ephemeral `plan_id` rather
-/// than a journal/SafetyNet Run id.
-pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
-    let cfg = config::load(config_path)?;
-    let configured_pair = cfg
-        .pairs
-        .get(pair_name)
-        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
-    let (pair, notices) = crate::preconditions::resolve_pair(configured_pair)?;
-    for notice in notices {
+/// Emits the versioned Dry-run contract from the same fresh [`Plan`] used by
+/// human review and Run, so every surface names the exact same action set.
+pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
+    let setup = prepare(config_path, pair_name)?;
+    for notice in &setup.notices {
         eprintln!("{notice}");
     }
-    if !pair.source.is_dir() {
-        return Err(AppError::Precondition(format!(
-            "{}: source directory not found (is the volume mounted?)",
-            pair.source.display()
-        )));
-    }
-
+    let header_pair = setup.pair;
     let plan_id = plan_id();
-    let mut stdout = io::stdout().lock();
-
-    emit(
-        &mut stdout,
-        json!({
-            "schema": "vibefilesync.plan/v1",
-            "type": "plan_start",
-            "plan_id": plan_id,
-            "pair": pair_name,
-            "mode": pair.mode.to_string(),
-            "dry_run": true,
-        }),
-    )?;
-
-    let supports_symlinks = if pair.destination.is_dir() {
-        match volume::filesystem_type(&pair.destination) {
-            Ok(filesystem) => !filesystem.eq_ignore_ascii_case("exfat"),
-            Err(_) => true,
+    emit(serde_json::json!({
+        "schema": "vibefilesync.plan/v1", "type": "plan_start", "plan_id": plan_id,
+        "pair": pair_name, "mode": header_pair.mode, "dry_run": true
+    }))?;
+    let mut stats = StreamStats::default();
+    walk(&header_pair.source, false, |path, entry| {
+        stats.scanned += 1;
+        let destination_path = header_pair.destination.join(path);
+        let replaces_directory = is_directory(&destination_path)?
+            && !contains_machinery(&destination_path);
+        let old = entry_at(&destination_path)?;
+        let classification = classify_source_entry(
+            path,
+            entry,
+            old.as_ref(),
+            setup.supports_symlinks,
+            setup.mtime_tolerance,
+        );
+        let row = match classification {
+            SourceClassification::Action(op, action) => {
+                if replaces_directory {
+                    crate::ndjson::stdout(&plan_action_row(&plan_id, op, &action))
+                        .map_err(io::Error::other)?;
+                    let replacement = destination_directory_replacement(path);
+                    crate::ndjson::stdout(&plan_action_row(
+                        &plan_id,
+                        PlanOperation::Delete,
+                        &replacement,
+                    ))
+                    .map_err(io::Error::other)?;
+                    stats.increment(op);
+                    stats.deletes += 1;
+                    stats.scanned += 1;
+                    return Ok(());
+                }
+                stats.increment(op);
+                plan_action_row(&plan_id, op, &action)
+            }
+            SourceClassification::Error(error) => {
+                stats.errors += 1;
+                serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","plan_id":plan_id,"op":PlanOperation::Error,"path":error.rel_path.to_string_lossy(),"reason":error.message})
+            }
+            SourceClassification::Unchanged => {
+                stats.unchanged += 1;
+                return Ok(());
+            }
+            SourceClassification::Excluded => unreachable!("public Plan has no exclusions"),
+        };
+        crate::ndjson::stdout(&row).map_err(io::Error::other)
+    })
+    .map_err(|e| scan_error(&header_pair.source, e))?;
+    walk_leaf_directories(&header_pair.source, |path| {
+        if fs::symlink_metadata(header_pair.destination.join(path))
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return Ok(());
         }
-    } else {
-        true
-    };
-
-    // Walk each tree through ReadDir iterators. Looking up the counterpart
-    // path on demand avoids retaining either a whole tree or a wide
-    // directory's entries, so rows reach stdout as traversal discovers them.
-    let mut counts = JsonPlanCounts::default();
-    stream_source_tree(
-        &pair.source,
-        pair.destination
-            .is_dir()
-            .then_some(pair.destination.as_path()),
-        Path::new(""),
-        pair.mode,
-        supports_symlinks,
-        excludes,
-        &mut counts,
-        &mut |action| emit_plan_action(&mut stdout, &plan_id, action),
-    )?;
-    if pair.mode == Mode::Mirror && pair.destination.is_dir() {
-        stream_destination_deletes(
-            &pair.source,
-            &pair.destination,
-            Path::new(""),
-            excludes,
-            &mut counts,
-            &mut |action| emit_plan_action(&mut stdout, &plan_id, action),
-        )?;
-    }
-
-    let cleanup = stream_stray_temps(&pair.destination, &mut |stray, bytes| {
-        emit(
-            &mut stdout,
-            json!({
-                "schema": "vibefilesync.plan/v1",
-                "type": "action",
-                "plan_id": plan_id,
-                "op": "cleanup",
-                "path": path_text(stray),
-                "reason": "abandoned temp",
-                "bytes": bytes,
-            }),
-        )
-    })?;
-    emit(
-        &mut stdout,
-        json!({
-            "schema": "vibefilesync.plan/v1",
-            "type": "summary",
-            "plan_id": plan_id,
-            "counts": {
-                "copy": counts.copies,
-                "update": counts.updates,
-                "delete": counts.deletes,
-                "error": counts.errors,
-                "cleanup": cleanup,
-                "scanned": counts.scanned,
-                "unchanged": counts.unchanged,
-                "excluded": counts.excluded,
+        let action = Action {
+            rel_path: path.to_path_buf(),
+            bytes: 0,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "new directory".into(),
+            structural_conflict: None,
+        };
+        crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Copy, &action))
+            .map_err(io::Error::other)?;
+        stats.copies += 1;
+        stats.scanned += 1;
+        Ok(())
+    })
+    .map_err(|error| scan_error(&header_pair.source, error))?;
+    if header_pair.destination.is_dir() {
+        if header_pair.mode == Mode::Mirror {
+            walk_destination_directory_deletes(
+                &header_pair.source,
+                &header_pair.destination,
+                |path| {
+                    let action = Action {
+                        rel_path: path.to_path_buf(),
+                        bytes: 0,
+                        source_mtime: None,
+                        old_bytes: Some(0),
+                        reason: "directory not in source".into(),
+                        structural_conflict: None,
+                    };
+                    crate::ndjson::stdout(&plan_action_row(
+                        &plan_id,
+                        PlanOperation::Delete,
+                        &action,
+                    ))
+                    .map_err(io::Error::other)?;
+                    stats.deletes += 1;
+                    stats.scanned += 1;
+                    Ok(())
+                },
+            )
+            .map_err(|error| scan_error(&header_pair.destination, error))?;
+        }
+        walk(
+            &header_pair.destination,
+            setup.skip_apple_double,
+            |path, entry| {
+                let collapsed = header_pair.mode == Mode::Mirror
+                    && has_collapsed_destination_ancestor(
+                        &header_pair.source,
+                        &header_pair.destination,
+                        path,
+                    )?;
+                if collapsed || has_file_ancestor(&header_pair.source, path)? {
+                    if header_pair.mode == Mode::Mirror {
+                        stats.scanned += 1;
+                    }
+                    return Ok(());
+                }
+                let source = fs::symlink_metadata(header_pair.source.join(path));
+                let (reason, structural_conflict) = match source {
+                    Ok(metadata) if metadata.file_type().is_dir() => (
+                        "replaced by source directory",
+                        Some(StructuralConflict::DestinationFile),
+                    ),
+                    Ok(_) => return Ok(()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) && header_pair.mode == Mode::Mirror =>
+                    {
+                        ("not in source", None)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(error),
+                };
+                stats.scanned += 1;
+                let action = Action {
+                    rel_path: path.to_path_buf(),
+                    bytes: entry.size,
+                    source_mtime: None,
+                    old_bytes: Some(entry.size),
+                    reason: reason.into(),
+                    structural_conflict,
+                };
+                crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Delete, &action))
+                    .map_err(io::Error::other)?;
+                stats.deletes += 1;
+                Ok(())
             },
-        }),
-    )?;
+        )
+        .map_err(|error| scan_error(&header_pair.destination, error))?;
+    }
+    walk_stray_temps(&header_pair.destination, |path| {
+        let bytes = fs::symlink_metadata(header_pair.destination.join(path))?.len();
+        let action = Action {
+            rel_path: path.to_path_buf(),
+            bytes,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "abandoned temp".into(),
+            structural_conflict: None,
+        };
+        crate::ndjson::stdout(&plan_action_row(&plan_id, PlanOperation::Cleanup, &action))
+            .map_err(io::Error::other)?;
+        stats.cleanup += 1;
+        Ok(())
+    })
+    .map_err(|error| scan_error(&header_pair.destination, error))?;
+    emit(serde_json::json!({
+        "schema": "vibefilesync.plan/v1", "type": "summary", "plan_id": plan_id,
+        "counts": {
+            "copy": stats.copies, "update": stats.updates, "delete": stats.deletes,
+            "error": stats.errors, "cleanup": stats.cleanup, "scanned": stats.scanned,
+            "unchanged": stats.unchanged, "excluded": stats.excluded
+        }
+    }))?;
     Ok(crate::error::EXIT_OK)
 }
 
+fn entry_at(path: &Path) -> io::Result<Option<Entry>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(None),
+        Ok(metadata) => Ok(Some(Entry {
+            size: metadata.len(),
+            mtime: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            is_symlink: metadata.file_type().is_symlink(),
+        })),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_directory(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn walk_leaf_directories(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    fn recurse(
+        root: &Path,
+        directory: &Path,
+        visit: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let mut has_content = false;
+        for_each_sorted_entry(directory, |entry| {
+            if is_machinery(&entry.file_name()) {
+                return Ok(());
+            }
+            has_content = true;
+            let path = entry.path();
+            if fs::symlink_metadata(&path)?.file_type().is_dir() {
+                recurse(root, &path, visit)?;
+            }
+            Ok(())
+        })?;
+        if directory != root && !has_content {
+            visit(
+                directory
+                    .strip_prefix(root)
+                    .expect("walked directory is under root"),
+            )?;
+        }
+        Ok(has_content)
+    }
+
+    recurse(root, root, &mut visit)?;
+    Ok(())
+}
+
+fn walk_destination_directory_deletes(
+    source_root: &Path,
+    destination_root: &Path,
+    mut visit: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    fn recurse(
+        source_root: &Path,
+        destination_root: &Path,
+        directory: &Path,
+        visit: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for_each_sorted_entry(directory, |entry| {
+            if is_machinery(&entry.file_name()) {
+                return Ok(());
+            }
+            let path = entry.path();
+            if !fs::symlink_metadata(&path)?.file_type().is_dir() {
+                return Ok(());
+            }
+            let relative = path
+                .strip_prefix(destination_root)
+                .expect("walked directory is under destination");
+            match fs::symlink_metadata(source_root.join(relative)) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    recurse(source_root, destination_root, &path, visit)?;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    if contains_machinery(&path) {
+                        recurse(source_root, destination_root, &path, visit)?;
+                    } else {
+                        visit(relative)?;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            Ok(())
+        })
+    }
+
+    recurse(source_root, destination_root, destination_root, &mut visit)
+}
+
+fn has_collapsed_destination_ancestor(
+    source_root: &Path,
+    destination_root: &Path,
+    path: &Path,
+) -> io::Result<bool> {
+    let mut ancestor = path.parent();
+    while let Some(relative) = ancestor {
+        let destination = destination_root.join(relative);
+        match fs::symlink_metadata(source_root.join(relative)) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                if destination.is_dir() && !contains_machinery(&destination) {
+                    return Ok(true);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        ancestor = relative.parent();
+    }
+    Ok(false)
+}
+
+fn has_file_ancestor(root: &Path, path: &Path) -> io::Result<bool> {
+    let mut ancestor = path.parent();
+    while let Some(relative) = ancestor {
+        match fs::symlink_metadata(root.join(relative)) {
+            Ok(metadata) if !metadata.file_type().is_dir() => return Ok(true),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        ancestor = relative.parent();
+    }
+    Ok(false)
+}
+
 #[derive(Default)]
-struct JsonPlanCounts {
+struct StreamStats {
     copies: usize,
     updates: usize,
     deletes: usize,
     errors: usize,
+    cleanup: usize,
     scanned: usize,
     unchanged: usize,
     excluded: usize,
 }
 
-enum JsonPlanAction {
-    Copy {
-        path: PathBuf,
-        bytes: u64,
-    },
-    Update {
-        path: PathBuf,
-        bytes: u64,
-        old_bytes: u64,
-        reason: &'static str,
-    },
-    Delete {
-        path: PathBuf,
-        bytes: u64,
-    },
-    Error {
-        path: PathBuf,
-        reason: &'static str,
-    },
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stream_source_tree(
-    source: &Path,
-    destination: Option<&Path>,
-    relative: &Path,
-    mode: Mode,
-    supports_symlinks: bool,
-    excludes: &[String],
-    counts: &mut JsonPlanCounts,
-    emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
-) -> Result<(), AppError> {
-    for entry in fs::read_dir(source).map_err(|error| scan_error(source, error))? {
-        let entry = entry.map_err(|error| scan_error(source, error))?;
-        if is_machinery(&entry.file_name()) {
-            continue;
-        }
-        let source_path = entry.path();
-        let child_relative = relative.join(entry.file_name());
-        let destination_path = destination.map(|root| root.join(entry.file_name()));
-        let source_metadata =
-            fs::symlink_metadata(&source_path).map_err(|error| scan_error(&source_path, error))?;
-        if source_metadata.file_type().is_dir() {
-            let destination_directory = match destination_path.as_deref() {
-                Some(path) => match fs::symlink_metadata(path) {
-                    Ok(metadata) if metadata.file_type().is_dir() => Some(path),
-                    Ok(metadata) => {
-                        if mode == Mode::Mirror {
-                            counts.scanned += 1;
-                            if excludes
-                                .iter()
-                                .any(|exclude| Path::new(exclude) == child_relative)
-                            {
-                                counts.excluded += 1;
-                            } else {
-                                counts.deletes += 1;
-                                emit(JsonPlanAction::Delete {
-                                    path: child_relative.clone(),
-                                    bytes: metadata.len(),
-                                })?;
-                            }
-                        }
-                        None
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(scan_error(path, error)),
-                },
-                None => None,
-            };
-            stream_source_tree(
-                &source_path,
-                destination_directory,
-                &child_relative,
-                mode,
-                supports_symlinks,
-                excludes,
-                counts,
-                emit,
-            )?;
-        } else {
-            stream_source_entry(
-                source_path,
-                destination_path.filter(|path| path.is_file() || path.is_symlink()),
-                &child_relative,
-                supports_symlinks,
-                excludes,
-                counts,
-                emit,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn stream_stray_temps(
-    root: &Path,
-    emit: &mut impl FnMut(&Path, u64) -> Result<(), AppError>,
-) -> Result<usize, AppError> {
-    if !root.is_dir() {
-        return Ok(0);
-    }
-    stream_stray_directory(root, root, emit)
-}
-
-fn stream_stray_directory(
-    root: &Path,
-    directory: &Path,
-    emit: &mut impl FnMut(&Path, u64) -> Result<(), AppError>,
-) -> Result<usize, AppError> {
-    let mut count = 0;
-    for entry in fs::read_dir(directory).map_err(|error| scan_error(directory, error))? {
-        let entry = entry.map_err(|error| scan_error(directory, error))?;
-        if entry.file_name() == "_SafetyNet" {
-            continue;
-        }
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(|error| scan_error(&path, error))?;
-        if metadata.file_type().is_dir() {
-            count += stream_stray_directory(root, &path, emit)?;
-        } else if is_stray_temp(&entry.file_name()) {
-            let relative = path
-                .strip_prefix(root)
-                .expect("streamed temp is under its destination root");
-            emit(relative, metadata.len())?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stream_source_entry(
-    source: PathBuf,
-    destination: Option<PathBuf>,
-    relative: &Path,
-    supports_symlinks: bool,
-    excludes: &[String],
-    counts: &mut JsonPlanCounts,
-    emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
-) -> Result<(), AppError> {
-    let source_metadata =
-        fs::symlink_metadata(&source).map_err(|error| scan_error(&source, error))?;
-    if source_metadata.file_type().is_dir() {
-        unreachable!("directories are handled by stream_source_tree")
-    }
-
-    counts.scanned += 1;
-    let is_excluded = excludes
-        .iter()
-        .any(|exclude| Path::new(exclude) == relative);
-    if source_metadata.file_type().is_symlink() && !supports_symlinks {
-        if is_excluded {
-            counts.excluded += 1;
-            return Ok(());
-        }
-        counts.errors += 1;
-        return emit(JsonPlanAction::Error {
-            path: relative.to_path_buf(),
-            reason: "symlink not supported on exFAT destination",
-        });
-    }
-    match destination {
-        None => {
-            if is_excluded {
-                counts.excluded += 1;
-                return Ok(());
-            }
-            counts.copies += 1;
-            emit(JsonPlanAction::Copy {
-                path: relative.to_path_buf(),
-                bytes: source_metadata.len(),
-            })
-        }
-        Some(destination) => {
-            let destination_metadata = fs::symlink_metadata(&destination)
-                .map_err(|error| scan_error(&destination, error))?;
-            let source_entry = Entry {
-                size: source_metadata.len(),
-                mtime: source_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                is_symlink: source_metadata.file_type().is_symlink(),
-            };
-            let destination_entry = Entry {
-                size: destination_metadata.len(),
-                mtime: destination_metadata
-                    .modified()
-                    .unwrap_or(SystemTime::UNIX_EPOCH),
-                is_symlink: destination_metadata.file_type().is_symlink(),
-            };
-            match change_reason(&source_entry, &destination_entry) {
-                Some(reason) => {
-                    if is_excluded {
-                        counts.excluded += 1;
-                        return Ok(());
-                    }
-                    counts.updates += 1;
-                    emit(JsonPlanAction::Update {
-                        path: relative.to_path_buf(),
-                        bytes: source_entry.size,
-                        old_bytes: destination_entry.size,
-                        reason,
-                    })
-                }
-                None => {
-                    counts.unchanged += 1;
-                    Ok(())
-                }
-            }
+impl StreamStats {
+    fn increment(&mut self, operation: PlanOperation) {
+        match operation {
+            PlanOperation::Copy => self.copies += 1,
+            PlanOperation::Update => self.updates += 1,
+            _ => unreachable!("source actions are copy/update only"),
         }
     }
 }
 
-fn stream_destination_deletes(
-    source_root: &Path,
-    destination: &Path,
-    relative: &Path,
-    excludes: &[String],
-    counts: &mut JsonPlanCounts,
-    emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
-) -> Result<(), AppError> {
-    for entry in fs::read_dir(destination).map_err(|error| scan_error(destination, error))? {
-        let entry = entry.map_err(|error| scan_error(destination, error))?;
-        if is_machinery(&entry.file_name()) {
-            continue;
-        }
-        let destination_path = entry.path();
-        let child_relative = relative.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&destination_path)
-            .map_err(|error| scan_error(&destination_path, error))?;
-        let source_path = source_root.join(entry.file_name());
-        if metadata.file_type().is_dir() {
-            stream_destination_deletes(
-                &source_path,
-                &destination_path,
-                &child_relative,
-                excludes,
-                counts,
-                emit,
-            )?;
-        } else if source_path_is_absent(&source_path) {
-            counts.scanned += 1;
-            if excludes
-                .iter()
-                .any(|exclude| Path::new(exclude) == child_relative)
-            {
-                counts.excluded += 1;
-            } else {
-                counts.deletes += 1;
-                emit(JsonPlanAction::Delete {
-                    path: child_relative,
-                    bytes: metadata.len(),
-                })?;
-            }
-        }
+fn plan_action_row(plan_id: &str, op: PlanOperation, action: &Action) -> serde_json::Value {
+    let mut row = serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","plan_id":plan_id,"op":op,"path":action.rel_path.to_string_lossy(),"reason":action.reason,"bytes":action.bytes});
+    if let Some(bytes) = action.old_bytes {
+        row["old_bytes"] = bytes.into();
     }
-    Ok(())
+    if matches!(op, PlanOperation::Update | PlanOperation::Delete) {
+        row["safety_net"] = format!("_SafetyNet/<run-id>/{}", action.rel_path.display()).into();
+    }
+    row
 }
 
-fn source_path_is_absent(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_err_and(|error| {
-        matches!(
-            error.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-        )
-    })
-}
-
-fn emit_plan_action(
-    output: &mut impl Write,
-    plan_id: &str,
-    action: JsonPlanAction,
-) -> Result<(), AppError> {
-    let (op, path, reason, bytes, old_bytes, safety_net) = match action {
-        JsonPlanAction::Copy { path, bytes } => ("copy", path, "new", Some(bytes), None, false),
-        JsonPlanAction::Update {
-            path,
-            bytes,
-            old_bytes,
-            reason,
-        } => ("update", path, reason, Some(bytes), Some(old_bytes), true),
-        JsonPlanAction::Delete { path, bytes } => (
-            "delete",
-            path,
-            "not in source",
-            Some(bytes),
-            Some(bytes),
-            true,
-        ),
-        JsonPlanAction::Error { path, reason } => ("error", path, reason, None, None, false),
-    };
-    let mut event = json!({
-        "schema": "vibefilesync.plan/v1",
-        "type": "action",
-        "plan_id": plan_id,
-        "op": op,
-        "path": path_text(&path),
-        "reason": reason,
-    });
-    if let Some(bytes) = bytes {
-        event["bytes"] = json!(bytes);
-    }
-    if let Some(old_bytes) = old_bytes {
-        event["old_bytes"] = json!(old_bytes);
-    }
-    if safety_net {
-        event["safety_net"] = json!(format!("_SafetyNet/<run-id>/{}", path_text(&path)));
-    }
-    emit(output, event)
+fn emit(value: serde_json::Value) -> Result<(), AppError> {
+    crate::ndjson::stdout(&value)
 }
 
 fn plan_id() -> String {
@@ -837,19 +996,52 @@ fn plan_id() -> String {
     format!("plan-{}-{:09}", now.as_secs(), now.subsec_nanos())
 }
 
-fn path_text(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+struct PlanSetup {
+    pair: config::Pair,
+    supports_symlinks: bool,
+    mtime_tolerance: Duration,
+    skip_apple_double: bool,
+    notices: Vec<String>,
 }
 
-fn emit(output: &mut impl Write, event: serde_json::Value) -> Result<(), AppError> {
-    serde_json::to_writer(&mut *output, &event)
-        .map_err(|error| AppError::Precondition(error.to_string()))?;
-    output.write_all(b"\n").map_err(scan_error_for_stdout)?;
-    output.flush().map_err(scan_error_for_stdout)
-}
-
-fn scan_error_for_stdout(error: io::Error) -> AppError {
-    AppError::Precondition(format!("could not write JSON output: {error}"))
+fn prepare(config_path: &Path, pair_name: &str) -> Result<PlanSetup, AppError> {
+    let cfg = config::load(config_path)?;
+    let configured = cfg
+        .pairs
+        .get(pair_name)
+        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+    let (pair, notices) = crate::preconditions::resolve_pair(configured)?;
+    if !pair.source.is_dir() {
+        return Err(AppError::Precondition(format!(
+            "{}: source directory not found (is the volume mounted?)",
+            pair.source.display()
+        )));
+    }
+    let destination_type = if pair.destination.is_dir() {
+        Some(
+            volume::filesystem_type(&pair.destination)
+                .map_err(|error| scan_error(&pair.destination, error))?,
+        )
+    } else {
+        None
+    };
+    let is_exfat = destination_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("exfat"));
+    let supports_symlinks = !is_exfat;
+    let mtime_tolerance = destination_type
+        .as_deref()
+        .map(volume::timestamp_granularity_for)
+        .transpose()
+        .map_err(|error| scan_error(&pair.destination, error))?
+        .unwrap_or(Duration::ZERO);
+    Ok(PlanSetup {
+        pair,
+        supports_symlinks,
+        mtime_tolerance,
+        skip_apple_double: is_exfat,
+        notices,
+    })
 }
 
 /// Builds a fresh plan for the CLI edges which need to render it and then
@@ -860,87 +1052,281 @@ pub(crate) fn build(
     pair_name: &str,
     excludes: &[String],
 ) -> Result<(config::Pair, Plan), AppError> {
-    let cfg = config::load(config_path)?;
-    let pair = cfg
-        .pairs
-        .get(pair_name)
-        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
-    let (pair, notices) = crate::preconditions::resolve_pair(pair)?;
-    for notice in notices {
+    let setup = prepare(config_path, pair_name)?;
+    for notice in setup.notices {
         eprintln!("{notice}");
     }
-
-    if !pair.source.is_dir() {
-        return Err(AppError::Precondition(format!(
-            "{}: source directory not found (is the volume mounted?)",
-            pair.source.display()
-        )));
-    }
-
-    let source = scan(&pair.source).map_err(|e| scan_error(&pair.source, e))?;
-
-    let dest_exists = pair.destination.is_dir();
-    let dest = if dest_exists {
-        scan(&pair.destination).map_err(|e| scan_error(&pair.destination, e))?
+    let pair = setup.pair;
+    let source = scan(&pair.source, false).map_err(|error| scan_error(&pair.source, error))?;
+    let destination = if pair.destination.is_dir() {
+        scan(&pair.destination, setup.skip_apple_double)
+            .map_err(|error| scan_error(&pair.destination, error))?
     } else {
         BTreeMap::new()
     };
-
-    // exFAT can't store symlinks; a source symlink bound for it is a
-    // per-file plan error. If the destination doesn't exist yet, or its
-    // filesystem can't be determined, assume symlinks are fine rather than
-    // manufacturing errors.
-    let supports_symlinks = if dest_exists {
-        match volume::filesystem_type(&pair.destination) {
-            Ok(fs) => !fs.eq_ignore_ascii_case("exfat"),
-            Err(_) => true,
-        }
+    let source_directories =
+        scan_directories(&pair.source).map_err(|error| scan_error(&pair.source, error))?;
+    let destination_directories = if pair.destination.is_dir() {
+        scan_directories(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?
     } else {
-        true
+        BTreeSet::new()
     };
-
-    let mut plan = compute(&source, &dest, pair.mode, supports_symlinks, excludes);
-    #[cfg(feature = "fault-injection")]
-    if std::env::var_os("VIBESYNC_TEST_BLOCK_PLAN").is_some() {
-        plan.errors.push(PlanError {
-            rel_path: PathBuf::from("__test_blocked_plan__"),
-            message: "injected blocked plan".to_string(),
-        });
-    }
-    plan.strays = stray_temps(&pair.destination).map_err(|e| scan_error(&pair.destination, e))?;
+    let mut plan = compute(
+        &source,
+        &destination,
+        pair.mode,
+        setup.supports_symlinks,
+        setup.mtime_tolerance,
+        excludes,
+    );
+    add_directory_actions(
+        &mut plan,
+        &source,
+        &source_directories,
+        &destination_directories,
+        &pair.destination,
+        pair.mode,
+        excludes,
+    );
+    add_structural_replacements(
+        &mut plan,
+        &source,
+        &destination,
+        &pair.destination,
+        pair.mode,
+        excludes,
+    )
+    .map_err(|error| scan_error(&pair.destination, error))?;
+    plan.strays =
+        stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
     Ok((pair, plan))
+}
+
+fn add_directory_actions(
+    plan: &mut Plan,
+    source_entries: &BTreeMap<PathBuf, Entry>,
+    source: &BTreeSet<PathBuf>,
+    destination: &BTreeSet<PathBuf>,
+    destination_root: &Path,
+    mode: Mode,
+    excludes: &[String],
+) {
+    for path in source.difference(destination) {
+        if source_entries.keys().any(|entry| entry.starts_with(path))
+            || source
+                .iter()
+                .any(|directory| directory != path && directory.starts_with(path))
+        {
+            continue;
+        }
+        if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+            plan.excluded += 1;
+            continue;
+        }
+        plan.copies.push(Action {
+            rel_path: path.clone(),
+            bytes: 0,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "new directory".into(),
+            structural_conflict: None,
+        });
+        plan.scanned += 1;
+        plan.directory_copies.insert(path.clone());
+    }
+    if mode == Mode::Mirror {
+        for path in destination.difference(source) {
+            if destination
+                .difference(source)
+                .any(|ancestor| ancestor != path && path.starts_with(ancestor))
+                || contains_machinery(&destination_root.join(path))
+            {
+                continue;
+            }
+            if excludes.iter().any(|excluded| Path::new(excluded) == path) {
+                plan.excluded += 1;
+                continue;
+            }
+            plan.deletes
+                .retain(|action| !action.rel_path.starts_with(path));
+            plan.deletes.push(Action {
+                rel_path: path.clone(),
+                bytes: 0,
+                source_mtime: None,
+                old_bytes: Some(0),
+                reason: "directory not in source".into(),
+                structural_conflict: None,
+            });
+            plan.scanned += 1;
+            plan.directory_deletes.insert(path.clone());
+        }
+    }
+    plan.copies
+        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    plan.deletes
+        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+}
+
+fn contains_machinery(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if is_machinery(&entry.file_name()) {
+            return true;
+        }
+        if entry.path().is_dir() && contains_machinery(&entry.path()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn add_structural_replacements(
+    plan: &mut Plan,
+    source: &BTreeMap<PathBuf, Entry>,
+    destination: &BTreeMap<PathBuf, Entry>,
+    destination_root: &Path,
+    mode: Mode,
+    excludes: &[String],
+) -> io::Result<()> {
+    let mut structural = Vec::new();
+
+    // A destination file blocks creation of a source directory. Mirror
+    // already classifies it as destination-only, so tag that existing row;
+    // Update needs a new replacement row even though unrelated content stays.
+    for (path, entry) in destination {
+        if source
+            .keys()
+            .any(|source_path| source_path != path && source_path.starts_with(path))
+            || plan
+                .directory_copies
+                .iter()
+                .any(|source_path| source_path.starts_with(path))
+        {
+            if mode == Mode::Mirror {
+                if let Some(existing) = plan
+                    .deletes
+                    .iter_mut()
+                    .find(|action| action.rel_path == *path)
+                {
+                    existing.reason = "replaced by source directory".into();
+                    existing.structural_conflict = Some(StructuralConflict::DestinationFile);
+                }
+            } else {
+                structural.push(Action {
+                    rel_path: path.clone(),
+                    bytes: entry.size,
+                    source_mtime: None,
+                    old_bytes: Some(entry.size),
+                    reason: "replaced by source directory".into(),
+                    structural_conflict: Some(StructuralConflict::DestinationFile),
+                });
+                plan.scanned += 1;
+            }
+        }
+    }
+
+    // A reviewed destination directory at a source-file path is archived as
+    // one object after the dependent file passes its gate. An excluded
+    // descendant keeps the directory outside the structural replacement.
+    for copy in &plan.copies {
+        if plan.directory_copies.contains(&copy.rel_path)
+            || !fs::symlink_metadata(destination_root.join(&copy.rel_path))
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+            || excludes
+                .iter()
+                .any(|excluded| Path::new(excluded).starts_with(&copy.rel_path))
+            || contains_machinery(&destination_root.join(&copy.rel_path))
+        {
+            continue;
+        }
+        if let Some(existing) = plan
+            .deletes
+            .iter_mut()
+            .find(|action| action.rel_path == copy.rel_path)
+        {
+            existing.reason = "replaced by source file".into();
+            existing.structural_conflict = Some(StructuralConflict::DestinationDirectory);
+        } else {
+            structural.push(destination_directory_replacement(&copy.rel_path));
+        }
+        plan.directory_deletes.insert(copy.rel_path.clone());
+    }
+
+    for action in structural {
+        plan.unknown_excludes
+            .retain(|excluded| Path::new(excluded) != action.rel_path);
+        if excludes
+            .iter()
+            .any(|excluded| Path::new(excluded) == action.rel_path)
+        {
+            plan.excluded += 1;
+        } else if !plan
+            .deletes
+            .iter()
+            .any(|existing| existing.rel_path == action.rel_path)
+        {
+            plan.deletes.push(action);
+        }
+    }
+    plan.deletes
+        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    Ok(())
 }
 
 /// Lists abandoned sibling Publish temps without treating them as sync
 /// content. This is intentionally read-only so `plan` and `status` are safe
 /// at any time; only a real run removes the returned paths.
 pub(crate) fn stray_temps(root: &Path) -> io::Result<Vec<PathBuf>> {
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut strays = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if entry.file_name() == "_SafetyNet" {
-                continue;
+    walk_stray_temps(root, |path| {
+        strays.push(path.to_path_buf());
+        Ok(())
+    })?;
+    strays.sort();
+    Ok(strays)
+}
+
+fn walk_stray_temps(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<usize> {
+    enum Pending {
+        Directory(PathBuf),
+        Stray(PathBuf),
+    }
+
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    let mut stack = vec![Pending::Directory(root.to_path_buf())];
+    while let Some(pending) = stack.pop() {
+        match pending {
+            Pending::Stray(path) => {
+                visit(path.strip_prefix(root).expect("entry is under root"))?;
+                count += 1;
             }
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_dir() {
-                stack.push(path);
-            } else if is_stray_temp(&entry.file_name()) {
-                strays.push(
-                    path.strip_prefix(root)
-                        .expect("entry is under root")
-                        .to_path_buf(),
-                );
+            Pending::Directory(dir) => {
+                let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
+                entries.sort_by_key(|entry| entry.file_name());
+                for entry in entries.into_iter().rev() {
+                    if entry.file_name() == "_SafetyNet" {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_dir() {
+                        stack.push(Pending::Directory(path));
+                    } else if is_stray_temp(&entry.file_name()) {
+                        stack.push(Pending::Stray(path));
+                    }
+                }
             }
         }
     }
-    strays.sort();
-    Ok(strays)
+    Ok(count)
 }
 
 fn is_stray_temp(name: &OsStr) -> bool {
@@ -997,7 +1383,7 @@ mod tests {
             ("gone.txt", file(5, 50)),     // dest-only -> delete
         ]);
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
 
         assert_eq!(plan.copies.len(), 1);
         assert_eq!(plan.copies[0].rel_path, PathBuf::from("new.txt"));
@@ -1015,10 +1401,28 @@ mod tests {
         let source = tree(&[("edited.txt", file(20, 500))]);
         let dest = tree(&[("edited.txt", file(20, 200))]);
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
         assert_eq!(plan.updates.len(), 1);
         assert_eq!(plan.updates[0].reason, "modified");
         assert_eq!(plan.unchanged, 0);
+    }
+
+    #[test]
+    fn timestamp_granularity_does_not_replan_a_published_file() {
+        let source = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 11))]);
+        let destination = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 10))]);
+
+        let plan = compute(
+            &source,
+            &destination,
+            Mode::Mirror,
+            false,
+            Duration::from_secs(2),
+            &[],
+        );
+
+        assert!(plan.updates.is_empty());
+        assert_eq!(plan.unchanged, 1);
     }
 
     #[test]
@@ -1026,7 +1430,7 @@ mod tests {
         let source = tree(&[("new.txt", file(10, 100))]);
         let dest = tree(&[("gone.txt", file(5, 50)), ("also-gone.txt", file(6, 60))]);
 
-        let plan = compute(&source, &dest, Mode::Update, true, &[]);
+        let plan = compute(&source, &dest, Mode::Update, true, Duration::ZERO, &[]);
 
         assert_eq!(plan.copies.len(), 1);
         assert!(
@@ -1046,6 +1450,7 @@ mod tests {
             &dest,
             Mode::Mirror,
             /* supports_symlinks */ false,
+            Duration::ZERO,
             &[],
         );
 
@@ -1062,7 +1467,7 @@ mod tests {
         let source = tree(&[("link", link(12))]);
         let dest = BTreeMap::new();
 
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
         assert!(plan.errors.is_empty());
         assert_eq!(plan.copies.len(), 1);
     }
@@ -1077,6 +1482,7 @@ mod tests {
             &dest,
             Mode::Mirror,
             true,
+            Duration::ZERO,
             &["skip.txt".to_string()],
         );
 
@@ -1095,6 +1501,7 @@ mod tests {
             &dest,
             Mode::Mirror,
             true,
+            Duration::ZERO,
             &["gone.txt".to_string()],
         );
         assert!(plan.deletes.is_empty());
@@ -1105,7 +1512,7 @@ mod tests {
     fn render_totals_and_safetynet_notes_for_mirror() {
         let source = tree(&[("new.txt", file(10, 100)), ("chg.txt", file(40, 300))]);
         let dest = tree(&[("chg.txt", file(30, 300)), ("gone.txt", file(5, 50))]);
-        let plan = compute(&source, &dest, Mode::Mirror, true, &[]);
+        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
 
         let out = render(&plan, "photos", Mode::Mirror);
 
@@ -1126,7 +1533,7 @@ mod tests {
         // reporting DELETE (0), not by hiding the section.
         let source = tree(&[("new.txt", file(10, 100))]);
         let dest = tree(&[("gone.txt", file(5, 50))]);
-        let plan = compute(&source, &dest, Mode::Update, true, &[]);
+        let plan = compute(&source, &dest, Mode::Update, true, Duration::ZERO, &[]);
 
         let out = render(&plan, "docs", Mode::Update);
 
@@ -1165,8 +1572,40 @@ mod tests {
         assert!(is_machinery(OsStr::new("_SafetyNet")));
         assert!(is_machinery(OsStr::new(".photo.jpg.vibesync-tmp-abc123")));
         assert!(is_machinery(OsStr::new("._vibesync-run-20260716T120000Z")));
+        assert!(!is_machinery(OsStr::new("._notes")));
         assert!(!is_machinery(OsStr::new("_SafetyNetworkNotes")));
         assert!(!is_machinery(OsStr::new("vibesync-tmp-visible")));
         assert!(!is_machinery(OsStr::new("regular.txt")));
+    }
+
+    #[test]
+    fn apple_double_filter_is_content_and_destination_context_sensitive() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("._photo.jpg"),
+            [0x00, 0x05, 0x16, 0x07, 0x01],
+        )
+        .unwrap();
+        fs::write(root.path().join("._notes"), b"legitimate user content").unwrap();
+
+        let mut source_paths = Vec::new();
+        walk(root.path(), false, |path, _| {
+            source_paths.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        source_paths.sort();
+        assert_eq!(
+            source_paths,
+            [PathBuf::from("._notes"), PathBuf::from("._photo.jpg")]
+        );
+
+        let mut exfat_destination_paths = Vec::new();
+        walk(root.path(), true, |path, _| {
+            exfat_destination_paths.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(exfat_destination_paths, [PathBuf::from("._notes")]);
     }
 }
