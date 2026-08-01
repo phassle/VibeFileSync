@@ -896,6 +896,7 @@ fn copy_file(
         } else {
             copyfile_all_but_acls(source, temp)?;
         }
+        crate::interrupt::check()?;
         fault_at(FaultTransition::CopyComplete, context())?;
         #[cfg(all(feature = "fault-injection", debug_assertions))]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
@@ -931,6 +932,7 @@ fn copy_file(
             return Err(verification.data_mismatch_error());
         }
         fault_at(FaultTransition::VerifyComplete, context())?;
+        crate::interrupt::check()?;
         revalidate_source(source, planned_source_mtime, action.bytes)?;
         fault_at(FaultTransition::SourceRevalidated, context())?;
         let warnings = verification.warnings;
