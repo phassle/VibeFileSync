@@ -2,6 +2,16 @@
 
 This bundle turns one spec-level issue into planned, test-driven, independently reviewed, integrated work while preserving the repository's issue-tracker and Git policies.
 
+## How it works
+
+Dynamic Implement is a technical orchestration layer built on top of Matt Pocock's engineering skills. It turns a high-level GitHub issue into an integrated change by coordinating planning, implementation, testing, independent review, and Git integration.
+
+It uses `wayfinder` to map the codebase and issue dependencies, `implement` and `tdd` to deliver each isolated subtask, and `code-review` to separately assess specification compliance and engineering standards. `to-tickets` can decompose larger work when needed.
+
+For an implementation run, Dynamic Implement reads and plans the issue graph, selects a live-verified model and reasoning-effort step from a calibrated escalation ladder, and assigns each subtask its own branch and worktree. Implementers run focused and full checks before handoff. A clean review process receives no implementation conversation history, and approved work follows the repository's Git workflow into its integration target.
+
+Each completed run records model and effort choices, escalations, test evidence, review outcomes, and integration evidence. This telemetry calibrates future runs, enabling increasingly reliable model routing over time.
+
 ## Included skills
 
 Install all three directories as one compatible set:
