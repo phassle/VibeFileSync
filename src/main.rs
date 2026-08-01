@@ -1,12 +1,15 @@
 //! `vibesync`: hot-path verbs top-level, management namespaced, per
 //! ADR-0004. Implemented so far: Folder-pair management, the human Dry-run,
-//! safe `run`/`prune`, and Journal-backed `status`/`history`; the TUI and
-//! streaming JSON plan/run surfaces remain later slices.
+//! safe `run`/`prune`, Journal-backed `status`/`history`, and streaming
+//! NDJSON plan/run surfaces; the TUI remains a later slice.
 
 mod banner;
 mod config;
 mod error;
+mod event;
+mod failure;
 mod journal;
+mod ndjson;
 mod pair;
 mod plan;
 mod preconditions;
@@ -63,6 +66,9 @@ enum Command {
         /// Skip the free-space preflight check.
         #[arg(long)]
         ignore_space_check: bool,
+        /// Fully hash-verify source and copied data before Publish.
+        #[arg(long)]
+        verify: bool,
         /// Exclude an exact plan path (repeatable); glob-free per ADR-0004.
         #[arg(long, value_name = "PATH")]
         exclude: Vec<String>,
@@ -158,10 +164,8 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             json,
             exclude,
         } => {
-            // The NDJSON `vibefilesync.plan/v1` stream is a later slice;
-            // only the human diff is implemented here.
             if *json {
-                return Ok(not_yet_implemented("plan --json", pair));
+                return plan::run_json(config_path, pair, exclude);
             }
             plan::run(config_path, pair, exclude)
         }
@@ -172,21 +176,21 @@ fn run(command: &Command, config_path: &std::path::Path) -> Result<i32, AppError
             permanent_delete,
             allow_empty_source,
             ignore_space_check,
+            verify,
             exclude,
-        } => {
-            if *json {
-                return Ok(not_yet_implemented("run --json", pair));
-            }
-            run::run(
-                config_path,
-                pair,
-                *yes,
-                *permanent_delete,
-                *allow_empty_source,
-                *ignore_space_check,
-                exclude,
-            )
-        }
+        } => run::run(
+            config_path,
+            pair,
+            run::RunOptions {
+                yes: *yes,
+                permanent_delete: *permanent_delete,
+                allow_empty_source: *allow_empty_source,
+                ignore_space_check: *ignore_space_check,
+                json_output: *json,
+                full_verify: *verify,
+                excludes: exclude,
+            },
+        ),
         Command::Status { pair } => journal::status(config_path, pair),
         Command::History { pair, json } => {
             if *json {

@@ -9,15 +9,22 @@
 
 use assert_cmd::Command;
 use std::fs;
+#[cfg(feature = "fault-injection")]
+use std::io::{BufRead, BufReader};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
+#[cfg(feature = "fault-injection")]
+use std::process::Stdio;
 
 const EXIT_OK: i32 = 0;
+const EXIT_PARTIAL: i32 = 1;
 const EXIT_PRECONDITION: i32 = 2;
+#[cfg(feature = "fault-injection")]
+const EXIT_BLOCKED_PLAN: i32 = 3;
 const EXIT_INTERRUPTED: i32 = 4;
 const EXIT_USAGE: i32 = 64;
-const EXIT_UNIMPLEMENTED: i32 = 69;
 
 fn vibesync(config_home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("vibesync").expect("binary builds");
@@ -375,7 +382,7 @@ fn bad_config_aborts_before_an_unimplemented_verb_runs() {
 }
 
 #[test]
-fn run_stub_accepts_the_adr_0004_per_run_flags() {
+fn run_accepts_the_adr_0004_per_run_flags() {
     let fx = Fixture::new();
     fx.cmd()
         .args([
@@ -386,31 +393,307 @@ fn run_stub_accepts_the_adr_0004_per_run_flags() {
             "--permanent-delete",
             "--allow-empty-source",
             "--ignore-space-check",
+            "--verify",
             "--exclude",
             "some/relative/path",
         ])
         .assert()
-        .code(EXIT_UNIMPLEMENTED);
+        .code(EXIT_USAGE);
 }
 
 #[test]
-fn plan_json_is_not_yet_implemented() {
-    // The human `plan` diff ships in this slice; the NDJSON
-    // `vibefilesync.plan/v1` stream is a later one.
+fn plan_json_stream_has_versioned_rows_in_contract_order_and_pure_stdout() {
     let fx = Fixture::new();
+    fx.write_source("new.txt", "new");
+    fx.write_source("changed.txt", "new value");
+    fx.write_dest("changed.txt", "old");
+    fx.write_dest("removed.txt", "gone");
     fx.add_photos_pair();
 
     let output = fx
         .cmd()
-        .args(["plan", "photos", "--json", "--exclude", "a/b"])
+        .args(["plan", "photos", "--json"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_UNIMPLEMENTED));
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
     assert!(
-        stderr.contains("not yet implemented"),
-        "plan --json should say not yet implemented: {stderr}"
+        output.stderr.is_empty(),
+        "JSON plan must not log: {:?}",
+        output.stderr
     );
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(rows.first().unwrap()["type"], "plan_start");
+    assert_eq!(rows.last().unwrap()["type"], "summary");
+    assert!(rows[1..rows.len() - 1]
+        .iter()
+        .all(|row| row["type"] == "action"));
+    assert!(rows
+        .iter()
+        .all(|row| row["schema"] == "vibefilesync.plan/v1"));
+    assert_eq!(rows[0]["pair"], "photos");
+    assert_eq!(rows[0]["mode"], "mirror");
+    assert_eq!(rows[0]["dry_run"], true);
+    let update = rows.iter().find(|row| row["op"] == "update").unwrap();
+    assert_eq!(update["path"], "changed.txt");
+    assert_eq!(update["bytes"], 9);
+    assert_eq!(update["old_bytes"], 3);
+    assert!(update["safety_net"]
+        .as_str()
+        .unwrap()
+        .contains("_SafetyNet/"));
+    let delete = rows.iter().find(|row| row["op"] == "delete").unwrap();
+    assert_eq!(delete["old_bytes"], 4);
+    assert!(delete.get("bytes").is_none());
+    assert_eq!(rows.last().unwrap()["counts"]["copy"], 1);
+}
+
+#[test]
+fn run_json_stream_reports_execution_order_verification_and_safetynet() {
+    let fx = Fixture::new();
+    fx.write_source("created.txt", "created");
+    fx.write_source("updated.txt", "new value");
+    fx.write_dest("updated.txt", "old");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--json", "--yes", "--verify"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    assert!(
+        output.stderr.is_empty(),
+        "JSON run must not log: {:?}",
+        output.stderr
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line is JSON"))
+        .collect();
+    assert!(rows
+        .iter()
+        .all(|row| row["schema"] == "vibefilesync.run/v1"));
+    assert_eq!(rows.first().unwrap()["type"], "run_start");
+    assert_eq!(rows.last().unwrap()["type"], "summary");
+    assert!(rows[0]["degradations"].is_array());
+    for path in ["created.txt", "updated.txt"] {
+        let events: Vec<_> = rows.iter().filter(|row| row["path"] == path).collect();
+        assert_eq!(events.first().unwrap()["type"], "action_start");
+        assert_eq!(events.last().unwrap()["type"], "action_done");
+        assert_eq!(events.last().unwrap()["result"], "done");
+        assert_eq!(events.last().unwrap()["verified"], "full");
+    }
+    let updated = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "updated.txt")
+        .unwrap();
+    assert!(updated["safety_net"]
+        .as_str()
+        .unwrap()
+        .contains("_SafetyNet/"));
+    assert_eq!(rows.last().unwrap()["warnings"], 0);
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn run_json_progress_is_live_during_a_large_file_copy() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.source.path().join("large.bin"),
+        vec![7_u8; 16 * 1024 * 1024],
+    )
+    .unwrap();
+    fx.write_source("small.txt", "small");
+    fx.add_photos_pair();
+
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut child = ProcessCommand::new(binary.get_program())
+        .args(["run", "photos", "--json", "--yes"])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .env("VIBESYNC_TEST_COPY_CHUNK_DELAY_MS", "5")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut saw_live_progress = false;
+    for line in lines {
+        let row: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if !saw_live_progress
+            && row["type"] == "progress"
+            && row["bytes"].as_u64().unwrap() > 0
+            && row["bytes"].as_u64().unwrap() < row["total_bytes"].as_u64().unwrap()
+        {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "an intermediate progress row must cross stdout before copy completion"
+            );
+            saw_live_progress = true;
+        }
+    }
+    assert!(
+        saw_live_progress,
+        "copy emitted no intermediate progress row"
+    );
+    assert_eq!(child.wait().unwrap().code(), Some(EXIT_OK));
+}
+
+#[test]
+fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
+    let fx = Fixture::new();
+    fx.write_source("blocked.txt", "contents");
+    fs::create_dir(fx.destination.path().join("blocked.txt")).unwrap();
+    fx.add_photos_pair();
+    assert_eq!(
+        fx.cmd()
+            .args(["run", "photos", "--json", "--yes"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(EXIT_PARTIAL)
+    );
+
+    let missing = Fixture::new();
+    missing.add_photos_pair();
+    fs::remove_dir_all(missing.source.path()).unwrap();
+    assert_eq!(
+        missing
+            .cmd()
+            .args(["run", "photos", "--json", "--yes"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(EXIT_PRECONDITION)
+    );
+
+    assert_eq!(
+        fx.cmd()
+            .args(["run", "photos", "--json", "--unknown"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(EXIT_USAGE)
+    );
+    #[cfg(feature = "fault-injection")]
+    {
+        let blocked = Fixture::new();
+        std::os::unix::fs::symlink("target", blocked.source.path().join("link")).unwrap();
+        blocked.add_photos_pair();
+        assert_eq!(
+            blocked
+                .cmd()
+                .env("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")
+                .args(["run", "photos", "--json", "--yes"])
+                .output()
+                .unwrap()
+                .status
+                .code(),
+            Some(EXIT_BLOCKED_PLAN)
+        );
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows() {
+    let failed = Fixture::new();
+    failed.write_source("blocked.txt", "contents");
+    fs::create_dir(failed.destination.path().join("blocked.txt")).unwrap();
+    failed.add_photos_pair();
+    let failed_output = failed
+        .cmd()
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(failed_output.status.code(), Some(EXIT_PARTIAL));
+    let failed_rows: Vec<serde_json::Value> = String::from_utf8(failed_output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(failed_rows[0]["type"], "run_start");
+    assert_eq!(failed_rows[1]["type"], "action_start");
+    assert_eq!(failed_rows[2]["type"], "action_failed");
+    assert_eq!(failed_rows[2]["result"], "failed");
+    assert!(failed_rows[2]["reason"].is_string());
+    assert_eq!(failed_rows[3]["type"], "summary");
+
+    let warning = Fixture::new();
+    warning.write_source("warning.txt", "contents");
+    warning.add_photos_pair();
+    let warning_output = warning
+        .cmd()
+        .env("VIBESYNC_TEST_WARNING_PATH", "warning.txt")
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(warning_output.status.code(), Some(EXIT_OK));
+    let warning_rows: Vec<serde_json::Value> = String::from_utf8(warning_output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let done = warning_rows
+        .iter()
+        .find(|row| row["type"] == "action_done")
+        .unwrap();
+    assert_eq!(done["result"], "done");
+    assert_eq!(done["verified"], "standard");
+    assert_eq!(done["warnings"][0]["code"], "metadata_mismatch");
+    assert_eq!(warning_rows.last().unwrap()["warnings"], 1);
+
+    let deletion = Fixture::new();
+    deletion.write_dest("gone.txt", "gone");
+    deletion.add_photos_pair();
+    let deletion_output = deletion
+        .cmd()
+        .args(["run", "photos", "--json", "--yes", "--allow-empty-source"])
+        .output()
+        .unwrap();
+    assert_eq!(deletion_output.status.code(), Some(EXIT_OK));
+    let deletion_rows: Vec<serde_json::Value> = String::from_utf8(deletion_output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let deleted = deletion_rows
+        .iter()
+        .find(|row| row["type"] == "action_done")
+        .unwrap();
+    assert_eq!(deleted["op"], "delete");
+    assert_eq!(deleted["result"], "done");
+    assert!(deleted["safety_net"].as_str().is_some());
+    assert!(deleted.get("verified").is_none());
+
+    let interrupted = Fixture::new();
+    interrupted.write_source("crash.txt", "contents");
+    interrupted.add_photos_pair();
+    let interrupted_output = interrupted
+        .cmd()
+        .env("VIBESYNC_TEST_CRASH_AT", "copy_complete")
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!interrupted_output.status.success());
+    let interrupted_rows: Vec<serde_json::Value> = String::from_utf8(interrupted_output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(interrupted_rows[0]["type"], "run_start");
+    assert_eq!(interrupted_rows[1]["type"], "action_start");
+    assert!(interrupted_rows
+        .iter()
+        .all(|row| row["schema"] == "vibefilesync.run/v1"));
+    assert!(!interrupted_rows.iter().any(|row| row["type"] == "summary"));
 }
 
 #[test]
@@ -1197,12 +1480,23 @@ fn pair_lock_rejects_overlap_and_dies_with_a_killed_process() {
         .expect("first run starts");
 
     let lock = fx.journal_dir("photos").join(".lock");
+    let mut lock_held = false;
     for _ in 0..100 {
-        if lock.exists() {
-            break;
+        if let Ok(probe) = fs::OpenOptions::new().read(true).write(true).open(&lock) {
+            let result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+            {
+                lock_held = true;
+                break;
+            }
+            if result == 0 {
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    assert!(lock_held, "first process acquired the pair lock");
 
     let before = Fixture::snapshot(fx.destination.path());
     let second = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
@@ -1347,7 +1641,7 @@ fn journal_failure_after_publish_is_an_interrupted_run_not_a_precondition_abort(
     let binary = Command::cargo_bin("vibesync").expect("binary builds");
     let mut command = ProcessCommand::new(binary.get_program());
     command
-        .args(["run", "limited", "--yes"])
+        .args(["run", "limited", "--json", "--yes"])
         .env("XDG_CONFIG_HOME", fx.xdg.path())
         .env("HOME", fx.home.path());
     unsafe {
@@ -1373,6 +1667,17 @@ fn journal_failure_after_publish_is_an_interrupted_run_not_a_precondition_abort(
         "the Journal tail fails only after Publish"
     );
     assert_eq!(output.status.code(), Some(EXIT_INTERRUPTED));
+    let stream: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(stream[0]["type"], "run_start");
+    assert_eq!(stream[1]["type"], "action_start");
+    assert!(stream
+        .iter()
+        .all(|row| row["schema"] == "vibefilesync.run/v1"));
+    assert!(!stream.iter().any(|row| row["type"] == "summary"));
     let status = fx.cmd().args(["status", "limited"]).output().unwrap();
     assert!(String::from_utf8_lossy(&status.stdout).contains("interrupted"));
 }
@@ -1397,6 +1702,30 @@ fn plan_and_status_report_stray_temps_without_destination_writes() {
         Fixture::snapshot(fx.destination.path()),
         before,
         "plan wrote to destination"
+    );
+
+    let json_plan = fx
+        .cmd()
+        .args(["plan", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_plan.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(json_plan.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["plan_start", "action", "summary"]
+    );
+    assert_eq!(rows.last().unwrap()["strays"], 1);
+    assert_eq!(
+        Fixture::snapshot(fx.destination.path()),
+        before,
+        "JSON plan wrote to destination"
     );
 
     let status = fx.cmd().args(["status", "photos"]).output().unwrap();

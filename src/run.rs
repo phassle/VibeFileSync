@@ -4,11 +4,11 @@
 
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
@@ -16,13 +16,47 @@ use crate::plan::{self, Action};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3);
 const F_FULLFSYNC: libc::c_int = 51;
+const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const RUN_SCHEMA: &str = "vibefilesync.run/v1";
+const COPYFILE_STATE_STATUS_CB: u32 = 6;
+const COPYFILE_STATE_STATUS_CTX: u32 = 7;
+const COPYFILE_STATE_COPIED: u32 = 8;
+const COPYFILE_STATE_BSIZE: u32 = 13;
+const COPYFILE_COPY_DATA: libc::c_int = 4;
+const COPYFILE_ERR: libc::c_int = 3;
+const COPYFILE_PROGRESS: libc::c_int = 4;
+const COPYFILE_CONTINUE: libc::c_int = 0;
+const COPYFILE_QUIT: libc::c_int = 2;
+
+type CopyfileState = *mut libc::c_void;
+type CopyfileCallback = unsafe extern "C" fn(
+    libc::c_int,
+    libc::c_int,
+    CopyfileState,
+    *const libc::c_char,
+    *const libc::c_char,
+    *mut libc::c_void,
+) -> libc::c_int;
 
 extern "C" {
     fn copyfile(
         from: *const libc::c_char,
         to: *const libc::c_char,
-        state: *mut libc::c_void,
+        state: CopyfileState,
         flags: u32,
+    ) -> libc::c_int;
+    fn copyfile_state_alloc() -> CopyfileState;
+    fn copyfile_state_free(state: CopyfileState) -> libc::c_int;
+    fn copyfile_state_get(
+        state: CopyfileState,
+        flag: u32,
+        destination: *mut libc::c_void,
+    ) -> libc::c_int;
+    fn copyfile_state_set(
+        state: CopyfileState,
+        flag: u32,
+        source: *const libc::c_void,
     ) -> libc::c_int;
     fn listxattr(
         path: *const libc::c_char,
@@ -32,22 +66,243 @@ extern "C" {
     ) -> isize;
 }
 
-pub fn run(
-    config_path: &Path,
-    pair_name: &str,
-    yes: bool,
-    permanent_delete: bool,
-    allow_empty_source: bool,
-    ignore_space_check: bool,
-    excludes: &[String],
-) -> Result<i32, AppError> {
+pub struct RunOptions<'a> {
+    pub yes: bool,
+    pub permanent_delete: bool,
+    pub allow_empty_source: bool,
+    pub ignore_space_check: bool,
+    pub json_output: bool,
+    pub full_verify: bool,
+    pub excludes: &'a [String],
+}
+
+enum RunReporter {
+    Human,
+    Json,
+}
+
+impl RunReporter {
+    fn new(json: bool) -> Self {
+        if json {
+            Self::Json
+        } else {
+            Self::Human
+        }
+    }
+
+    fn is_json(&self) -> bool {
+        matches!(self, Self::Json)
+    }
+
+    fn plan(&self, plan: &plan::Plan, pair: &str, mode: crate::config::Mode) {
+        if matches!(self, Self::Human) {
+            print!("{}", plan::render(plan, pair, mode));
+        }
+    }
+
+    fn precondition_warnings(&self, warnings: &[String]) {
+        if matches!(self, Self::Human) {
+            for warning in warnings {
+                eprintln!("{warning}");
+            }
+        }
+    }
+
+    fn blocked(&self, errors: usize) {
+        if matches!(self, Self::Human) {
+            eprintln!("vibesync: run blocked by {errors} plan error(s)");
+        }
+    }
+
+    fn cancelled(&self) {
+        if matches!(self, Self::Human) {
+            println!("Run cancelled; destination unchanged.");
+        }
+    }
+
+    fn confirm(&self) -> Result<bool, AppError> {
+        match self {
+            Self::Json => {
+                eprint!("Proceed with COPY actions? [y/N] ");
+                io::stderr().flush().map_err(io_error)?;
+            }
+            Self::Human => {
+                print!("Proceed with COPY actions? [y/N] ");
+                io::stdout().flush().map_err(io_error)?;
+            }
+        }
+        let mut response = String::new();
+        io::stdin().read_line(&mut response).map_err(io_error)?;
+        Ok(matches!(
+            response.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+
+    fn run_start(
+        &self,
+        run_id: &str,
+        pair: &str,
+        mode: crate::config::Mode,
+        destination: &Path,
+        warnings: &[String],
+        planned: usize,
+    ) -> Result<(), AppError> {
+        let mut event = crate::event::run_start(
+            crate::event::Context {
+                schema: RUN_SCHEMA,
+                run_id,
+            },
+            pair,
+            warnings,
+            &crate::volume::expected_degradations(destination),
+        );
+        event["mode"] = serde_json::json!(mode);
+        event["planned"] = planned.into();
+        self.json(event)
+    }
+
+    fn action_start(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+    ) -> Result<(), AppError> {
+        self.json(crate::event::action_start(
+            crate::event::Context {
+                schema: RUN_SCHEMA,
+                run_id,
+            },
+            operation,
+            action,
+        ))?;
+        if action.bytes >= PROGRESS_THRESHOLD
+            && matches!(operation, Operation::Copy | Operation::Update)
+        {
+            self.progress(run_id, operation, action, 0)?;
+        }
+        Ok(())
+    }
+
+    fn progress(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+        bytes: u64,
+    ) -> Result<(), AppError> {
+        self.json(serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":bytes,"total_bytes":action.bytes}))
+    }
+
+    fn action_done(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+        safety_net: Option<&Path>,
+        warnings: &[String],
+        full_verify: bool,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Json => crate::ndjson::stdout(&crate::event::action_done(
+                crate::event::Context {
+                    schema: RUN_SCHEMA,
+                    run_id,
+                },
+                operation,
+                action,
+                safety_net,
+                warnings,
+                matches!(operation, Operation::Copy | Operation::Update)
+                    .then_some(if full_verify { "full" } else { "standard" }),
+                false,
+            )),
+            Self::Human => {
+                for warning in warnings {
+                    eprintln!(
+                        "vibesync: {} {} warning: {warning}",
+                        operation.as_str().to_ascii_uppercase(),
+                        action.rel_path.display()
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn action_failed(
+        &self,
+        run_id: &str,
+        operation: Operation,
+        action: &Action,
+        error: &io::Error,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Json => crate::ndjson::stdout(&crate::event::action_failed(
+                crate::event::Context {
+                    schema: RUN_SCHEMA,
+                    run_id,
+                },
+                operation,
+                action,
+                &error.to_string(),
+            )),
+            Self::Human => {
+                eprintln!(
+                    "vibesync: {} {} failed: {error}",
+                    operation.as_str().to_ascii_uppercase(),
+                    action.rel_path.display()
+                );
+                if error.raw_os_error() == Some(libc::ENOSPC) {
+                    eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn cleaned(&self, path: &Path) {
+        if matches!(self, Self::Human) {
+            println!("Cleaned stray temp: {}", path.display());
+        }
+    }
+
+    fn summary(&self, run_id: &str, stats: &RunStats) -> Result<(), AppError> {
+        self.json(crate::event::summary(
+            crate::event::Context {
+                schema: RUN_SCHEMA,
+                run_id,
+            },
+            stats,
+        ))
+    }
+
+    fn json(&self, value: serde_json::Value) -> Result<(), AppError> {
+        if matches!(self, Self::Json) {
+            crate::ndjson::stdout(&value)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
+    let RunOptions {
+        yes,
+        permanent_delete,
+        allow_empty_source,
+        ignore_space_check,
+        json_output,
+        full_verify,
+        excludes,
+    } = options;
+    let reporter = RunReporter::new(json_output);
     let config = crate::config::load(config_path)?;
     if !config.pairs.contains_key(pair_name) {
         return Err(AppError::Usage(format!("pair '{pair_name}' not found")));
     }
     let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
     let (pair, initial_plan) = plan::build(config_path, pair_name, excludes)?;
-    print!("{}", plan::render(&initial_plan, pair_name, pair.mode));
+    reporter.plan(&initial_plan, pair_name, pair.mode);
 
     let run_warnings = crate::preconditions::check_run(
         &pair,
@@ -55,27 +310,34 @@ pub fn run(
         allow_empty_source,
         ignore_space_check,
     )?;
-    for warning in &run_warnings {
-        eprintln!("{warning}");
-    }
+    reporter.precondition_warnings(&run_warnings);
 
     if !initial_plan.errors.is_empty() {
-        eprintln!(
-            "vibesync: run blocked by {} plan error(s)",
-            initial_plan.errors.len()
-        );
+        reporter.blocked(initial_plan.errors.len());
         return Ok(EXIT_BLOCKED_PLAN);
     }
 
-    if !yes && !confirm()? {
-        println!("Run cancelled; destination unchanged.");
+    if !yes && !reporter.confirm()? {
+        reporter.cancelled();
         return Ok(EXIT_OK);
     }
 
     let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
+    let degradations = crate::volume::expected_degradations(&pair.destination);
     journal
-        .run_start(pair_name, &initial_plan, &run_warnings)
+        .run_start(pair_name, &initial_plan, &run_warnings, &degradations)
         .map_err(io_error)?;
+    reporter.run_start(
+        journal.run_id(),
+        pair_name,
+        pair.mode,
+        &pair.destination,
+        &run_warnings,
+        initial_plan.copies.len()
+            + initial_plan.updates.len()
+            + initial_plan.deletes.len()
+            + initial_plan.strays.len(),
+    )?;
     let mut stats = RunStats {
         counts: Counts {
             planned: initial_plan.copies.len()
@@ -92,26 +354,37 @@ pub fn run(
             bytes: fs::metadata(pair.destination.join(stray))
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
+            old_bytes: None,
             reason: "abandoned temp".to_string(),
         };
         journal
             .action_start(Operation::Cleanup, &action, None, None)
             .map_err(journal_runtime_error)?;
+        reporter.action_start(journal.run_id(), Operation::Cleanup, &action)?;
         match fs::remove_file(pair.destination.join(stray)) {
             Ok(()) => {
                 journal
-                    .action_done(Operation::Cleanup, &action, None, &[])
+                    .action_done(Operation::Cleanup, &action, None, &[], None)
                     .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
-                println!("Cleaned stray temp: {}", stray.display());
+                reporter.action_done(
+                    journal.run_id(),
+                    Operation::Cleanup,
+                    &action,
+                    None,
+                    &[],
+                    false,
+                )?;
+                reporter.cleaned(stray);
             }
             Err(error) => {
                 stats.counts.failed += 1;
                 journal
                     .action_failed(Operation::Cleanup, &action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                eprintln!("vibesync: cleanup {} failed: {error}", stray.display());
+                reporter.action_failed(journal.run_id(), Operation::Cleanup, &action, &error)?;
                 journal.summary(&stats).map_err(journal_runtime_error)?;
+                reporter.summary(journal.run_id(), &stats)?;
                 return Ok(1);
             }
         }
@@ -120,12 +393,10 @@ pub fn run(
     // a new scan rather than from the scan that discovered the abandoned temp.
     let (pair, mut plan) = plan::build(config_path, pair_name, excludes)?;
     if !plan.errors.is_empty() {
-        eprintln!(
-            "vibesync: run blocked by {} plan error(s)",
-            plan.errors.len()
-        );
+        reporter.blocked(plan.errors.len());
         stats.counts.failed += plan.errors.len();
         journal.summary(&stats).map_err(journal_runtime_error)?;
+        reporter.summary(journal.run_id(), &stats)?;
         return Ok(EXIT_BLOCKED_PLAN);
     }
     for (operation, action) in missing_reviewed_actions(&initial_plan, &plan) {
@@ -136,19 +407,13 @@ pub fn run(
         journal
             .action_start(operation, action, source.as_deref(), None)
             .map_err(journal_runtime_error)?;
+        reporter.action_start(journal.run_id(), operation, action)?;
+        let error = io::Error::other("changed during reconciliation; rerun required");
         journal
-            .action_failed(
-                operation,
-                action,
-                "changed during reconciliation; rerun required",
-            )
+            .action_failed(operation, action, &error.to_string())
             .map_err(journal_runtime_error)?;
+        reporter.action_failed(journal.run_id(), operation, action, &error)?;
         stats.counts.failed += 1;
-        eprintln!(
-            "vibesync: {} {} changed during reconciliation; rerun required",
-            operation.as_str().to_ascii_uppercase(),
-            action.rel_path.display()
-        );
     }
     retain_reviewed_actions(&mut plan, &initial_plan);
     for (operation, action) in plan
@@ -167,14 +432,34 @@ pub fn run(
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
+        reporter.action_start(journal.run_id(), operation, action)?;
+        let mut last_progress: Option<Instant> = None;
+        let mut progress = |copied: u64| -> io::Result<()> {
+            let interval_elapsed = match last_progress {
+                Some(last) => last.elapsed() >= PROGRESS_INTERVAL,
+                None => true,
+            };
+            if copied == action.bytes || interval_elapsed {
+                reporter
+                    .progress(journal.run_id(), operation, action, copied)
+                    .map_err(io::Error::other)?;
+                last_progress = Some(Instant::now());
+            }
+            Ok(())
+        };
         match copy_file(
             &pair.destination,
             &source,
             &destination,
             &temp,
             action,
-            journal.run_id(),
-            permanent_delete,
+            CopyOptions {
+                run_id: journal.run_id(),
+                permanent_delete,
+                full_verify,
+                report_progress: reporter.is_json(),
+            },
+            &mut progress,
         ) {
             Ok(outcome) => {
                 journal
@@ -183,11 +468,20 @@ pub fn run(
                         action,
                         outcome.safety_net.as_deref(),
                         &outcome.warnings,
+                        Some(if full_verify { "full" } else { "standard" }),
                     )
                     .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
                 stats.bytes += action.bytes;
                 stats.warnings += outcome.warnings.len();
+                reporter.action_done(
+                    journal.run_id(),
+                    operation,
+                    action,
+                    outcome.safety_net.as_deref(),
+                    &outcome.warnings,
+                    full_verify,
+                )?;
                 match operation {
                     Operation::Copy => stats.counts.copied += 1,
                     Operation::Update => stats.counts.updated += 1,
@@ -201,16 +495,12 @@ pub fn run(
                 journal
                     .action_failed(operation, action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                eprintln!(
-                    "vibesync: {} {} failed: {error}",
-                    operation.as_str().to_ascii_uppercase(),
-                    action.rel_path.display()
-                );
-                if error.raw_os_error() == Some(libc::ENOSPC) {
-                    eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
+                reporter.action_failed(journal.run_id(), operation, action, &error)?;
+                if error.kind() != io::ErrorKind::InvalidData {
+                    journal.summary(&stats).map_err(journal_runtime_error)?;
+                    reporter.summary(journal.run_id(), &stats)?;
+                    return Ok(1);
                 }
-                journal.summary(&stats).map_err(journal_runtime_error)?;
-                return Ok(1);
             }
         }
     }
@@ -219,6 +509,7 @@ pub fn run(
         journal
             .action_start(Operation::Delete, action, None, None)
             .map_err(journal_runtime_error)?;
+        reporter.action_start(journal.run_id(), Operation::Delete, action)?;
         match remove_file(
             &pair.destination,
             &destination,
@@ -228,26 +519,32 @@ pub fn run(
         ) {
             Ok(safety_net) => {
                 journal
-                    .action_done(Operation::Delete, action, safety_net.as_deref(), &[])
+                    .action_done(Operation::Delete, action, safety_net.as_deref(), &[], None)
                     .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
                 stats.counts.deleted += 1;
                 stats.bytes += action.bytes;
+                reporter.action_done(
+                    journal.run_id(),
+                    Operation::Delete,
+                    action,
+                    safety_net.as_deref(),
+                    &[],
+                    false,
+                )?;
             }
             Err(error) => {
                 stats.counts.failed += 1;
                 journal
                     .action_failed(Operation::Delete, action, &error.to_string())
                     .map_err(journal_runtime_error)?;
-                eprintln!(
-                    "vibesync: DELETE {} failed: {error}",
-                    action.rel_path.display()
-                );
+                reporter.action_failed(journal.run_id(), Operation::Delete, action, &error)?;
             }
         }
     }
 
     journal.summary(&stats).map_err(journal_runtime_error)?;
+    reporter.summary(journal.run_id(), &stats)?;
     if stats.counts.failed == 0 {
         Ok(EXIT_OK)
     } else {
@@ -297,33 +594,35 @@ fn missing_reviewed_actions<'a>(
         .collect()
 }
 
-fn confirm() -> Result<bool, AppError> {
-    print!("Proceed with COPY actions? [y/N] ");
-    io::stdout().flush().map_err(io_error)?;
-    let mut response = String::new();
-    io::stdin().read_line(&mut response).map_err(io_error)?;
-    Ok(matches!(
-        response.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 fn copy_file(
     destination_root: &Path,
     source: &Path,
     destination: &Path,
     temp: &Path,
     action: &Action,
-    run_id: &str,
-    permanent_delete: bool,
+    options: CopyOptions<'_>,
+    progress: &mut impl FnMut(u64) -> io::Result<()>,
 ) -> io::Result<ActionOutcome> {
+    let CopyOptions {
+        run_id,
+        permanent_delete,
+        full_verify,
+        report_progress,
+    } = options;
     let source_before = fs::metadata(source)?;
     let parent = destination
         .parent()
         .expect("relative COPY path always has a parent");
     fs::create_dir_all(parent)?;
     let result = (|| {
-        copyfile_all_but_acls(source, temp)?;
+        if report_progress
+            && action.bytes >= PROGRESS_THRESHOLD
+            && fs::symlink_metadata(source)?.is_file()
+        {
+            copyfile_all_but_acls_with_progress(source, temp, action.bytes, progress)?;
+        } else {
+            copyfile_all_but_acls(source, temp)?;
+        }
         crash_at("copy_complete");
         #[cfg(feature = "fault-injection")]
         if std::env::var_os("VIBESYNC_TEST_ENOSPC_PATH")
@@ -332,7 +631,22 @@ fn copy_file(
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
         fully_sync(temp)?;
-        let warnings = verify(source, &source_before, temp, action.bytes)?;
+        // Narrow issue-22 process-seam injection. ADR-0009's generic
+        // EXEC_AT transition harness is owned by the later harness slice.
+        #[cfg(feature = "fault-injection")]
+        if std::env::var_os("VIBESYNC_TEST_WARNING_PATH")
+            .is_some_and(|path| Path::new(&path) == action.rel_path)
+        {
+            let epoch = [libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            }; 2];
+            let path = c_path(temp)?;
+            if unsafe { libc::utimes(path.as_ptr(), epoch.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let warnings = verify(source, &source_before, temp, action.bytes, full_verify)?;
         let safety_net = remove_file(
             destination_root,
             destination,
@@ -342,12 +656,6 @@ fn copy_file(
         )?;
         fs::rename(temp, destination)?;
         sync_directory(parent)?;
-        for warning in &warnings {
-            eprintln!(
-                "vibesync: COPY {} warning: {warning}",
-                action.rel_path.display()
-            );
-        }
         Ok(ActionOutcome {
             safety_net,
             warnings,
@@ -358,6 +666,13 @@ fn copy_file(
         let _ = fs::remove_file(temp);
     }
     result
+}
+
+struct CopyOptions<'a> {
+    run_id: &'a str,
+    permanent_delete: bool,
+    full_verify: bool,
+    report_progress: bool,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -471,6 +786,10 @@ fn temporary_path(destination: &Path, run_id: &str) -> PathBuf {
 }
 
 fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
+    copyfile_with_flags(source, destination, COPYFILE_ALL_WITHOUT_ACLS)
+}
+
+fn copyfile_with_flags(source: &Path, destination: &Path, flags: u32) -> io::Result<()> {
     let source = c_path(source)?;
     let destination = c_path(destination)?;
     let result = unsafe {
@@ -478,7 +797,7 @@ fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
             source.as_ptr(),
             destination.as_ptr(),
             std::ptr::null_mut(),
-            COPYFILE_ALL_WITHOUT_ACLS,
+            flags,
         )
     };
     if result == 0 {
@@ -486,6 +805,127 @@ fn copyfile_all_but_acls(source: &Path, destination: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn copyfile_all_but_acls_with_progress<F>(
+    source: &Path,
+    destination: &Path,
+    total: u64,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    let source = c_path(source)?;
+    let destination = c_path(destination)?;
+    let state = unsafe { copyfile_state_alloc() };
+    if state.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut context = CopyProgressContext {
+        progress,
+        error: None,
+        copied: 0,
+    };
+    let block_size: u32 = 256 * 1024;
+    let block_size_result = unsafe {
+        copyfile_state_set(
+            state,
+            COPYFILE_STATE_BSIZE,
+            (&block_size as *const u32).cast(),
+        )
+    };
+    let callback_result = unsafe {
+        copyfile_state_set(
+            state,
+            COPYFILE_STATE_STATUS_CB,
+            copyfile_progress_callback::<F> as CopyfileCallback as *const libc::c_void,
+        )
+    };
+    let context_result = unsafe {
+        copyfile_state_set(
+            state,
+            COPYFILE_STATE_STATUS_CTX,
+            (&mut context as *mut CopyProgressContext<'_, F>).cast(),
+        )
+    };
+    if block_size_result != 0 || callback_result != 0 || context_result != 0 {
+        let error = io::Error::last_os_error();
+        unsafe { copyfile_state_free(state) };
+        return Err(error);
+    }
+    let result = unsafe {
+        copyfile(
+            source.as_ptr(),
+            destination.as_ptr(),
+            state,
+            COPYFILE_ALL_WITHOUT_ACLS,
+        )
+    };
+    let copy_error = (result != 0).then(io::Error::last_os_error);
+    unsafe { copyfile_state_free(state) };
+    if let Some(error) = context.error {
+        return Err(error);
+    }
+    if let Some(error) = copy_error {
+        return Err(error);
+    }
+    if context.copied < total {
+        (context.progress)(total)?;
+    }
+    Ok(())
+}
+
+struct CopyProgressContext<'a, F> {
+    progress: &'a mut F,
+    error: Option<io::Error>,
+    copied: u64,
+}
+
+unsafe extern "C" fn copyfile_progress_callback<F>(
+    what: libc::c_int,
+    stage: libc::c_int,
+    state: CopyfileState,
+    _source: *const libc::c_char,
+    _destination: *const libc::c_char,
+    raw_context: *mut libc::c_void,
+) -> libc::c_int
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if what != COPYFILE_COPY_DATA {
+        return COPYFILE_CONTINUE;
+    }
+    let context = &mut *raw_context.cast::<CopyProgressContext<'_, F>>();
+    if stage == COPYFILE_ERR {
+        context.error = Some(io::Error::last_os_error());
+        return COPYFILE_QUIT;
+    }
+    if stage != COPYFILE_PROGRESS {
+        return COPYFILE_CONTINUE;
+    }
+    let mut copied: libc::off_t = 0;
+    if copyfile_state_get(
+        state,
+        COPYFILE_STATE_COPIED,
+        (&mut copied as *mut libc::off_t).cast(),
+    ) != 0
+    {
+        context.error = Some(io::Error::last_os_error());
+        return COPYFILE_QUIT;
+    }
+    context.copied = copied.max(0) as u64;
+    if let Err(error) = (context.progress)(context.copied) {
+        context.error = Some(error);
+        return COPYFILE_QUIT;
+    }
+    // Makes elapsed-time throttling deterministic at the process seam while
+    // still exercising copyfile(3)'s real per-write callback.
+    #[cfg(feature = "fault-injection")]
+    if let Ok(delay) = std::env::var("VIBESYNC_TEST_COPY_CHUNK_DELAY_MS") {
+        std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
+    }
+    COPYFILE_CONTINUE
 }
 
 fn fully_sync(path: &Path) -> io::Result<()> {
@@ -511,6 +951,7 @@ fn verify(
     source_before: &fs::Metadata,
     temp: &Path,
     planned_size: u64,
+    full_verify: bool,
 ) -> io::Result<Vec<String>> {
     let source_after = fs::metadata(source)?;
     if source_after.len() != source_before.len()
@@ -526,6 +967,12 @@ fn verify(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "verify mismatch: size differs",
+        ));
+    }
+    if full_verify && !files_equal(source, temp)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verify mismatch: content differs",
         ));
     }
     let source_mtime = source_after.modified()?;
@@ -557,6 +1004,23 @@ fn verify(
         warnings.push("xattr names differ".to_string());
     }
     Ok(warnings)
+}
+
+fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    let mut a = [0_u8; 64 * 1024];
+    let mut b = [0_u8; 64 * 1024];
+    loop {
+        let an = left.read(&mut a)?;
+        let bn = right.read(&mut b)?;
+        if an != bn || a[..an] != b[..bn] {
+            return Ok(false);
+        }
+        if an == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 fn xattr_names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
@@ -626,6 +1090,7 @@ mod tests {
             copies: vec![Action {
                 rel_path: PathBuf::from("reviewed.txt"),
                 bytes: 1,
+                old_bytes: None,
                 reason: "new".to_string(),
             }],
             ..plan::Plan::default()
@@ -636,6 +1101,7 @@ mod tests {
                 Action {
                     rel_path: PathBuf::from("arrived-later.txt"),
                     bytes: 2,
+                    old_bytes: None,
                     reason: "new".to_string(),
                 },
             ],
@@ -653,6 +1119,7 @@ mod tests {
             copies: vec![Action {
                 rel_path: PathBuf::from("photo.txt"),
                 bytes: 1,
+                old_bytes: None,
                 reason: "new".to_string(),
             }],
             ..plan::Plan::default()
@@ -661,6 +1128,7 @@ mod tests {
             copies: vec![Action {
                 rel_path: PathBuf::from("photo.txt"),
                 bytes: 2,
+                old_bytes: None,
                 reason: "new".to_string(),
             }],
             ..plan::Plan::default()
@@ -683,6 +1151,7 @@ mod tests {
         let action = Action {
             rel_path: PathBuf::from("photo.jpg"),
             bytes: 1, // independent planned expectation forces gate failure
+            old_bytes: None,
             reason: "new".to_string(),
         };
         let temp = temporary_path(&destination, "20260716T120000Z");
@@ -693,8 +1162,13 @@ mod tests {
             &destination,
             &temp,
             &action,
-            "20260716T120000Z",
-            false,
+            CopyOptions {
+                run_id: "20260716T120000Z",
+                permanent_delete: false,
+                full_verify: false,
+                report_progress: false,
+            },
+            &mut |_| Ok(()),
         );
 
         assert!(result.is_err());
@@ -719,6 +1193,7 @@ mod tests {
         let action = Action {
             rel_path: PathBuf::from("report.txt"),
             bytes: 1,
+            old_bytes: Some(11),
             reason: "size differs".to_string(),
         };
         let temp = temporary_path(&destination, "20260716T120000Z");
@@ -729,8 +1204,13 @@ mod tests {
             &destination,
             &temp,
             &action,
-            "20260716T120000Z",
-            false,
+            CopyOptions {
+                run_id: "20260716T120000Z",
+                permanent_delete: false,
+                full_verify: false,
+                report_progress: false,
+            },
+            &mut |_| Ok(()),
         );
 
         assert!(result.is_err());
@@ -739,5 +1219,30 @@ mod tests {
             !destination_dir.path().join("_SafetyNet").exists(),
             "archive is strictly after the verification gate"
         );
+    }
+
+    #[test]
+    fn copyfile_data_error_quits_and_preserves_errno() {
+        let mut progress: fn(u64) -> io::Result<()> = |_| Ok(());
+        let mut context = CopyProgressContext {
+            progress: &mut progress,
+            error: None,
+            copied: 0,
+        };
+        unsafe { *libc::__error() = libc::ENOSPC };
+
+        let response = unsafe {
+            copyfile_progress_callback::<fn(u64) -> io::Result<()>>(
+                COPYFILE_COPY_DATA,
+                COPYFILE_ERR,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                (&mut context as *mut CopyProgressContext<'_, _>).cast(),
+            )
+        };
+
+        assert_eq!(response, COPYFILE_QUIT);
+        assert_eq!(context.error.unwrap().raw_os_error(), Some(libc::ENOSPC));
     }
 }
