@@ -416,22 +416,31 @@ pub fn run_json(config_path: &Path, pair_name: &str, excludes: &[String]) -> Res
         true
     };
 
-    // Compare only matching directory entries, retaining at most one
-    // directory's entries. No whole-tree Plan, source set, or destination
-    // index exists in JSON mode (ADR-0003's constant-memory contract).
+    // Walk each tree through ReadDir iterators. Looking up the counterpart
+    // path on demand avoids retaining either a whole tree or a wide
+    // directory's entries, so rows reach stdout as traversal discovers them.
     let mut counts = JsonPlanCounts::default();
-    stream_directory(
-        Some(&pair.source),
+    stream_source_tree(
+        &pair.source,
         pair.destination
             .is_dir()
             .then_some(pair.destination.as_path()),
         Path::new(""),
-        pair.mode,
         supports_symlinks,
         excludes,
         &mut counts,
         &mut |action| emit_plan_action(&mut stdout, &plan_id, action),
     )?;
+    if pair.mode == Mode::Mirror && pair.destination.is_dir() {
+        stream_destination_deletes(
+            &pair.source,
+            &pair.destination,
+            Path::new(""),
+            excludes,
+            &mut counts,
+            &mut |action| emit_plan_action(&mut stdout, &plan_id, action),
+        )?;
+    }
 
     let strays =
         stray_temps(&pair.destination).map_err(|error| scan_error(&pair.destination, error))?;
@@ -503,157 +512,50 @@ enum JsonPlanAction {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stream_directory(
-    source: Option<&Path>,
+fn stream_source_tree(
+    source: &Path,
     destination: Option<&Path>,
     relative: &Path,
-    mode: Mode,
     supports_symlinks: bool,
     excludes: &[String],
     counts: &mut JsonPlanCounts,
     emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
-    let source_entries = source.map(sorted_entries).transpose()?.unwrap_or_default();
-    let destination_entries = destination
-        .map(sorted_entries)
-        .transpose()?
-        .unwrap_or_default();
-    let mut source_index = 0;
-    let mut destination_index = 0;
-
-    while source_index < source_entries.len() || destination_index < destination_entries.len() {
-        let source_entry = source_entries.get(source_index);
-        let destination_entry = destination_entries.get(destination_index);
-        match (source_entry, destination_entry) {
-            (Some(source_entry), Some(destination_entry)) => {
-                match source_entry.file_name().cmp(&destination_entry.file_name()) {
-                    std::cmp::Ordering::Less => {
-                        stream_source_entry(
-                            source_entry.path(),
-                            None,
-                            &relative.join(source_entry.file_name()),
-                            mode,
-                            supports_symlinks,
-                            excludes,
-                            counts,
-                            emit,
-                        )?;
-                        source_index += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        stream_destination_entry(
-                            destination_entry.path(),
-                            &relative.join(destination_entry.file_name()),
-                            mode,
-                            excludes,
-                            counts,
-                            emit,
-                        )?;
-                        destination_index += 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        let source_path = source_entry.path();
-                        let destination_path = destination_entry.path();
-                        let child_relative = relative.join(source_entry.file_name());
-                        let source_metadata = fs::symlink_metadata(&source_path)
-                            .map_err(|error| scan_error(&source_path, error))?;
-                        let destination_metadata = fs::symlink_metadata(&destination_path)
-                            .map_err(|error| scan_error(&destination_path, error))?;
-                        match (
-                            source_metadata.file_type().is_dir(),
-                            destination_metadata.file_type().is_dir(),
-                        ) {
-                            (true, true) => stream_directory(
-                                Some(&source_path),
-                                Some(&destination_path),
-                                &child_relative,
-                                mode,
-                                supports_symlinks,
-                                excludes,
-                                counts,
-                                emit,
-                            )?,
-                            (true, false) => {
-                                stream_source_entry(
-                                    source_path,
-                                    None,
-                                    &child_relative,
-                                    mode,
-                                    supports_symlinks,
-                                    excludes,
-                                    counts,
-                                    emit,
-                                )?;
-                                stream_destination_entry(
-                                    destination_path,
-                                    &child_relative,
-                                    mode,
-                                    excludes,
-                                    counts,
-                                    emit,
-                                )?;
-                            }
-                            (false, true) => {
-                                stream_source_entry(
-                                    source_path,
-                                    None,
-                                    &child_relative,
-                                    mode,
-                                    supports_symlinks,
-                                    excludes,
-                                    counts,
-                                    emit,
-                                )?;
-                                stream_destination_entry(
-                                    destination_path,
-                                    &child_relative,
-                                    mode,
-                                    excludes,
-                                    counts,
-                                    emit,
-                                )?;
-                            }
-                            (false, false) => stream_source_entry(
-                                source_path,
-                                Some(destination_path),
-                                &child_relative,
-                                mode,
-                                supports_symlinks,
-                                excludes,
-                                counts,
-                                emit,
-                            )?,
-                        }
-                        source_index += 1;
-                        destination_index += 1;
-                    }
-                }
-            }
-            (Some(source_entry), None) => {
-                stream_source_entry(
-                    source_entry.path(),
-                    None,
-                    &relative.join(source_entry.file_name()),
-                    mode,
-                    supports_symlinks,
-                    excludes,
-                    counts,
-                    emit,
-                )?;
-                source_index += 1;
-            }
-            (None, Some(destination_entry)) => {
-                stream_destination_entry(
-                    destination_entry.path(),
-                    &relative.join(destination_entry.file_name()),
-                    mode,
-                    excludes,
-                    counts,
-                    emit,
-                )?;
-                destination_index += 1;
-            }
-            (None, None) => break,
+    for entry in fs::read_dir(source).map_err(|error| scan_error(source, error))? {
+        let entry = entry.map_err(|error| scan_error(source, error))?;
+        if is_machinery(&entry.file_name()) {
+            continue;
+        }
+        let source_path = entry.path();
+        let child_relative = relative.join(entry.file_name());
+        let destination_path = destination.map(|root| root.join(entry.file_name()));
+        let source_metadata =
+            fs::symlink_metadata(&source_path).map_err(|error| scan_error(&source_path, error))?;
+        if source_metadata.file_type().is_dir() {
+            let destination_directory = destination_path.as_deref().filter(|path| {
+                fs::symlink_metadata(path)
+                    .map(|metadata| metadata.file_type().is_dir())
+                    .unwrap_or(false)
+            });
+            stream_source_tree(
+                &source_path,
+                destination_directory,
+                &child_relative,
+                supports_symlinks,
+                excludes,
+                counts,
+                emit,
+            )?;
+        } else {
+            stream_source_entry(
+                source_path,
+                destination_path.filter(|path| path.is_file() || path.is_symlink()),
+                &child_relative,
+                supports_symlinks,
+                excludes,
+                counts,
+                emit,
+            )?;
         }
     }
     Ok(())
@@ -664,7 +566,6 @@ fn stream_source_entry(
     source: PathBuf,
     destination: Option<PathBuf>,
     relative: &Path,
-    mode: Mode,
     supports_symlinks: bool,
     excludes: &[String],
     counts: &mut JsonPlanCounts,
@@ -673,16 +574,7 @@ fn stream_source_entry(
     let source_metadata =
         fs::symlink_metadata(&source).map_err(|error| scan_error(&source, error))?;
     if source_metadata.file_type().is_dir() {
-        return stream_directory(
-            Some(&source),
-            destination.as_deref(),
-            relative,
-            mode,
-            supports_symlinks,
-            excludes,
-            counts,
-            emit,
-        );
+        unreachable!("directories are handled by stream_source_tree")
     }
 
     counts.scanned += 1;
@@ -742,55 +634,52 @@ fn stream_source_entry(
     }
 }
 
-fn stream_destination_entry(
-    destination: PathBuf,
+fn stream_destination_deletes(
+    source_root: &Path,
+    destination: &Path,
     relative: &Path,
-    mode: Mode,
     excludes: &[String],
     counts: &mut JsonPlanCounts,
     emit: &mut impl FnMut(JsonPlanAction) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
-    if mode != Mode::Mirror {
-        return Ok(());
+    for entry in fs::read_dir(destination).map_err(|error| scan_error(destination, error))? {
+        let entry = entry.map_err(|error| scan_error(destination, error))?;
+        if is_machinery(&entry.file_name()) {
+            continue;
+        }
+        let destination_path = entry.path();
+        let child_relative = relative.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&destination_path)
+            .map_err(|error| scan_error(&destination_path, error))?;
+        let source_path = source_root.join(entry.file_name());
+        if metadata.file_type().is_dir() {
+            stream_destination_deletes(
+                &source_path,
+                &destination_path,
+                &child_relative,
+                excludes,
+                counts,
+                emit,
+            )?;
+        } else if fs::symlink_metadata(&source_path)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            counts.scanned += 1;
+            if excludes
+                .iter()
+                .any(|exclude| Path::new(exclude) == child_relative)
+            {
+                counts.excluded += 1;
+            } else {
+                counts.deletes += 1;
+                emit(JsonPlanAction::Delete {
+                    path: child_relative,
+                    bytes: metadata.len(),
+                })?;
+            }
+        }
     }
-    let metadata =
-        fs::symlink_metadata(&destination).map_err(|error| scan_error(&destination, error))?;
-    if metadata.file_type().is_dir() {
-        return stream_directory(
-            None,
-            Some(&destination),
-            relative,
-            mode,
-            true,
-            excludes,
-            counts,
-            emit,
-        );
-    }
-
-    counts.scanned += 1;
-    if excludes
-        .iter()
-        .any(|exclude| Path::new(exclude) == relative)
-    {
-        counts.excluded += 1;
-        return Ok(());
-    }
-    counts.deletes += 1;
-    emit(JsonPlanAction::Delete {
-        path: relative.to_path_buf(),
-        bytes: metadata.len(),
-    })
-}
-
-fn sorted_entries(directory: &Path) -> Result<Vec<fs::DirEntry>, AppError> {
-    let mut entries = fs::read_dir(directory)
-        .map_err(|error| scan_error(directory, error))?
-        .map(|entry| entry.map_err(|error| scan_error(directory, error)))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.retain(|entry| !is_machinery(&entry.file_name()));
-    entries.sort_by_key(|entry| entry.file_name());
-    Ok(entries)
+    Ok(())
 }
 
 fn emit_plan_action(

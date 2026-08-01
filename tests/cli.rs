@@ -391,6 +391,12 @@ fn run_json_emits_a_pure_versioned_event_stream() {
     let events = ndjson(&output.stdout);
     assert_eq!(events[0]["schema"], "vibefilesync.run/v1");
     assert_eq!(events[0]["type"], "run_start");
+    let planned = events[0]["planned_actions"]
+        .as_array()
+        .expect("run_start declares the planned action set");
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0]["op"], "update");
+    assert_eq!(planned[0]["path"], "report.txt");
     assert_eq!(events[1]["type"], "action_start");
     assert_eq!(events[1]["op"], "update");
     assert_eq!(events[2]["type"], "action_done");
@@ -1462,7 +1468,7 @@ fn journal_failure_after_publish_is_an_interrupted_run_not_a_precondition_abort(
     let binary = Command::cargo_bin("vibesync").expect("binary builds");
     let mut command = ProcessCommand::new(binary.get_program());
     command
-        .args(["run", "limited", "--yes"])
+        .args(["run", "limited", "--yes", "--json"])
         .env("XDG_CONFIG_HOME", fx.xdg.path())
         .env("HOME", fx.home.path());
     unsafe {
@@ -1488,6 +1494,15 @@ fn journal_failure_after_publish_is_an_interrupted_run_not_a_precondition_abort(
         "the Journal tail fails only after Publish"
     );
     assert_eq!(output.status.code(), Some(EXIT_INTERRUPTED));
+    let events = ndjson(&output.stdout);
+    assert_eq!(events[0]["type"], "run_start");
+    assert_eq!(events[1]["type"], "action_start");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["schema"] == "vibefilesync.run/v1"),
+        "interrupted JSON output stays parseable: {events:#?}"
+    );
     let status = fx.cmd().args(["status", "limited"]).output().unwrap();
     assert!(String::from_utf8_lossy(&status.stdout).contains("interrupted"));
 }

@@ -551,12 +551,33 @@ impl JsonRunStream {
         plan: &plan::Plan,
         warnings: &[String],
     ) -> Result<(), AppError> {
+        let mut actions = Vec::new();
+        actions.extend(
+            plan.copies
+                .iter()
+                .map(|action| planned_action("copy", action)),
+        );
+        actions.extend(
+            plan.updates
+                .iter()
+                .map(|action| planned_action("update", action)),
+        );
+        actions.extend(
+            plan.deletes
+                .iter()
+                .map(|action| planned_action("delete", action)),
+        );
+        actions.extend(
+            plan.strays
+                .iter()
+                .map(|path| planned_action("cleanup", &cleanup_action(path))),
+        );
         self.emit(json!({
             "schema": "vibefilesync.run/v1",
             "type": "run_start",
             "run_id": run_id,
             "pair": pair_name,
-            "planned_actions": plan.copies.len() + plan.updates.len() + plan.deletes.len() + plan.strays.len(),
+            "planned_actions": actions,
             "warnings": warnings,
         }))
     }
@@ -640,6 +661,23 @@ impl JsonRunStream {
             .write_all(b"\n")
             .and_then(|()| stdout.flush())
             .map_err(|error| AppError::Interrupted(format!("could not write JSON output: {error}")))
+    }
+}
+
+fn planned_action(operation: &str, action: &Action) -> serde_json::Value {
+    json!({
+        "op": operation,
+        "path": path_text(&action.rel_path),
+        "bytes": action.bytes,
+    })
+}
+
+fn cleanup_action(path: &Path) -> Action {
+    Action {
+        rel_path: path.to_path_buf(),
+        bytes: 0,
+        old_bytes: None,
+        reason: "abandoned temp".to_string(),
     }
 }
 
