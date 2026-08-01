@@ -85,6 +85,10 @@ pub struct Plan {
     pub unchanged: usize,
     /// Rows removed by `--exclude`.
     pub excluded: usize,
+    /// Requested exclusions that did not name an action row in this plan.
+    /// They remain non-fatal so a script can safely reuse a filtered list,
+    /// but are reported to make a typo or a stale plan visible.
+    pub unknown_excludes: Vec<String>,
     /// Files found under the source and destination before filtering. These
     /// counts are precondition inputs, not presentation rows.
     pub source_entries: usize,
@@ -216,7 +220,24 @@ pub fn compute(
         }
     }
 
+    plan.unknown_excludes = excludes
+        .iter()
+        .filter(|excluded| {
+            let path = Path::new(excluded);
+            !source.contains_key(path) && !(mode == Mode::Mirror && dest.contains_key(path))
+        })
+        .cloned()
+        .collect();
+
     plan
+}
+
+/// Reports exclusions which did not match an exact action path. Keep this on
+/// stderr so NDJSON stdout remains a machine-readable event stream.
+pub(crate) fn report_unknown_excludes(plan: &Plan) {
+    for excluded in &plan.unknown_excludes {
+        eprintln!("vibesync: exclude path not found in plan: {excluded}");
+    }
 }
 
 /// Classifies and records one source entry for both buffered human plans and
@@ -412,6 +433,7 @@ fn human_size(bytes: u64) -> String {
 /// reads as empty (a first sync), so everything plans as COPY.
 pub fn run(config_path: &Path, pair_name: &str, excludes: &[String]) -> Result<i32, AppError> {
     let (pair, plan) = build(config_path, pair_name, excludes)?;
+    report_unknown_excludes(&plan);
     print!("{}", render(&plan, pair_name, pair.mode));
     Ok(crate::error::EXIT_OK)
 }
