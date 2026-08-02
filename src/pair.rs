@@ -180,7 +180,7 @@ fn cross_pair_destination_overlap_warnings(
 /// volume-relative path — no volume enumeration, and a candidate that
 /// cannot be resolved this way (no relative path recorded, or its expected
 /// directory doesn't exist) is skipped rather than raised.
-fn matching_source_names(cfg: &Config, target: &Path) -> Result<Vec<String>, AppError> {
+pub(crate) fn matching_source_names(cfg: &Config, target: &Path) -> Result<Vec<String>, AppError> {
     let target_identity = volume::directory_identity(target)
         .map_err(|e| AppError::Usage(format!("{}: not a directory ({e})", target.display())))?;
     let target_uuid = volume::volume_uuid(target).map_err(|e| {
