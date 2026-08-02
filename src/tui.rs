@@ -943,6 +943,20 @@ fn seeded_pane_loop<B: Backend, E: Events>(
 ) -> io::Result<()> {
     loop {
         terminal.draw(|frame| draw_seeded_pane(frame, seed_dir, notice, header_mode))?;
+        // Lets a test prove `TerminalSession`'s `Drop` restores the terminal
+        // during a panic unwind, rather than only on the ordinary return
+        // path. Placed after the first draw so the panic lands on a TUI
+        // that has provably taken the terminal over. Deliberately `panic!`,
+        // not `abort()` as ADR-0009 §1 specifies for every other
+        // `VIBESYNC_TEST_CRASH_AT` transition: `abort()` skips unwinding
+        // entirely, so it cannot exercise the `Drop`-based restoration this
+        // transition exists to prove.
+        #[cfg(all(feature = "fault-injection", debug_assertions))]
+        if std::env::var("VIBESYNC_TEST_CRASH_AT").ok().as_deref()
+            == Some("terminal_session_started")
+        {
+            panic!("fault injection: panic after the terminal session started");
+        }
         let Event::Key(key) = events.next()? else {
             continue;
         };

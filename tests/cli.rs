@@ -390,6 +390,24 @@ fn config_file(config_home: &Path) -> std::path::PathBuf {
     config_home.join("vibesync").join("config.toml")
 }
 
+/// Wraps `value` in single quotes for a POSIX shell, escaping any embedded
+/// single quotes.
+#[cfg(feature = "fault-injection")]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `stty -a` prints disabled flags with a leading `-` (e.g. `-icanon`,
+/// `-echo`); an enabled flag appears as the bare token. Tokenizing avoids
+/// false positives from related flags that share a prefix, like `echoe` or
+/// `echok`.
+#[cfg(feature = "fault-injection")]
+fn stty_flag_is_enabled(stty_output: &str, flag: &str) -> bool {
+    stty_output
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .any(|token| token == flag)
+}
+
 struct Fixture {
     xdg: tempfile::TempDir,
     home: tempfile::TempDir,
@@ -3569,6 +3587,98 @@ fn tui_startup_with_a_single_match_never_enumerates_pair_choices() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(fx.destination.path().join("selected.txt").is_file());
+}
+
+/// Issue #46 acceptance criterion 67: a crash must restore the terminal.
+/// `TerminalSession::start` is the single guarded entry point and its `Drop`
+/// restores raw mode, the alternate screen, and the cursor during unwinding
+/// (the crate unwinds by default). `VIBESYNC_TEST_CRASH_AT=panic`, unlike
+/// `startup_pair_choices`'s `abort()`, panics rather than aborting, so the
+/// unwind actually runs and this test can observe the restoration rather
+/// than merely proving a path is unreached.
+///
+/// The child runs under a shell inside the same `script`-supplied
+/// pseudo-terminal, so `stty -a` — run immediately after the panicking
+/// process exits — observes whether `disable_raw_mode()` actually ran
+/// during unwind, not just whether the process happened to exit.
+///
+/// Verified by deleting each line of `TerminalSession::drop` in turn:
+/// removing `disable_raw_mode()` turns the raw-mode assertions red, and
+/// removing `execute!(Show, LeaveAlternateScreen)` turns the alternate-screen
+/// assertion red — both independently caught.
+///
+/// The cursor-show assertion is *not* independently isolated to one line:
+/// `execute!(..., Show, LeaveAlternateScreen)` and the standalone
+/// `self.terminal.show_cursor()` each emit their own `Show` sequence, so
+/// either line alone still satisfies the assertion when the other runs.
+/// Deleting `execute!` alone leaves `\x1b[?25h` intact (from
+/// `show_cursor()`) and only the alternate-screen assertion goes red;
+/// deleting `show_cursor()` alone leaves `\x1b[?25h` intact (from
+/// `execute!`'s `Show`) and nothing goes red. The assertion is real — it
+/// would fail if cursor restoration were removed entirely — but this
+/// double redundancy in production code means no single-line deletion is
+/// caught by it. Acknowledged limitation, not silently counted as covered.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tui_panic_after_terminal_takeover_still_restores_the_terminal() {
+    let fx = Fixture::new();
+
+    // The fault fires from inside the seeded-pane loop, right after its
+    // first `terminal.draw`, so no scripted key press is needed: the child
+    // panics on its own once it has provably taken the terminal over.
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let binary_path = binary.get_program().to_str().expect("binary path is utf-8");
+    let shell_command = format!(
+        "{} tui; echo VIBESYNC_TUI_EXIT=$?; stty -a",
+        shell_single_quote(binary_path)
+    );
+    let output = ProcessCommand::new("script")
+        .args(["-q", "/dev/null", "sh", "-c", &shell_command])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .env("VIBESYNC_TEST_CRASH_AT", "terminal_session_started")
+        .output()
+        .expect("script starts a pseudo-terminal");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The restore escape sequences land on the same terminal line as this
+    // marker (no newline separates the panicking child's last output from
+    // the shell's `echo`), so the marker is found by substring, not by
+    // scanning whole lines.
+    let exit_code: i32 = {
+        const MARKER: &str = "VIBESYNC_TUI_EXIT=";
+        let start = stdout.find(MARKER).expect("shell echoes the tui exit code") + MARKER.len();
+        let digits: String = stdout[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().expect("exit code is an integer")
+    };
+    assert_ne!(
+        exit_code, 0,
+        "fault injection should panic, not exit cleanly: {stdout}"
+    );
+
+    // `TUI_ALTERNATE_SCREEN` (`\x1b[?1049h`) is its counterpart: this proves
+    // the session guard's `Drop` ran during the panic's unwind rather than
+    // being skipped, which is exactly the property criterion 67 protects.
+    assert!(
+        stdout.contains("\x1b[?1049l"),
+        "panic must still leave the alternate screen: {stdout}"
+    );
+    assert!(
+        stdout.contains("\x1b[?25h"),
+        "panic must still show the cursor: {stdout}"
+    );
+
+    assert!(
+        stty_flag_is_enabled(&stdout, "icanon"),
+        "panic must still restore canonical (non-raw) mode: {stdout}"
+    );
+    assert!(
+        stty_flag_is_enabled(&stdout, "echo"),
+        "panic must still restore terminal echo: {stdout}"
+    );
 }
 
 #[test]
