@@ -255,7 +255,11 @@ fn side_status_json(
     }
 }
 
-fn state_name_and_location(state: &VolumeState) -> (&'static str, Option<&Path>) {
+/// The short machine-readable state vocabulary shared by `pair list --check`
+/// (JSON `state` field and table `STATUS` column) and the TUI pair
+/// selector's per-side tag — one name per `VolumeState`, so the wording
+/// never diverges between the two surfaces.
+pub(crate) fn state_name_and_location(state: &VolumeState) -> (&'static str, Option<&Path>) {
     match state {
         VolumeState::Ready => ("ready", None),
         VolumeState::Relocated { at } => ("relocated", Some(at.as_path())),
@@ -282,7 +286,11 @@ pub fn list_table(
 /// present, else the stored path's mount component (derived from the
 /// recorded volume-relative path, no volume I/O), else the stored path
 /// itself.
-fn volume_label(name: Option<&str>, path: &Path, relative_path: Option<&Path>) -> String {
+pub(crate) fn volume_label(
+    name: Option<&str>,
+    path: &Path,
+    relative_path: Option<&Path>,
+) -> String {
     if let Some(name) = name.filter(|n| !n.is_empty()) {
         return name.to_string();
     }
