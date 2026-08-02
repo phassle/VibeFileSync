@@ -111,6 +111,10 @@ enum PairCommand {
         /// Classify each side's volume state (advisory; does volume I/O).
         #[arg(long)]
         check: bool,
+        /// Narrow the listing to the pair whose source is this directory,
+        /// matched by macOS directory identity (device and inode).
+        #[arg(long)]
+        source: Option<PathBuf>,
     },
     /// Remove a Folder pair.
     Remove { name: String },
@@ -214,11 +218,15 @@ fn run_pair(action: &PairCommand, config_path: &std::path::Path) -> Result<i32, 
             pair::add(config_path, name, source, destination, *mode)?;
             Ok(error::EXIT_OK)
         }
-        PairCommand::List { json, check } => {
+        PairCommand::List {
+            json,
+            check,
+            source,
+        } => {
             let output = if *json {
-                pair::list_json(config_path, *check)?
+                pair::list_json(config_path, *check, source.as_deref())?
             } else {
-                pair::list_table(config_path, *check)?
+                pair::list_table(config_path, *check, source.as_deref())?
             };
             print!("{output}");
             Ok(error::EXIT_OK)

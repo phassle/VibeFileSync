@@ -201,6 +201,18 @@ pub fn volume_name(path: &Path) -> io::Result<String> {
     Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Reads a directory's macOS identity — device and inode — the pair used to
+/// answer "is this the same directory?" regardless of the path string used
+/// to reach it: a differently-cased path, a symlink, or a volume remounted
+/// elsewhere all resolve to the same (device, inode) if they name the same
+/// directory. `fs::metadata` follows symlinks, so a symlinked path resolves
+/// to the identity of what it points at.
+pub fn directory_identity(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 /// Finds the root of a currently mounted volume by its pinned UUID. This is
 /// deliberately a mount-table scan rather than a pathname heuristic: a
 /// remount at `/Volumes/Backup 1` must not be mistaken for the old path.
@@ -274,6 +286,28 @@ fn format_uuid(bytes: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_identity_matches_the_same_directory_reached_two_different_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let symlink = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &symlink).unwrap();
+        assert_eq!(
+            directory_identity(dir.path()).unwrap(),
+            directory_identity(&symlink).unwrap()
+        );
+    }
+
+    #[test]
+    fn directory_identity_distinguishes_a_directory_from_its_own_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert_ne!(
+            directory_identity(dir.path()).unwrap(),
+            directory_identity(&child).unwrap()
+        );
+    }
 
     #[test]
     fn formats_uuid_bytes_as_hyphenated_uppercase() {

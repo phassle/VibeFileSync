@@ -500,6 +500,92 @@ fn pair_list_check_matching_nothing_is_still_an_empty_list_exit_0() {
 }
 
 #[test]
+fn pair_list_source_narrows_to_the_matching_pair_in_json() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0]["name"], "photos");
+}
+
+#[test]
+fn pair_list_source_narrows_to_the_matching_pair_in_the_human_table() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("photos"), "{stdout}");
+}
+
+#[test]
+fn pair_list_source_excludes_a_pair_when_given_its_destination() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.destination.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn pair_list_source_matching_nothing_is_an_empty_list_exit_0() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            elsewhere.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn config_rewrite_is_atomic_no_stray_temp_files_survive() {
     let fx = Fixture::new();
     fx.add_photos_pair();
