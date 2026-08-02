@@ -4,7 +4,7 @@
 //!   cargo run --example commander-panes           # interactive
 //!   cargo run --example commander-panes -- --dump # plain-text dump, no TTY
 //!
-//! Keys: 1/2/3 switch review layout, 4..7 show volume/first-use states,
+//! Keys: 1-4 switch review layout, 5..8 show volume/first-use states,
 //! j/k move, space toggles inclusion, q quits.
 
 use std::io::{self, Stdout};
@@ -181,7 +181,7 @@ fn header(frame: &mut Frame, area: Rect, title: &str, subtitle: &str) {
 
 fn footer(frame: &mut Frame, area: Rect, app: &App, keys: &str) {
     // Screens with no plan behind them get keys only — no action count, no gate.
-    let status = if !matches!(app.screen, 1..=3) {
+    let status = if !matches!(app.screen, 1..=4) {
         Line::from("")
     } else if app.blocked() {
         Line::from(Span::styled(
@@ -406,6 +406,71 @@ fn draw_variant_b(frame: &mut Frame, app: &App) {
     );
 }
 
+// ------- variant D: two-sided rows, named operations, no unchanged noise
+
+fn draw_variant_d(frame: &mut Frame, app: &App) {
+    let (head, body, foot) = layout(frame.area());
+    header(
+        frame,
+        head,
+        "photos  ·  Mirror",
+        "~/Photos                    →  Backup Drive (exFAT) · connected",
+    );
+
+    let hidden = app.rows.iter().filter(|r| !r.op.reviewable()).count();
+    let rows: Vec<Row> = app
+        .rows
+        .iter()
+        .filter(|r| r.op.reviewable())
+        .enumerate()
+        .map(|(i, r)| {
+            let selected = i == app.cursor.min(4);
+            let base = if selected {
+                Style::default().bg(Color::Rgb(38, 42, 52))
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                Cell::from(if r.included { " ✓" } else { " ·" }).style(base.fg(ACCENT)),
+                Cell::from(r.op.name()).style(base.fg(r.op.color()).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("{}  {}", r.left, r.left_meta)).style(base),
+                Cell::from(r.op.arrow()).style(base.fg(r.op.color())),
+                Cell::from(format!("{}  {}", r.right, r.right_meta)).style(base),
+                Cell::from(r.detail).style(base.fg(DIM)),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Percentage(32),
+                Constraint::Length(5),
+                Constraint::Percentage(30),
+                Constraint::Percentage(26),
+            ],
+        )
+        .header(
+            Row::new(vec!["", " OP", " SOURCE", "", " DESTINATION", " WHY"])
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " PLAN  ·  {hidden} unchanged row(s) hidden — u to show "
+        ))),
+        body,
+    );
+
+    footer(
+        frame,
+        foot,
+        app,
+        " 1/2/3/4 layout · j k move · space include · u unchanged · r Run · q quit ",
+    );
+}
+
 // ------------------------------------ variant C: one two-sided table
 
 fn draw_variant_c(frame: &mut Frame, app: &App) {
@@ -477,7 +542,7 @@ fn draw_variant_c(frame: &mut Frame, app: &App) {
 fn draw_state(frame: &mut Frame, app: &App, which: u8) {
     let (head, body, foot) = layout(frame.area());
     let (title, subtitle, lines) = match which {
-        4 => (
+        5 => (
             "first use",
             "no Folder pairs configured — the current directory seeds the source",
             vec![
@@ -500,7 +565,7 @@ fn draw_state(frame: &mut Frame, app: &App, which: u8) {
                 )),
             ],
         ),
-        5 => (
+        6 => (
             "photos  ·  Mirror",
             "matched from the current directory",
             vec![
@@ -522,7 +587,7 @@ fn draw_state(frame: &mut Frame, app: &App, which: u8) {
                 )),
             ],
         ),
-        6 => (
+        7 => (
             "photos  ·  Mirror",
             "source cannot be read",
             vec![
@@ -581,7 +646,7 @@ fn draw_state(frame: &mut Frame, app: &App, which: u8) {
         frame,
         foot,
         app,
-        " 1/2/3 layouts · 4 first use · 5 volume absent · 6 unreadable · 7 pair picker · q quit ",
+        " 1-4 layouts · 5 first use · 6 volume absent · 7 unreadable · 8 pair picker · q quit ",
     );
 }
 
@@ -590,6 +655,7 @@ fn draw(frame: &mut Frame, app: &App) {
         1 => draw_variant_a(frame, app),
         2 => draw_variant_b(frame, app),
         3 => draw_variant_c(frame, app),
+        4 => draw_variant_d(frame, app),
         other => draw_state(frame, app, other),
     }
 }
@@ -610,10 +676,14 @@ fn dump() -> io::Result<()> {
             3,
             "VARIANT C — one two-sided table, nothing to keep in scroll-sync",
         ),
-        (4, "STATE — first use, current directory seeds the source"),
-        (5, "STATE — destination volume absent"),
-        (6, "STATE — source unreadable (never shown as empty)"),
-        (7, "STATE — pair picker, current directory matched"),
+        (
+            4,
+            "VARIANT D — named operations on two-sided rows, unchanged rows hidden",
+        ),
+        (5, "STATE — first use, current directory seeds the source"),
+        (6, "STATE — destination volume absent"),
+        (7, "STATE — source unreadable (never shown as empty)"),
+        (8, "STATE — pair picker, current directory matched"),
     ];
     for (screen, label) in labels {
         let mut app = App::new();
@@ -658,7 +728,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<(
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Char(c @ '1'..='7') => app.screen = c as u8 - b'0',
+            KeyCode::Char(c @ '1'..='8') => app.screen = c as u8 - b'0',
             KeyCode::Char('j') | KeyCode::Down => {
                 app.cursor = (app.cursor + 1).min(app.rows.len() - 1)
             }
