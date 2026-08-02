@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_source_names_ignores_a_symlink_to_the_source() {
+    fn matching_source_names_finds_the_pair_through_a_symlink_to_its_source() {
         let (config_dir, source, _destination, config_path) = config_with_one_pair();
         let cfg = config::load(&config_path).unwrap();
         let alias = config_dir.path().join("alias-to-source");

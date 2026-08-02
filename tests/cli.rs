@@ -99,6 +99,11 @@ const TUI_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
 /// `script` hands the child has no window size, so the frame itself paints no
 /// glyphs to match on.
 const TUI_FRAME_FLUSHED: &[u8] = b"\x1b[0m";
+/// What ratatui emits for `Terminal::clear`. `run_pair_flow` clears exactly
+/// once on entering a stage, so past the startup gate this is the only
+/// byte-level marker of a stage boundary available: the frames themselves are
+/// indistinguishable, since the window-less pseudo-terminal paints no glyphs.
+const TUI_SCREEN_CLEARED: &[u8] = b"\x1b[2J";
 /// Deliberately generous: startup normally takes single-digit milliseconds, so
 /// only a genuinely wedged child should ever reach this ceiling.
 const TUI_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -313,9 +318,9 @@ fn vibesync_in_tty_with_input_after_start_in(
 }
 
 /// Like `vibesync_in_tty_with_input_after_start`, but `between` runs once
-/// the TUI has had time to react to `first` (e.g. finish a Compare scan)
-/// and before `second` is written — used to land a filesystem change inside
-/// a specific stage rather than only before the TUI ever opens.
+/// `first` has driven the TUI through a completed Compare scan and into
+/// Review, and before `second` is written — used to land a filesystem change
+/// inside a specific stage rather than only before the TUI ever opens.
 fn vibesync_in_tty_with_staged_input(
     config_home: &Path,
     home: &Path,
@@ -360,12 +365,41 @@ fn vibesync_in_tty_with_staged_input(
         );
     }
 
+    // The startup gate above returns or panics, so this is always `Some`.
+    let started = rendered.expect("startup gate yields the first frame's offset");
+
     let mut stdin = child.stdin.take().expect("script stdin is piped");
     stdin.write_all(first).expect("first input is written");
-    // Not a readiness signal: the TUI is provably running by now. This is the
-    // staging delay the helper exists for — time for the work `first` kicks
-    // off (e.g. a Compare scan) to reach the stage `between` targets.
-    std::thread::sleep(Duration::from_millis(500));
+
+    // The staging rendezvous the helper exists for, and ADR-0011 §1 applies
+    // here too: `between` must land after Compare captured its plan, not
+    // merely a while after `first` was written, or the test silently exercises
+    // a different stage than the one it is named for. `run_pair_flow` clears
+    // the screen once per stage entry, so past the startup gate the clears are
+    // the boundaries: the pane gate proceeding into Compare (`src/tui.rs:1057`),
+    // then the finished scan handing its plan to Review (`src/tui.rs:1081`).
+    // The next frame flush would not do — Compare draws on entry, before it has
+    // even read the key that starts the scan, and again every 50 ms while the
+    // scan runs (`src/tui.rs:441`), so a flush proves nothing about progress.
+    let comparing = pty.wait_for(TUI_SCREEN_CLEARED, started, TUI_READY_TIMEOUT);
+    let reviewing =
+        comparing.and_then(|from| pty.wait_for(TUI_SCREEN_CLEARED, from, TUI_READY_TIMEOUT));
+    let parked =
+        reviewing.and_then(|from| pty.wait_for(TUI_FRAME_FLUSHED, from, TUI_READY_TIMEOUT));
+    if parked.is_none() {
+        let stage = match (comparing, reviewing) {
+            (None, _) => "leave the pane gate",
+            (_, None) => "finish comparing",
+            _ => "render the review it compared",
+        };
+        terminate_process_group(&mut child);
+        panic!(
+            "TUI never managed to {stage} for {args:?}: pty {:?}, stderr {:?}",
+            pty.snapshot(),
+            errors.snapshot()
+        );
+    }
+
     between();
     stdin.write_all(second).expect("second input is written");
     drop(stdin);
