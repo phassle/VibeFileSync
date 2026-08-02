@@ -24,6 +24,7 @@ pub fn resolve_pair(pair: &Pair) -> Result<(Pair, Vec<String>), AppError> {
         pair.destination_volume_relative_path.as_deref(),
         "destination",
     )?;
+    refuse_self_overlap(&source, &destination)?;
     let mut resolved = pair.clone();
     resolved.source = source;
     resolved.destination = destination;
@@ -98,6 +99,82 @@ fn relocated_folder(
         )));
     }
     Ok(folder)
+}
+
+/// A Folder pair whose source and destination name the same directory, or
+/// where one is nested inside the other. Neither configuration has a
+/// legitimate meaning: an identical pair has no plan, and a nested pair
+/// either makes the plan incoherent (destination inside source) or means a
+/// Mirror deletes everything around its own source (source inside
+/// destination).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfOverlap {
+    Identical,
+    DestinationInsideSource,
+    SourceInsideDestination,
+}
+
+/// Detects [`SelfOverlap`] between a pair's two *resolved, existing*
+/// directories. Identity uses the same device-and-inode rule as pair
+/// matching (`volume::directory_identity`), so a case difference or a
+/// symlink cannot defeat it; nesting uses canonicalized-path containment,
+/// which resolves the same way.
+pub fn check_self_overlap(source: &Path, destination: &Path) -> io::Result<Option<SelfOverlap>> {
+    let source_identity = volume::directory_identity(source)?;
+    let destination_identity = volume::directory_identity(destination)?;
+    if source_identity == destination_identity {
+        return Ok(Some(SelfOverlap::Identical));
+    }
+    let source_canonical = source.canonicalize()?;
+    let destination_canonical = destination.canonicalize()?;
+    if destination_canonical.starts_with(&source_canonical) {
+        return Ok(Some(SelfOverlap::DestinationInsideSource));
+    }
+    if source_canonical.starts_with(&destination_canonical) {
+        return Ok(Some(SelfOverlap::SourceInsideDestination));
+    }
+    Ok(None)
+}
+
+pub fn self_overlap_message(overlap: SelfOverlap, source: &Path, destination: &Path) -> String {
+    match overlap {
+        SelfOverlap::Identical => format!(
+            "source and destination are the same directory ({} and {})",
+            source.display(),
+            destination.display()
+        ),
+        SelfOverlap::DestinationInsideSource => format!(
+            "destination {} is nested inside source {}",
+            destination.display(),
+            source.display()
+        ),
+        SelfOverlap::SourceInsideDestination => format!(
+            "source {} is nested inside destination {}; a Mirror would delete everything around it",
+            source.display(),
+            destination.display()
+        ),
+    }
+}
+
+fn refuse_self_overlap(source: &Path, destination: &Path) -> Result<(), AppError> {
+    refuse_self_overlap_as(source, destination, AppError::Precondition)
+}
+
+/// Shared by both call sites — `pair::add`'s usage-time check and this
+/// module's run-time re-check — which differ only in which `AppError`
+/// variant (and therefore exit code) the refusal should surface as.
+pub fn refuse_self_overlap_as(
+    source: &Path,
+    destination: &Path,
+    to_error: impl Fn(String) -> AppError,
+) -> Result<(), AppError> {
+    match check_self_overlap(source, destination) {
+        Ok(Some(overlap)) => Err(to_error(self_overlap_message(overlap, source, destination))),
+        Ok(None) => Ok(()),
+        Err(error) => Err(to_error(format!(
+            "could not compare source and destination: {error}"
+        ))),
+    }
 }
 
 /// A non-fatal, advisory report of one Folder-pair side's volume state.
@@ -300,6 +377,70 @@ fn tree_size(root: &Path) -> io::Result<u64> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn check_self_overlap_flags_identical_directories_even_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+
+        let overlap = check_self_overlap(dir.path(), &alias).unwrap();
+
+        assert_eq!(overlap, Some(SelfOverlap::Identical));
+    }
+
+    #[test]
+    fn check_self_overlap_flags_destination_nested_inside_source() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = source.path().join("child");
+        fs::create_dir(&destination).unwrap();
+
+        let overlap = check_self_overlap(source.path(), &destination).unwrap();
+
+        assert_eq!(overlap, Some(SelfOverlap::DestinationInsideSource));
+    }
+
+    #[test]
+    fn check_self_overlap_flags_source_nested_inside_destination() {
+        let destination = tempfile::tempdir().unwrap();
+        let source = destination.path().join("child");
+        fs::create_dir(&source).unwrap();
+
+        let overlap = check_self_overlap(&source, destination.path()).unwrap();
+
+        assert_eq!(overlap, Some(SelfOverlap::SourceInsideDestination));
+    }
+
+    #[test]
+    fn check_self_overlap_is_none_for_unrelated_directories() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let overlap = check_self_overlap(source.path(), destination.path()).unwrap();
+
+        assert_eq!(overlap, None);
+    }
+
+    #[test]
+    fn resolve_pair_refuses_an_identical_hand_edited_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = volume::volume_uuid(dir.path()).unwrap();
+        let pair = Pair {
+            source: dir.path().to_path_buf(),
+            source_volume_uuid: uuid.clone(),
+            source_volume_name: None,
+            source_volume_relative_path: Some(PathBuf::new()),
+            destination: dir.path().to_path_buf(),
+            destination_volume_uuid: uuid,
+            destination_volume_name: None,
+            destination_volume_relative_path: Some(PathBuf::new()),
+            mode: Mode::Mirror,
+        };
+
+        let error = resolve_pair(&pair).unwrap_err();
+
+        assert!(error.to_string().contains("same directory"));
+    }
 
     #[test]
     fn mirror_empty_source_requires_its_one_run_override() {

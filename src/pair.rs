@@ -69,6 +69,10 @@ pub fn add(
 
     require_existing_dir(source)?;
     require_existing_dir(destination)?;
+    refuse_self_overlap(source, destination)?;
+    for warning in cross_pair_destination_overlap_warnings(&cfg, name, destination) {
+        eprintln!("{warning}");
+    }
 
     let source_volume_uuid = pin_volume_uuid(source)?;
     let destination_volume_uuid = pin_volume_uuid(destination)?;
@@ -119,6 +123,49 @@ pub fn add(
 
     config::save(config_path, &cfg)?;
     Ok(())
+}
+
+/// Refuses a pair whose source and destination are the same directory, or
+/// where one is nested inside the other — in either direction, in both Sync
+/// modes. Neither configuration has a legitimate use, and SafetyNet cannot
+/// rescue a self-consuming tree the way it rescues an ordinary bad run.
+/// Reused unchanged by `preconditions::resolve_pair` so a hand-edited config
+/// is caught again at Compare and Run.
+fn refuse_self_overlap(source: &Path, destination: &Path) -> Result<(), AppError> {
+    preconditions::refuse_self_overlap_as(source, destination, AppError::Usage)
+}
+
+/// Warns, without refusing, when a new pair's destination overlaps an
+/// existing pair's destination tree — naming the other pair. A Mirror
+/// parent will archive the child's content on its next run, but
+/// archive-by-rename is exactly what SafetyNet guarantees, so the outcome is
+/// recoverable and a refusal would forbid layouts that are merely unusual.
+/// `exclude_name` keeps a `--replace` from warning about the pair it is
+/// itself redefining.
+fn cross_pair_destination_overlap_warnings(
+    cfg: &Config,
+    exclude_name: &str,
+    destination: &Path,
+) -> Vec<String> {
+    let Ok(destination_canonical) = destination.canonicalize() else {
+        return Vec::new();
+    };
+    cfg.pairs
+        .iter()
+        .filter(|(name, _)| name.as_str() != exclude_name)
+        .filter_map(|(name, other)| {
+            let other_canonical = other.destination.canonicalize().ok()?;
+            (destination_canonical.starts_with(&other_canonical)
+                || other_canonical.starts_with(&destination_canonical))
+            .then(|| {
+                format!(
+                    "vibesync: warning: destination {} overlaps with pair '{name}' (destination {})",
+                    destination.display(),
+                    other.destination.display()
+                )
+            })
+        })
+        .collect()
 }
 
 /// Names of the Folder pairs whose *source* is `target`, decided by macOS
@@ -466,6 +513,93 @@ mod tests {
         )
         .unwrap();
         (config_dir, source, destination, config_path)
+    }
+
+    #[test]
+    fn add_refuses_an_identical_source_and_destination() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+
+        let error = add(
+            &config_path,
+            "photos",
+            dir.path(),
+            dir.path(),
+            Mode::Mirror,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("same directory"));
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn add_refuses_a_destination_nested_inside_the_source() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let destination = source.path().join("child");
+        std::fs::create_dir(&destination).unwrap();
+        let config_path = config_dir.path().join("config.toml");
+
+        let error = add(
+            &config_path,
+            "photos",
+            source.path(),
+            &destination,
+            Mode::Update,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("nested"));
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn add_refuses_a_source_nested_inside_the_destination() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source = destination.path().join("child");
+        std::fs::create_dir(&source).unwrap();
+        let config_path = config_dir.path().join("config.toml");
+
+        let error = add(
+            &config_path,
+            "photos",
+            &source,
+            destination.path(),
+            Mode::Mirror,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("nested"));
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn cross_pair_destination_overlap_warnings_names_the_other_pair() {
+        let (_config_dir, _source, destination, config_path) = config_with_one_pair();
+        let cfg = config::load(&config_path).unwrap();
+        let nested_destination = destination.path().join("child");
+        std::fs::create_dir(&nested_destination).unwrap();
+
+        let warnings = cross_pair_destination_overlap_warnings(&cfg, "other", &nested_destination);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("photos"));
+    }
+
+    #[test]
+    fn cross_pair_destination_overlap_warnings_excludes_the_pair_being_replaced() {
+        let (_config_dir, _source, destination, config_path) = config_with_one_pair();
+        let cfg = config::load(&config_path).unwrap();
+
+        let warnings = cross_pair_destination_overlap_warnings(&cfg, "photos", destination.path());
+
+        assert!(warnings.is_empty());
     }
 
     #[test]
