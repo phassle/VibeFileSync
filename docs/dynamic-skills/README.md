@@ -159,7 +159,7 @@ Setup researches the current models and native reasoning-effort values, shows th
 ~/.agents/dynamic-skills/capabilities.json
 ```
 
-The model catalog expires after 14 days. Dynamic Implement never runs setup automatically; it stops safely and reports the exact manual command when setup is absent, stale, or incomplete.
+Each harness's model catalog expires after 14 days, independently of the others. Dynamic Implement checks only the harnesses a run actually uses — the implementer and the selected reviewer — so a stale entry for a harness you are not using never blocks a run. It never starts setup automatically; it stops safely and names the specific harness and missing evidence.
 
 The no-issue orientation mode does not require this model capability setup because it creates no model session or implementation state. It still requires `wayfinder` and the repository configuration produced by `setup-matt-pocock-skills`.
 
@@ -212,13 +212,13 @@ Never store learned findings inside an installed skill directory. `dynamic-skill
 
 ## Updating
 
-For a skills CLI installation, inspect and apply available updates with the CLI's current update command. Re-run manual capability setup after a harness version, authentication, model surface, or reasoning-effort control changes—and whenever the 14-day catalog expires.
+For a skills CLI installation, inspect and apply available updates with the CLI's current update command. Re-run manual capability setup for a harness after its version, authentication, model surface, or reasoning-effort control changes—and whenever its 14-day lease expires. Setup merges into the existing profile, so refreshing one harness preserves every other harness's verified ladder.
 
 For a manual installation, replace all three skill directories from the same release. Preserve the local capability profile and repository-owned calibration file; neither belongs inside the replaced directories.
 
 ## Troubleshooting
 
-- **Dynamic Implement asks for setup:** expected when the local profile is absent, expired, lacks a catalog fingerprint, or has no live-verified model/effort ladder. Run the displayed manual setup command.
+- **Dynamic Implement asks for setup:** expected when the harness a run needs is absent from the profile, past its lease, lacks its ladder fingerprint, or has no live-verified model/effort ladder. The message names the harness. Run the displayed manual setup command.
 - **A required Matt skill is missing:** reinstall the official engineering set and run `setup-matt-pocock-skills` in the repository.
 - **OpenCode rejects the root invocation:** verify the custom command adapter exists and retains `DYNAMIC_IMPLEMENT_SLASH_ENTRY=1`.
 - **A reviewer route is unavailable:** rerun manual setup. Never substitute an unverified model or a reviewer carrying implementation context.

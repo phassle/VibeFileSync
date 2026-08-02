@@ -30,7 +30,7 @@ Keep learned model/effort outcomes in the repository at `.agents/dynamic-impleme
 
 ## Set up capabilities
 
-Run `dynamic-skills-setup` manually on first use, after authentication/harness changes, when a selected route fails, or after the model catalog expires. Dynamic Implement never starts setup automatically: it stops before mutation, reports the exact missing/stale evidence, and tells the user which setup command to invoke. After setup succeeds, invoke Dynamic Implement again.
+Run `dynamic-skills-setup` manually on first use, after authentication/harness changes, when a selected route fails, or when a harness's catalog lease expires. Dynamic Implement never starts setup automatically: it stops before mutation, reports the exact missing/stale evidence, and tells the user which setup command to invoke. After setup succeeds, invoke Dynamic Implement again.
 
 | Harness | Manual setup entry |
 | --- | --- |
@@ -46,7 +46,13 @@ Setup performs three separate jobs:
 2. Show the complete model/effort probe matrix and expected paid ceiling, then live-verify only combinations the user approves and can actually call.
 3. Map verified routes to Small/T1, Medium/T2, and Large/T3 and build one deterministic flat escalation ladder.
 
-The researched catalog expires after 14 days. A refresh researches the complete model/effort surface again before extending the expiry. Catalog freshness is separate from outcome calibration: the local catalog says which exact combinations this installation can call now; issue telemetry and the tracked team profile teach which combination comparable work needed.
+### One profile, many harnesses
+
+The profile accumulates. A setup run scopes itself to the current harness plus anything whose lease expired, and merges its results into the existing file — every other harness is carried forward unchanged, ladder and evidence intact. So you can run setup from Codex today and from Claude Code next week and end up with both verified, rather than the second run erasing the first.
+
+Most model routes can be verified from another harness, because the CLIs share the machine's authentication and setup can drive them as child processes. Only the coordinator identity and a harness's own native Goal/task facility need setup to run inside that harness; those are marked unobserved otherwise. Run setup from each harness you intend to coordinate from, and let cross-harness probing cover the rest.
+
+Each harness holds its own 14-day catalog lease and its own ladder fingerprint. A refresh researches that harness's model/effort surface again before extending its expiry, and leaves every other harness untouched. Catalog freshness is separate from outcome calibration: the local catalog says which exact combinations this installation can call now; issue telemetry and the tracked team profile teach which combination comparable work needed.
 
 A ladder step is usable only when its exact harness, model, and effort combination passed a live probe. Setup orders all verified effort steps within a model before moving to the next genuinely stronger model, then deduplicates no-op tier mappings. Advertised or declined combinations remain candidates and are never selected automatically. Paid probes require prior disclosure and approval.
 
