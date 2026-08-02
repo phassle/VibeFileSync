@@ -19,10 +19,14 @@ Every run is **review-first**: `plan` shows a comprehensible dry-run diff before
 
 `plan --json` and `run --json` stream versioned NDJSON events, every guard is deterministic and abort-by-default with explicit per-run overrides, and the exit-code taxonomy (0 clean · 1 partial · 2 precondition abort · 3 blocked plan · 4 interrupted · 64 usage) lets callers branch without parsing JSON.
 
+## Managing Folder pairs
+
+`pair list --source <PATH>` finds the pair for wherever you're standing, matched by directory identity rather than a stored path string. Add `--check` to see each pair's volume state at a glance — mounted, relocated, absent, or otherwise — without opening it. `pair add --replace` redefines an existing pair (new paths, re-pinned volumes) in one atomic save, keeping its name and run history intact.
+
 ## Status
 
 v1 is under active development from the spec in [issue #14](https://github.com/phassle/VibeFileSync/issues/14), broken into tracer-bullet tickets ([#15–#28](https://github.com/phassle/VibeFileSync/issues?q=label%3Aready-for-agent)).
 
 - **Domain glossary**: [`CONTEXT.md`](CONTEXT.md) — the normative vocabulary (Folder pair, Mirror, SafetyNet, Publish, Convergence, …)
-- **Architecture decisions**: [`docs/adr/`](docs/adr/) — ADR-0001…0011 back every decision in the spec
+- **Architecture decisions**: [`docs/adr/`](docs/adr/) — ADR-0001…0009 back every decision in the spec
 - **Agent instructions**: [`AGENTS.md`](AGENTS.md) — issue tracker, triage labels, gitflow
