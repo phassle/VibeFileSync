@@ -2332,13 +2332,14 @@ fn tui_confirmation_executes_the_reviewed_plan_through_the_run_engine() {
     fx.write_dest("changed.txt", "old destination version");
     fx.add_photos_pair();
 
-    // Enter starts Compare; Enter advances from action review to
-    // confirmation; y confirms; Enter dismisses the persisted Result stage.
+    // Enter passes the volume-state pane gate; Enter starts Compare; Enter
+    // advances from action review to confirmation; y confirms; Enter
+    // dismisses the persisted Result stage.
     let output = vibesync_in_tty_with_input(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\r\ry\r",
+        b"\r\r\ry\r",
     );
 
     assert!(
@@ -2387,14 +2388,19 @@ fn tui_shows_preflight_warnings_before_final_confirmation() {
     fx.write_dest("_SafetyNet/old-run/old.txt", "archived bytes");
     fx.add_photos_pair();
 
-    // Enter starts Compare; Enter reaches final confirmation; q cancels
-    // without mutation. The preflight warning's rendered text is asserted
-    // through the `Terminal<TestBackend>` seam (`tui::tests::
-    // confirm_screen_renders_compare_s_notices`) — a real pty's reported
-    // size is not guaranteed in this harness, so text assertions belong to
-    // the rendered-content seam, not this end-to-end one.
-    let output =
-        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\r\rq");
+    // Enter passes the volume-state pane gate; Enter starts Compare; Enter
+    // reaches final confirmation; q cancels without mutation. The preflight
+    // warning's rendered text is asserted through the `Terminal<TestBackend>`
+    // seam (`tui::tests:: confirm_screen_renders_compare_s_notices`) — a real
+    // pty's reported size is not guaranteed in this harness, so text
+    // assertions belong to the rendered-content seam, not this end-to-end
+    // one.
+    let output = vibesync_in_tty_with_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r\r\rq",
+    );
     assert!(output.status.success());
     assert!(!fx.destination.path().join("new.txt").exists());
 }
@@ -2405,13 +2411,14 @@ fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
     fx.write_source("later.txt", "still needs copying");
     fx.add_photos_pair();
 
-    // Enter starts Compare; Space excludes the selected row, Enter advances,
-    // y confirms, Enter dismisses the Result stage.
+    // Enter passes the volume-state pane gate; Enter starts Compare; Space
+    // excludes the selected row, Enter advances, y confirms, Enter dismisses
+    // the Result stage.
     let output = vibesync_in_tty_with_input(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\r \ry\r",
+        b"\r\r \ry\r",
     );
     assert!(output.status.success());
     assert!(!fx.destination.path().join("later.txt").exists());
@@ -2436,14 +2443,15 @@ fn tui_does_not_execute_an_action_that_appears_after_review_started() {
     fx.write_source("reviewed.txt", "reviewed before the TUI opened");
     fx.add_photos_pair();
 
-    // First "\r" starts Compare and lets its scan capture the plan; the
-    // extra file then lands after that scan, during Review, before the
-    // rest of the input (Enter to Confirm, y to run, Enter to dismiss).
+    // First "\r" passes the volume-state pane gate, the second starts
+    // Compare and lets its scan capture the plan; the extra file then lands
+    // after that scan, during Review, before the rest of the input (Enter
+    // to Confirm, y to run, Enter to dismiss).
     let output = vibesync_in_tty_with_staged_input(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\r",
+        b"\r\r",
         b"\ry\r",
         || fx.write_source("unreviewed.txt", "appeared during review"),
     );
@@ -2486,9 +2494,11 @@ fn tui_without_a_pair_selects_from_configured_folder_pairs() {
     fx.add_pair("photos", "mirror");
     fx.add_pair("documents", "mirror");
 
-    // BTreeMap order puts documents first: select it, start Compare, review,
-    // confirm, then dismiss the persisted Result stage.
-    let output = vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"\r\r\ry\r");
+    // BTreeMap order puts documents first: select it, pass the volume-state
+    // pane gate, start Compare, review, confirm, then dismiss the persisted
+    // Result stage.
+    let output =
+        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"\r\r\r\ry\r");
     assert!(
         output.status.success(),
         "pair selection failed: {}",
@@ -2506,14 +2516,15 @@ fn tui_included_error_blocks_until_the_row_is_excluded() {
     std::os::unix::fs::symlink("target", fx.source.path().join("link")).unwrap();
     fx.add_photos_pair();
 
-    // Enter starts Compare; Enter confirm; y is blocked; b returns; Space
-    // excludes the only row; Enter and y then run the now-valid reviewed
-    // subset; Enter dismisses the persisted Result stage.
+    // Enter passes the volume-state pane gate; Enter starts Compare; Enter
+    // confirm; y is blocked; b returns; Space excludes the only row; Enter
+    // and y then run the now-valid reviewed subset; Enter dismisses the
+    // persisted Result stage.
     let output = vibesync_in_tty_with_input_and_env(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\r\ryb \ry\r",
+        b"\r\r\ryb \ry\r",
         &[("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")],
     );
 

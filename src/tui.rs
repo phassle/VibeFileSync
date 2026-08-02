@@ -20,21 +20,104 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::{Frame, Terminal};
 
 use crate::banner::HeaderMode;
 use crate::config::{self, Mode};
 use crate::error::{AppError, EXIT_OK};
+use crate::pair;
+use crate::preconditions::{self, VolumeState};
+use crate::volume;
 use crate::{plan, run as run_engine};
 
 #[derive(Clone)]
 struct PairChoice {
     name: String,
-    mode: Mode,
-    source: PathBuf,
-    destination: PathBuf,
+    pair: config::Pair,
+    source_view: SideView,
+    destination_view: SideView,
+}
+
+/// One side's volume state as rendered for a person: a name-plus-filesystem
+/// label (never a UUID) and a state sentence worded around its remedy —
+/// reconnecting a drive is not the same act as restoring a folder, so the
+/// six `VolumeState` variants get six distinct sentences, not one template
+/// with a state name spliced in.
+#[derive(Clone)]
+struct SideView {
+    description: String,
+    /// Whether this side's state must block Compare and Run outright,
+    /// rather than merely being warned about — the Inaccessible case is the
+    /// one with a safety edge (an unreadable Mirror source reads like an
+    /// empty one), but any state short of Ready/Relocated blocks the same
+    /// way, since Compare could not resolve the pair regardless.
+    blocked: bool,
+}
+
+fn side_view(
+    state: &VolumeState,
+    name: Option<&str>,
+    path: &Path,
+    relative_path: Option<&Path>,
+) -> SideView {
+    let base_label = pair::volume_label(name, path, relative_path);
+    let probe_path: &Path = match state {
+        VolumeState::Relocated { at }
+        | VolumeState::FolderMissing { at }
+        | VolumeState::ForeignVolume { at } => at,
+        _ => path,
+    };
+    let label = match volume::filesystem_type(probe_path) {
+        Ok(filesystem) => format!("{base_label} ({filesystem})"),
+        Err(_) => base_label,
+    };
+    let (description, blocked) = describe_state(state, &label);
+    SideView {
+        description,
+        blocked,
+    }
+}
+
+/// Six distinct sentences, one per `VolumeState`. Never say "empty" for
+/// `Inaccessible`: Mirror mode reads an apparently-empty source as a request
+/// to delete the whole destination, so an unreadable folder must say so.
+fn describe_state(state: &VolumeState, label: &str) -> (String, bool) {
+    match state {
+        VolumeState::Ready => (format!("{label} — ready."), false),
+        VolumeState::Relocated { at } => (
+            format!(
+                "{label} — reconnected at {} (a notice, not an error).",
+                at.display()
+            ),
+            false,
+        ),
+        VolumeState::VolumeAbsent => (
+            format!("{label} — disconnected. Reconnect the drive, then press r to refresh."),
+            true,
+        ),
+        VolumeState::FolderMissing { at } => (
+            format!(
+                "{label} — the drive is connected, but the folder is missing at {}. Restore the folder, then press r to refresh.",
+                at.display()
+            ),
+            true,
+        ),
+        VolumeState::ForeignVolume { at } => (
+            format!(
+                "A different volume is connected at {} where {label} is expected. Reconnect {label}, then press r to refresh.",
+                at.display()
+            ),
+            true,
+        ),
+        VolumeState::Inaccessible => (
+            format!(
+                "{label} — present but unreadable (permission denied). Fix folder permissions, then press r to refresh."
+            ),
+            true,
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -658,6 +741,34 @@ fn run_pair_flow(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
     let mut events = CrosstermEvents::default();
     let header_mode = crate::banner::header_mode();
 
+    let cfg = config::load(config_path)?;
+    let cfg_pair = cfg
+        .pairs
+        .get(pair_name)
+        .cloned()
+        .ok_or_else(|| AppError::Usage(format!("pair '{pair_name}' not found")))?;
+
+    // Opening a pair resolves both sides fully (unlike the picker's
+    // per-pinned-UUID mount check) and refuses Compare/Run outright while
+    // either side is blocked, rather than merely warning about it.
+    match pane_gate(
+        session.terminal(),
+        &mut events,
+        pair_name,
+        &cfg_pair,
+        header_mode,
+    )
+    .map_err(tui_error)?
+    {
+        PaneOutcome::Cancelled => {
+            drop(session);
+            println!("Run cancelled; destination unchanged.");
+            return Ok(EXIT_OK);
+        }
+        PaneOutcome::Proceed => {}
+    }
+    session.terminal().clear().map_err(tui_error)?;
+
     let compared = compare(
         session.terminal(),
         &mut events,
@@ -756,13 +867,170 @@ fn pair_choices(config: &config::Config) -> Vec<PairChoice> {
     config
         .pairs
         .iter()
-        .map(|(name, pair)| PairChoice {
-            name: name.clone(),
-            mode: pair.mode,
-            source: pair.source.clone(),
-            destination: pair.destination.clone(),
-        })
+        .map(|(name, pair)| build_choice(name.clone(), pair.clone()))
         .collect()
+}
+
+/// Builds both sides' `SideView`s from a pair and its already-classified
+/// states — the one place that assembles a `SideView` from a Folder pair's
+/// fields, shared by the picker list (classified once, at list-build time)
+/// and the pane gate (classified once on entry, again only on `r`).
+fn side_views(
+    cfg_pair: &config::Pair,
+    source_state: &VolumeState,
+    destination_state: &VolumeState,
+) -> (SideView, SideView) {
+    let source_view = side_view(
+        source_state,
+        cfg_pair.source_volume_name.as_deref(),
+        &cfg_pair.source,
+        cfg_pair.source_volume_relative_path.as_deref(),
+    );
+    let destination_view = side_view(
+        destination_state,
+        cfg_pair.destination_volume_name.as_deref(),
+        &cfg_pair.destination,
+        cfg_pair.destination_volume_relative_path.as_deref(),
+    );
+    (source_view, destination_view)
+}
+
+/// Classifies both sides once, at the point a pair enters the picker list —
+/// never on a redraw or a timer, so the six-state read a user sees here
+/// never changes underneath them without an explicit refresh.
+fn build_choice(name: String, cfg_pair: config::Pair) -> PairChoice {
+    let (source_state, destination_state) = preconditions::classify_pair(&cfg_pair);
+    let (source_view, destination_view) = side_views(&cfg_pair, &source_state, &destination_state);
+    PairChoice {
+        name,
+        pair: cfg_pair,
+        source_view,
+        destination_view,
+    }
+}
+
+/// The outcome of the volume-state gate a pair passes through before
+/// Compare: both sides are resolved fully (unlike the picker's per-pinned-
+/// UUID mount check), and Compare/Run are refused outright rather than
+/// merely warned about while either side is blocked.
+enum PaneOutcome {
+    Proceed,
+    Cancelled,
+}
+
+/// Shows the two-sided pane view (Source / Destination) for one opened
+/// pair. Classification runs once on entry and again only on an explicit
+/// `r` refresh — nothing polls, so the screen a user is about to confirm
+/// Compare from never changes underneath them.
+fn pane_gate<B: Backend, E: Events>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    pair_name: &str,
+    cfg_pair: &config::Pair,
+    header_mode: HeaderMode,
+) -> io::Result<PaneOutcome> {
+    let (mut source_state, mut destination_state) = preconditions::classify_pair(cfg_pair);
+    let mut message: Option<String> = None;
+    loop {
+        let (source_view, destination_view) =
+            side_views(cfg_pair, &source_state, &destination_state);
+        let blocked = source_view.blocked || destination_view.blocked;
+        terminal.draw(|frame| {
+            draw_panes(
+                frame,
+                pair_name,
+                &source_view,
+                &destination_view,
+                blocked,
+                message.as_deref(),
+                header_mode,
+            )
+        })?;
+
+        let Event::Key(key) = events.next()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                let (source, destination) = preconditions::classify_pair(cfg_pair);
+                source_state = source;
+                destination_state = destination;
+                message = None;
+            }
+            KeyCode::Enter | KeyCode::Char('c') => {
+                if blocked {
+                    message = Some(
+                        "Compare disabled while a side needs attention above; reconnect or restore it, then press r to refresh."
+                            .to_string(),
+                    );
+                } else {
+                    return Ok(PaneOutcome::Proceed);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(PaneOutcome::Cancelled),
+            _ => {}
+        }
+    }
+}
+
+fn draw_panes(
+    frame: &mut Frame<'_>,
+    pair_name: &str,
+    source: &SideView,
+    destination: &SideView,
+    blocked: bool,
+    message: Option<&str>,
+    header_mode: HeaderMode,
+) {
+    let [header, body, footer] = vertical_sections(frame.area(), header_mode);
+    draw_header(frame, header, header_mode);
+
+    let [left, right] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(body);
+
+    draw_pane(frame, left, &format!("Source — {pair_name}"), source);
+    draw_pane(
+        frame,
+        right,
+        &format!("Destination — {pair_name}"),
+        destination,
+    );
+
+    let base_help = if blocked {
+        "BLOCKED: fix the side above, then press r to refresh · q cancel"
+    } else {
+        "Enter/c compare · r refresh · q cancel"
+    };
+    let help = match message {
+        Some(message) => format!("{message} ({base_help})"),
+        None => base_help.to_string(),
+    };
+    frame.render_widget(Paragraph::new(help), footer);
+}
+
+fn draw_pane(frame: &mut Frame<'_>, area: ratatui::layout::Rect, title: &str, view: &SideView) {
+    let status_word = if view.blocked { "BLOCKED" } else { "OK" };
+    let lines = vec![
+        Line::from(Span::styled(
+            status_word,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(view.description.clone()),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} ")),
+        ),
+        area,
+    );
 }
 
 fn select_pair(choices: &[PairChoice]) -> Result<Option<String>, AppError> {
@@ -858,18 +1126,24 @@ fn draw_pair_selector(
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
     let items = choices.iter().map(|choice| {
+        let tag = |view: &SideView| if view.blocked { "BLOCKED" } else { "OK" };
         ListItem::new(vec![
             Line::from(vec![
                 Span::styled(
                     choice.name.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("  ({})", choice.mode)),
+                Span::raw(format!("  ({})", choice.pair.mode)),
             ]),
             Line::from(format!(
-                "{} → {}",
-                choice.source.display(),
-                choice.destination.display()
+                "Source [{}]: {}",
+                tag(&choice.source_view),
+                choice.source_view.description
+            )),
+            Line::from(format!(
+                "Destination [{}]: {}",
+                tag(&choice.destination_view),
+                choice.destination_view.description
             )),
         ])
     });
@@ -1175,6 +1449,7 @@ fn tui_error(error: io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
 
     use ratatui::backend::TestBackend;
@@ -1241,6 +1516,23 @@ mod tests {
         fn poll(&mut self) -> Option<Result<ScanOutcome, AppError>> {
             self.0.pop_front()?
         }
+    }
+
+    fn choice(name: &str, mode: Mode, source: &str, destination: &str) -> PairChoice {
+        build_choice(
+            name.to_string(),
+            config::Pair {
+                source: PathBuf::from(source),
+                source_volume_uuid: String::new(),
+                source_volume_name: None,
+                source_volume_relative_path: None,
+                destination: PathBuf::from(destination),
+                destination_volume_uuid: String::new(),
+                destination_volume_name: None,
+                destination_volume_relative_path: None,
+                mode,
+            },
+        )
     }
 
     fn pair(mode: Mode) -> config::Pair {
@@ -1441,18 +1733,13 @@ mod tests {
     #[test]
     fn pair_selector_uses_deterministic_keyboard_selection() {
         let choices = vec![
-            PairChoice {
-                name: "documents".to_string(),
-                mode: Mode::Mirror,
-                source: PathBuf::from("/documents"),
-                destination: PathBuf::from("/Volumes/Backup/Documents"),
-            },
-            PairChoice {
-                name: "photos".to_string(),
-                mode: Mode::Update,
-                source: PathBuf::from("/photos"),
-                destination: PathBuf::from("/Volumes/Backup/Photos"),
-            },
+            choice(
+                "documents",
+                Mode::Mirror,
+                "/documents",
+                "/Volumes/Backup/Documents",
+            ),
+            choice("photos", Mode::Update, "/photos", "/Volumes/Backup/Photos"),
         ];
         let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
         let mut events = ScriptedEvents::keys([KeyCode::Down, KeyCode::Enter]);
@@ -1479,12 +1766,12 @@ mod tests {
 
     #[test]
     fn pair_selector_footer_uses_terminal_default_foreground() {
-        let choices = vec![PairChoice {
-            name: "photos".to_string(),
-            mode: Mode::Mirror,
-            source: PathBuf::from("/photos"),
-            destination: PathBuf::from("/Volumes/Backup/Photos"),
-        }];
+        let choices = vec![choice(
+            "photos",
+            Mode::Mirror,
+            "/photos",
+            "/Volumes/Backup/Photos",
+        )];
         let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
 
         terminal
@@ -1698,5 +1985,258 @@ mod tests {
             "destination free space is insufficient".to_string()
         ))));
         assert!(!is_lock_contention(&Ok(0)));
+    }
+
+    #[test]
+    fn all_six_volume_states_render_with_distinct_wording() {
+        let states = [
+            VolumeState::Ready,
+            VolumeState::Relocated {
+                at: PathBuf::from("/Volumes/Backup 1/Photos"),
+            },
+            VolumeState::VolumeAbsent,
+            VolumeState::FolderMissing {
+                at: PathBuf::from("/Volumes/Backup/Photos"),
+            },
+            VolumeState::ForeignVolume {
+                at: PathBuf::from("/Volumes/Backup/Photos"),
+            },
+            VolumeState::Inaccessible,
+        ];
+        let descriptions: Vec<String> = states
+            .iter()
+            .map(|state| describe_state(state, "Backup Drive").0)
+            .collect();
+        let unique: std::collections::HashSet<&String> = descriptions.iter().collect();
+        assert_eq!(unique.len(), descriptions.len(), "{descriptions:?}");
+    }
+
+    #[test]
+    fn inaccessible_side_is_reported_as_unreadable_never_as_empty() {
+        let (description, blocked) = describe_state(&VolumeState::Inaccessible, "Backup Drive");
+        assert!(blocked);
+        assert!(description.contains("unreadable"), "{description}");
+        assert!(
+            !description.to_lowercase().contains("empty"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn ready_and_relocated_never_block_but_the_other_four_states_do() {
+        assert!(!describe_state(&VolumeState::Ready, "Backup Drive").1);
+        assert!(
+            !describe_state(
+                &VolumeState::Relocated {
+                    at: PathBuf::from("/Volumes/Backup 1")
+                },
+                "Backup Drive"
+            )
+            .1
+        );
+        assert!(describe_state(&VolumeState::VolumeAbsent, "Backup Drive").1);
+        assert!(
+            describe_state(
+                &VolumeState::FolderMissing {
+                    at: PathBuf::from("/Volumes/Backup")
+                },
+                "Backup Drive"
+            )
+            .1
+        );
+        assert!(
+            describe_state(
+                &VolumeState::ForeignVolume {
+                    at: PathBuf::from("/Volumes/Backup")
+                },
+                "Backup Drive"
+            )
+            .1
+        );
+        assert!(describe_state(&VolumeState::Inaccessible, "Backup Drive").1);
+    }
+
+    #[test]
+    fn foreign_volume_says_a_different_volume_is_connected_rather_than_the_pinned_one_being_disconnected(
+    ) {
+        let (description, _) = describe_state(
+            &VolumeState::ForeignVolume {
+                at: PathBuf::from("/Volumes/Backup/Photos"),
+            },
+            "Backup Drive",
+        );
+        assert!(description.contains("different volume"), "{description}");
+        assert!(!description.contains("disconnected"), "{description}");
+    }
+
+    #[test]
+    fn relocated_volume_reads_as_a_notice_not_an_error() {
+        let (description, blocked) = describe_state(
+            &VolumeState::Relocated {
+                at: PathBuf::from("/Volumes/Backup 1/Photos"),
+            },
+            "Backup Drive",
+        );
+        assert!(!blocked);
+        assert!(
+            description.contains("notice, not an error"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn a_pair_with_no_captured_volume_name_still_renders_sensibly() {
+        let choice = choice(
+            "photos",
+            Mode::Update,
+            "/Volumes/Backup/Photos",
+            "/Volumes/Backup/Photos2",
+        );
+        assert!(choice
+            .source_view
+            .description
+            .contains("/Volumes/Backup/Photos"));
+        assert!(!choice.source_view.description.is_empty());
+    }
+
+    #[test]
+    fn pair_list_never_renders_the_volume_uuid() {
+        let mut cfg_pair = pair(Mode::Mirror);
+        cfg_pair.source_volume_uuid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE".to_string();
+        let choice = build_choice("photos".to_string(), cfg_pair);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_pair_selector(frame, &[choice], 0, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(!screen.contains("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"));
+    }
+
+    #[test]
+    fn pair_selector_shows_a_distinct_status_per_side() {
+        let choice = choice(
+            "photos",
+            Mode::Update,
+            "/no/such/source",
+            "/no/such/destination",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_pair_selector(frame, &[choice], 0, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Source ["), "{screen}");
+        assert!(screen.contains("Destination ["), "{screen}");
+    }
+
+    #[test]
+    fn compare_is_disabled_not_merely_warned_about_while_a_side_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let restricted = dir.path().join("locked");
+        fs::create_dir(&restricted).unwrap();
+        let mut perms = fs::metadata(&restricted).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&restricted, perms.clone()).unwrap();
+
+        let mut cfg_pair = pair(Mode::Mirror);
+        cfg_pair.source = restricted.clone();
+        cfg_pair.source_volume_relative_path = Some(PathBuf::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Enter, KeyCode::Char('q')]);
+
+        let outcome = pane_gate(
+            &mut terminal,
+            &mut events,
+            "photos",
+            &cfg_pair,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        perms.set_mode(0o700);
+        fs::set_permissions(&restricted, perms).unwrap();
+
+        assert!(matches!(outcome, PaneOutcome::Cancelled));
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("BLOCKED"));
+        assert!(screen.contains("unreadable"));
+    }
+
+    /// Delivers scripted keys but performs a filesystem side effect (fixing
+    /// permissions) right before returning the `r` key — simulating a user
+    /// physically reconnecting a drive and then pressing refresh.
+    struct ReconnectEvents {
+        path: PathBuf,
+        keys: VecDeque<KeyCode>,
+    }
+
+    impl Events for ReconnectEvents {
+        fn next(&mut self) -> io::Result<Event> {
+            let code = self
+                .keys
+                .pop_front()
+                .ok_or_else(|| io::Error::other("script exhausted"))?;
+            if code == KeyCode::Char('r') {
+                let mut perms = fs::metadata(&self.path).unwrap().permissions();
+                perms.set_mode(0o700);
+                fs::set_permissions(&self.path, perms).unwrap();
+            }
+            Ok(Event::Key(code.into()))
+        }
+
+        fn poll(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
+            Ok(Some(self.next()?))
+        }
+
+        fn push_back(&mut self, _event: Event) {
+            unimplemented!("unused by this test")
+        }
+    }
+
+    #[test]
+    fn refreshing_after_reconnecting_moves_a_blocked_pane_to_ready_with_no_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_uuid = volume::volume_uuid(dir.path()).unwrap();
+        let mut perms = fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(dir.path(), perms.clone()).unwrap();
+
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination_uuid = volume::volume_uuid(destination_dir.path()).unwrap();
+
+        let mut cfg_pair = pair(Mode::Update);
+        cfg_pair.source = dir.path().to_path_buf();
+        cfg_pair.source_volume_uuid = source_uuid;
+        cfg_pair.source_volume_relative_path = Some(PathBuf::new());
+        cfg_pair.destination = destination_dir.path().to_path_buf();
+        cfg_pair.destination_volume_uuid = destination_uuid;
+        cfg_pair.destination_volume_relative_path = Some(PathBuf::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ReconnectEvents {
+            path: dir.path().to_path_buf(),
+            keys: [KeyCode::Enter, KeyCode::Char('r'), KeyCode::Enter]
+                .into_iter()
+                .collect(),
+        };
+
+        let outcome = pane_gate(
+            &mut terminal,
+            &mut events,
+            "photos",
+            &cfg_pair,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        perms.set_mode(0o700);
+        fs::set_permissions(dir.path(), perms).unwrap();
+
+        assert!(matches!(outcome, PaneOutcome::Proceed));
     }
 }

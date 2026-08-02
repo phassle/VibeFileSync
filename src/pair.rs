@@ -228,7 +228,11 @@ pub fn list_table(config_path: &Path, check: bool) -> Result<String, AppError> {
 /// present, else the stored path's mount component (derived from the
 /// recorded volume-relative path, no volume I/O), else the stored path
 /// itself.
-fn volume_label(name: Option<&str>, path: &Path, relative_path: Option<&Path>) -> String {
+pub(crate) fn volume_label(
+    name: Option<&str>,
+    path: &Path,
+    relative_path: Option<&Path>,
+) -> String {
     if let Some(name) = name.filter(|n| !n.is_empty()) {
         return name.to_string();
     }
