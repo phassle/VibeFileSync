@@ -586,6 +586,142 @@ fn pair_list_source_matching_nothing_is_an_empty_list_exit_0() {
 }
 
 #[test]
+fn pair_list_source_matches_even_when_the_recorded_source_path_has_gone_stale() {
+    // Mirrors `run_against_a_relocated_volume_records_the_path_it_actually_used`
+    // (issue #49): rewrite the stored `source` display path to a stale
+    // string while leaving `source_volume_uuid` and
+    // `source_volume_relative_path` untouched, since those two fields
+    // (not the display path) are what matching is derived from — this is
+    // exactly the shape of "the volume got mounted somewhere else".
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let path = config_file(fx.xdg.path());
+    let original_source = fx.source.path().display().to_string();
+    let stale_source = "/Volumes/VibeFileSync-Stale/Photos";
+    let config = fs::read_to_string(&path).unwrap().replace(
+        &format!("source = \"{original_source}\""),
+        &format!("source = \"{stale_source}\""),
+    );
+    assert_ne!(
+        config,
+        fs::read_to_string(&path).unwrap(),
+        "replacement must have matched"
+    );
+    fs::write(&path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{value}");
+    assert_eq!(pairs[0]["name"], "photos");
+}
+
+#[test]
+fn pair_list_source_matches_a_case_different_spelling_of_the_same_directory() {
+    // Identity is decided by (device, inode) from filesystem metadata, not
+    // by string comparison, so a case-insensitive volume resolves a
+    // case-flipped spelling of the path to the same directory. This is
+    // only meaningful on a case-insensitive volume (macOS's default, and
+    // the volume backing the system temp dir these fixtures live on); the
+    // canary below skips (rather than falsely passing) if that assumption
+    // doesn't hold.
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let original = fx.source.path().to_str().unwrap().to_string();
+    let flipped: String = original
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    assert_ne!(original, flipped, "fixture path must contain letters");
+
+    if fs::metadata(&flipped).is_err() {
+        eprintln!(
+            "skipping: {flipped} does not resolve, so the backing volume is not \
+             case-insensitive here"
+        );
+        return;
+    }
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--json", "--source", &flipped])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{value}");
+    assert_eq!(pairs[0]["name"], "photos");
+}
+
+#[test]
+fn pair_list_source_silently_skips_a_pair_pinned_to_an_unmounted_volume() {
+    // A pair whose pinned `source_volume_uuid` matches no currently
+    // mounted volume must simply not appear — no error, no warning, exit
+    // 0. `matching_source_names` never enumerates mounted volumes; it
+    // only compares the pinned UUID against the query target's UUID, so a
+    // UUID belonging to nothing mounted is filtered out by that same
+    // equality check, with the same silence as a genuinely unmounted
+    // volume would produce.
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let path = config_file(fx.xdg.path());
+    let contents = fs::read_to_string(&path).unwrap();
+    let real_uuid = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("source_volume_uuid = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("source_volume_uuid present in config")
+        .to_string();
+    let unmounted_uuid = "00000000-0000-0000-0000-000000000000";
+    assert_ne!(real_uuid, unmounted_uuid);
+    let config = contents.replace(
+        &format!("source_volume_uuid = \"{real_uuid}\""),
+        &format!("source_volume_uuid = \"{unmounted_uuid}\""),
+    );
+    fs::write(&path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.is_empty(), "{stderr}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0, "{value}");
+}
+
+#[test]
 fn config_rewrite_is_atomic_no_stray_temp_files_survive() {
     let fx = Fixture::new();
     fx.add_photos_pair();
