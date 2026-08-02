@@ -63,15 +63,25 @@ fn side_view(
     relative_path: Option<&Path>,
 ) -> SideView {
     let base_label = pair::volume_label(name, path, relative_path);
-    let probe_path: &Path = match state {
-        VolumeState::Relocated { at }
-        | VolumeState::FolderMissing { at }
-        | VolumeState::ForeignVolume { at } => at,
-        _ => path,
+    // `FolderMissing`'s `at` is precisely the folder that does not exist, so
+    // probing it directly always fails; the volume it lives on is mounted
+    // and readable, so probe that mount instead. `mount_point_for_path`
+    // matches mount table entries by path prefix, so it still resolves even
+    // though the exact folder is missing.
+    let probe_path: PathBuf = match state {
+        VolumeState::Relocated { at } | VolumeState::ForeignVolume { at } => at.clone(),
+        VolumeState::FolderMissing { at } => {
+            volume::mount_point_for_path(at).unwrap_or_else(|_| at.clone())
+        }
+        _ => path.to_path_buf(),
     };
-    let label = match volume::filesystem_type(probe_path) {
+    // Every label carries a filesystem segment, known or not: a bare name
+    // reads as a complete, deliberate form, so a silently dropped
+    // filesystem would be indistinguishable from one that was never
+    // expected. Never guess the filesystem itself.
+    let label = match volume::filesystem_type(&probe_path) {
         Ok(filesystem) => format!("{base_label} ({filesystem})"),
-        Err(_) => base_label,
+        Err(_) => format!("{base_label} (filesystem unknown)"),
     };
     let (description, blocked) = describe_state(state, &label);
     SideView {
@@ -2097,6 +2107,109 @@ mod tests {
             .description
             .contains("/Volumes/Backup/Photos"));
         assert!(!choice.source_view.description.is_empty());
+    }
+
+    #[test]
+    fn name_plus_filesystem_renders_for_every_interface_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounted = dir.path().to_path_buf();
+        let missing_folder = mounted.join("gone");
+        let restricted = mounted.join("locked");
+        fs::create_dir(&restricted).unwrap();
+        let mut perms = fs::metadata(&restricted).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&restricted, perms.clone()).unwrap();
+        let unmounted = PathBuf::from("/no/such/volume/anywhere-vibesync-test");
+
+        let known_filesystem = [
+            side_view(&VolumeState::Ready, Some("Backup Drive"), &mounted, None),
+            side_view(
+                &VolumeState::Relocated {
+                    at: mounted.clone(),
+                },
+                Some("Backup Drive"),
+                &mounted,
+                None,
+            ),
+            side_view(
+                &VolumeState::FolderMissing {
+                    at: missing_folder.clone(),
+                },
+                Some("Backup Drive"),
+                &mounted,
+                None,
+            ),
+            side_view(
+                &VolumeState::ForeignVolume {
+                    at: mounted.clone(),
+                },
+                Some("Backup Drive"),
+                &mounted,
+                None,
+            ),
+            side_view(
+                &VolumeState::Inaccessible,
+                Some("Backup Drive"),
+                &restricted,
+                None,
+            ),
+        ];
+        for view in &known_filesystem {
+            assert!(
+                view.description.contains("Backup Drive ("),
+                "{}",
+                view.description
+            );
+            assert!(
+                !view
+                    .description
+                    .contains("Backup Drive (filesystem unknown"),
+                "expected a real filesystem, got: {}",
+                view.description
+            );
+        }
+
+        let unknown_filesystem = side_view(
+            &VolumeState::VolumeAbsent,
+            Some("Backup Drive"),
+            &unmounted,
+            None,
+        );
+        assert!(
+            unknown_filesystem
+                .description
+                .contains("Backup Drive (filesystem unknown)"),
+            "{}",
+            unknown_filesystem.description
+        );
+
+        fs::set_permissions(&restricted, {
+            perms.set_mode(0o755);
+            perms
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn folder_missing_probes_the_mounted_volume_rather_than_the_missing_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounted = dir.path().to_path_buf();
+        let missing_folder = mounted.join("Photos");
+
+        let view = side_view(
+            &VolumeState::FolderMissing { at: missing_folder },
+            Some("Backup Drive"),
+            &mounted,
+            None,
+        );
+
+        assert!(
+            !view
+                .description
+                .starts_with("Backup Drive (filesystem unknown)"),
+            "folder-missing should probe the mount point, not the missing folder: {}",
+            view.description
+        );
     }
 
     #[test]
