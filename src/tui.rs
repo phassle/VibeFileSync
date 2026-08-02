@@ -796,12 +796,12 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
 
     // `pair_choices` classifies every configured pair's destination
     // (`build_choice` -> `preconditions::classify_pair`), so it is built only
-    // once a branch is about to show the picker — never while deciding
-    // whether a single match preselects, and never for the empty-config
-    // case, which needs only `cfg.pairs.is_empty()`.
+    // inside `select_pair`, once a branch is about to show the picker — never
+    // while deciding whether a single match preselects, and never for the
+    // empty-config case, which needs only `cfg.pairs.is_empty()`.
     match matches.len() {
         0 if cfg.pairs.is_empty() => show_seeded_pane(&seed_dir, seed_notice.as_deref()),
-        0 => match select_pair(&pair_choices(&cfg), &[])? {
+        0 => match select_pair(config_path, &[])? {
             Some(name) => run_pair_flow(config_path, &name, seed_notice),
             None => Ok(EXIT_OK),
         },
@@ -817,7 +817,7 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
             };
             run_pair_flow(config_path, &name, Some(notice))
         }
-        _ => match select_pair(&pair_choices(&cfg), &matches)? {
+        _ => match select_pair(config_path, &matches)? {
             Some(name) => run_pair_flow(config_path, &name, seed_notice),
             None => Ok(EXIT_OK),
         },
@@ -1266,22 +1266,40 @@ fn draw_pane(frame: &mut Frame<'_>, area: ratatui::layout::Rect, title: &str, vi
     );
 }
 
-/// Opens the pair picker. `matched` names (already ordered by pair name,
-/// per `pair::matching_source_names`' `BTreeMap` iteration) are reordered
-/// ahead of the rest and marked, but nothing is auto-selected — several
-/// working-directory matches are still a choice for the user to make.
-fn select_pair(choices: &[PairChoice], matched: &[String]) -> Result<Option<String>, AppError> {
-    let ordered = order_choices(choices, matched);
+/// Opens the pair picker and, from it, the create/edit/remove flows. The
+/// selector owns a reload loop so that a save or removal — which goes through
+/// `pair::add`/`pair::remove`, never a config write here — is reflected
+/// immediately without tearing the screen down.
+///
+/// `matched` names (already ordered by pair name, per
+/// `pair::matching_source_names`' `BTreeMap` iteration) are reordered ahead of
+/// the rest and marked, but nothing is auto-selected — several working-
+/// directory matches are still a choice for the user to make. The same
+/// ordering is reapplied on every reload, so a created or edited pair lands
+/// in the matched block only if it actually matches.
+fn select_pair(config_path: &Path, matched: &[String]) -> Result<Option<String>, AppError> {
     let mut session = TerminalSession::start().map_err(tui_error)?;
     let mut events = CrosstermEvents::default();
-    select_pair_loop(
+    let mut choices = order_choices(&pair_choices(&config::load(config_path)?), matched);
+    let mut selected = 0usize;
+    let outcome = select_pair_loop(
         session.terminal(),
         &mut events,
-        &ordered,
+        config_path,
+        &mut choices,
+        &mut selected,
         matched,
         crate::banner::header_mode(),
-    )
-    .map_err(tui_error)
+    )?;
+    Ok(match outcome {
+        SelectPairOutcome::Chosen(name) => Some(name),
+        SelectPairOutcome::Cancelled => None,
+    })
+}
+
+enum SelectPairOutcome {
+    Chosen(String),
+    Cancelled,
 }
 
 /// Matched choices first (sorted by name, since both `choices` and `matched`
@@ -1295,28 +1313,93 @@ fn order_choices(choices: &[PairChoice], matched: &[String]) -> Vec<PairChoice> 
 fn select_pair_loop<B: Backend, E: Events>(
     terminal: &mut Terminal<B>,
     events: &mut E,
-    choices: &[PairChoice],
+    config_path: &Path,
+    choices: &mut Vec<PairChoice>,
+    selected: &mut usize,
     matched: &[String],
     header_mode: HeaderMode,
-) -> io::Result<Option<String>> {
-    let mut selected = 0;
+) -> Result<SelectPairOutcome, AppError> {
     loop {
+        if *selected >= choices.len() {
+            *selected = choices.len().saturating_sub(1);
+        }
         terminal
-            .draw(|frame| draw_pair_selector(frame, choices, selected, matched, header_mode))?;
-        let Event::Key(key) = events.next()? else {
+            .draw(|frame| draw_pair_selector(frame, choices, *selected, matched, header_mode))
+            .map_err(tui_error)?;
+        let Event::Key(key) = events.next().map_err(tui_error)? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
             continue;
         }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(choices.len() - 1),
-            KeyCode::Enter => return Ok(Some(choices[selected].name.clone())),
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !choices.is_empty() {
+                    *selected = (*selected + 1).min(choices.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(choice) = choices.get(*selected) {
+                    return Ok(SelectPairOutcome::Chosen(choice.name.clone()));
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+                let mut form = PairFormModel::new_pair(start);
+                let outcome = pair_form_loop(terminal, events, &mut form, config_path, header_mode)
+                    .map_err(tui_error)?;
+                reload_after_form(config_path, choices, selected, matched, outcome)?;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                if let Some(choice) = choices.get(*selected).cloned() {
+                    let mut form = PairFormModel::edit_pair(&choice.name, &choice.pair);
+                    let outcome =
+                        pair_form_loop(terminal, events, &mut form, config_path, header_mode)
+                            .map_err(tui_error)?;
+                    reload_after_form(config_path, choices, selected, matched, outcome)?;
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                if let Some(choice) = choices.get(*selected).cloned() {
+                    if confirm_remove_loop(
+                        terminal,
+                        events,
+                        config_path,
+                        &choice.name,
+                        header_mode,
+                    )? == RemoveOutcome::Removed
+                    {
+                        *choices =
+                            order_choices(&pair_choices(&config::load(config_path)?), matched);
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(SelectPairOutcome::Cancelled),
             _ => {}
         }
     }
+}
+
+/// Reloads `choices` from disk after a create/edit form closes — reapplying
+/// the working-directory `matched` ordering — and, if it saved, moves the
+/// selector's cursor onto the saved pair so the just-edited entry stays
+/// highlighted rather than jumping back to the top.
+fn reload_after_form(
+    config_path: &Path,
+    choices: &mut Vec<PairChoice>,
+    selected: &mut usize,
+    matched: &[String],
+    outcome: PairFormOutcome,
+) -> Result<(), AppError> {
+    *choices = order_choices(&pair_choices(&config::load(config_path)?), matched);
+    if let PairFormOutcome::Saved(name) = outcome {
+        *selected = choices
+            .iter()
+            .position(|choice| choice.name == name)
+            .unwrap_or(0);
+    }
+    Ok(())
 }
 
 fn review_loop<B: Backend, E: Events>(
@@ -1376,6 +1459,18 @@ fn draw_pair_selector(
 ) {
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
+    if choices.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No Folder pairs configured yet. Press n to add one.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Select a Folder pair "),
+            ),
+            body,
+        );
+        frame.render_widget(Paragraph::new("n new · q cancel"), footer);
+        return;
+    }
     let items = choices.iter().map(|choice| {
         // "OK"/"BLOCKED" keeps the at-a-glance runnable signal; the
         // `state_tag` suffix distinguishes Ready from Relocated within "OK"
@@ -1438,9 +1533,428 @@ fn draw_pair_selector(
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, body, &mut state);
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k move · Enter select · q cancel"),
+        Paragraph::new("↑/↓ or j/k move · Enter select · n new · e edit · x remove · q cancel"),
         footer,
     );
+}
+
+/// Which pane a keystroke moves in a Folder pair form. Tab switches focus.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    Source,
+    Destination,
+}
+
+/// A single filesystem pane: the directory currently shown and the
+/// subdirectories it can descend into. Only directories are listed — a
+/// Folder pair's source and destination are always directories.
+struct BrowsePane {
+    dir: PathBuf,
+    entries: Vec<PathBuf>,
+    selected: usize,
+}
+
+impl BrowsePane {
+    fn new(start: PathBuf) -> Self {
+        let mut pane = Self {
+            dir: start,
+            entries: Vec::new(),
+            selected: 0,
+        };
+        pane.refresh();
+        pane
+    }
+
+    fn refresh(&mut self) {
+        let mut entries: Vec<PathBuf> = fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.path())
+            .collect();
+        entries.sort();
+        self.entries = entries;
+        if self.selected >= self.entries.len() {
+            self.selected = self.entries.len().saturating_sub(1);
+        }
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        if !self.entries.is_empty() {
+            self.selected = (self.selected + 1).min(self.entries.len() - 1);
+        }
+    }
+
+    fn descend(&mut self) {
+        if let Some(target) = self.entries.get(self.selected).cloned() {
+            self.dir = target;
+            self.selected = 0;
+            self.refresh();
+        }
+    }
+
+    fn ascend(&mut self) {
+        if let Some(parent) = self.dir.parent().map(Path::to_path_buf) {
+            let previous = self.dir.clone();
+            self.dir = parent;
+            self.refresh();
+            self.selected = self
+                .entries
+                .iter()
+                .position(|entry| *entry == previous)
+                .unwrap_or(0);
+        }
+    }
+
+    fn current(&self) -> &Path {
+        &self.dir
+    }
+}
+
+/// Which screen a Folder pair form is showing. `Naming` only exists for
+/// creation — an edit keeps its `editing` name fixed and never visits it, so
+/// renaming stays unreachable from every path through this model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormStage {
+    Browse,
+    Naming,
+}
+
+/// The create/edit form: both panes browse the filesystem, and `s` saves by
+/// delegating to `pair::add` — the same function `pair add` uses — so this
+/// model never constructs a `Pair` or calls `config::save` itself.
+struct PairFormModel {
+    /// `Some(name)` when editing an existing pair; the name is fixed and
+    /// `Naming` is never entered, so a pair can never be renamed here.
+    editing: Option<String>,
+    focus: PaneFocus,
+    source: BrowsePane,
+    destination: BrowsePane,
+    name_input: String,
+    mode: Mode,
+    message: Option<String>,
+    stage: FormStage,
+}
+
+impl PairFormModel {
+    /// A fresh pair starts on Update (ADR-required default): an
+    /// absent-minded confirmation can never produce a pair that deletes, and
+    /// producing Mirror requires the deliberate `m` keypress.
+    fn new_pair(start: PathBuf) -> Self {
+        Self {
+            editing: None,
+            focus: PaneFocus::Source,
+            source: BrowsePane::new(start.clone()),
+            destination: BrowsePane::new(start),
+            name_input: String::new(),
+            mode: Mode::Update,
+            message: None,
+            stage: FormStage::Browse,
+        }
+    }
+
+    fn edit_pair(name: &str, pair: &config::Pair) -> Self {
+        Self {
+            editing: Some(name.to_string()),
+            focus: PaneFocus::Source,
+            source: BrowsePane::new(pair.source.clone()),
+            destination: BrowsePane::new(pair.destination.clone()),
+            name_input: name.to_string(),
+            mode: pair.mode,
+            message: None,
+            stage: FormStage::Browse,
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            PaneFocus::Source => PaneFocus::Destination,
+            PaneFocus::Destination => PaneFocus::Source,
+        };
+    }
+
+    fn active_pane_mut(&mut self) -> &mut BrowsePane {
+        match self.focus {
+            PaneFocus::Source => &mut self.source,
+            PaneFocus::Destination => &mut self.destination,
+        }
+    }
+
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            Mode::Update => Mode::Mirror,
+            Mode::Mirror => Mode::Update,
+        };
+    }
+}
+
+enum PairFormOutcome {
+    Cancelled,
+    Saved(String),
+}
+
+/// Drives the create/edit form. Every save goes through `pair::add` — the
+/// single writer that pins volume UUIDs, validates the name and performs one
+/// atomic save — so a pair saved here is byte-identical to one saved by
+/// `pair add`, and invalid or duplicate names are rejected with exactly the
+/// message the CLI gives, surfaced here via the same `AppError`.
+fn pair_form_loop<B: Backend, E: Events>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    model: &mut PairFormModel,
+    config_path: &Path,
+    header_mode: HeaderMode,
+) -> io::Result<PairFormOutcome> {
+    loop {
+        terminal.draw(|frame| draw_pair_form(frame, model, header_mode))?;
+        let Event::Key(key) = events.next()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match model.stage {
+            FormStage::Browse => match key.code {
+                KeyCode::Tab => model.toggle_focus(),
+                KeyCode::Up | KeyCode::Char('k') => model.active_pane_mut().move_up(),
+                KeyCode::Down | KeyCode::Char('j') => model.active_pane_mut().move_down(),
+                KeyCode::Enter | KeyCode::Char('l') => model.active_pane_mut().descend(),
+                KeyCode::Backspace | KeyCode::Char('h') => model.active_pane_mut().ascend(),
+                KeyCode::Char('m') | KeyCode::Char('M') => model.toggle_mode(),
+                KeyCode::Char('s') | KeyCode::Char('S') => match &model.editing {
+                    Some(name) => {
+                        match pair::add(
+                            config_path,
+                            name,
+                            model.source.current(),
+                            model.destination.current(),
+                            model.mode,
+                            true,
+                        ) {
+                            Ok(()) => return Ok(PairFormOutcome::Saved(name.clone())),
+                            Err(error) => model.message = Some(error.to_string()),
+                        }
+                    }
+                    None => {
+                        model.stage = FormStage::Naming;
+                        model.message = None;
+                    }
+                },
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(PairFormOutcome::Cancelled),
+                _ => {}
+            },
+            FormStage::Naming => match key.code {
+                KeyCode::Enter => {
+                    let name = model.name_input.clone();
+                    match pair::add(
+                        config_path,
+                        &name,
+                        model.source.current(),
+                        model.destination.current(),
+                        model.mode,
+                        false,
+                    ) {
+                        Ok(()) => return Ok(PairFormOutcome::Saved(name)),
+                        Err(error) => model.message = Some(error.to_string()),
+                    }
+                }
+                KeyCode::Esc => {
+                    model.stage = FormStage::Browse;
+                }
+                KeyCode::Backspace => {
+                    model.name_input.pop();
+                }
+                KeyCode::Char(c) => model.name_input.push(c),
+                _ => {}
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoveOutcome {
+    Cancelled,
+    Removed,
+}
+
+/// Removal is a configuration act only (ADR contract): it calls
+/// `pair::remove`, which touches nothing but the config file — no files, no
+/// SafetyNet archives, no run records. The confirmation states the one
+/// non-obvious consequence: run history keyed by this name becomes
+/// unreachable until a pair of that name exists again.
+fn confirm_remove_loop<B: Backend, E: Events>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    config_path: &Path,
+    name: &str,
+    header_mode: HeaderMode,
+) -> Result<RemoveOutcome, AppError> {
+    loop {
+        terminal
+            .draw(|frame| draw_remove_confirm(frame, name, header_mode))
+            .map_err(tui_error)?;
+        let Event::Key(key) = events.next().map_err(tui_error)? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                pair::remove(config_path, name)?;
+                return Ok(RemoveOutcome::Removed);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                return Ok(RemoveOutcome::Cancelled);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: HeaderMode) {
+    let [header, body, footer] = vertical_sections(frame.area(), header_mode);
+    draw_header(frame, header, header_mode);
+
+    match model.stage {
+        FormStage::Naming => {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "Name this pair",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!("Source: {}", model.source.current().display())),
+                Line::from(format!(
+                    "Destination: {}",
+                    model.destination.current().display()
+                )),
+                Line::from(format!("Mode: {}", model.mode)),
+                Line::from(""),
+                Line::from(format!("Name: {}", model.name_input)),
+            ];
+            if let Some(message) = &model.message {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    message.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Name this pair "),
+                ),
+                body,
+            );
+            frame.render_widget(
+                Paragraph::new("Type a name · Enter save · Esc back"),
+                footer,
+            );
+        }
+        FormStage::Browse => {
+            let [left, right] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(body);
+            draw_browse_pane(
+                frame,
+                left,
+                "Source",
+                &model.source,
+                model.focus == PaneFocus::Source,
+            );
+            draw_browse_pane(
+                frame,
+                right,
+                "Destination",
+                &model.destination,
+                model.focus == PaneFocus::Destination,
+            );
+
+            let title = match &model.editing {
+                Some(name) => format!("Editing '{name}' — mode: {}", model.mode),
+                None => format!("New pair — mode: {}", model.mode),
+            };
+            let base_help = format!(
+                "{title} · Tab switch pane · \u{2191}/\u{2193} or j/k move · Enter/l descend · Backspace/h ascend · m mode · s save · q cancel"
+            );
+            let help = match &model.message {
+                Some(message) => format!("{message} ({base_help})"),
+                None => base_help,
+            };
+            frame.render_widget(Paragraph::new(help), footer);
+        }
+    }
+}
+
+fn draw_browse_pane(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    label: &str,
+    pane: &BrowsePane,
+    focused: bool,
+) {
+    let focus_marker = if focused { " [FOCUSED]" } else { "" };
+    let title = format!(" {label}{focus_marker} — {} ", pane.current().display());
+    let items: Vec<ListItem> = pane
+        .entries
+        .iter()
+        .map(|entry| {
+            ListItem::new(
+                entry
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.display().to_string()),
+            )
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_symbol("▶ ")
+        .highlight_style(if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        });
+    let mut state = ListState::default();
+    if focused && !pane.entries.is_empty() {
+        state.select(Some(pane.selected));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_remove_confirm(frame: &mut Frame<'_>, name: &str, header_mode: HeaderMode) {
+    let [header, body, footer] = vertical_sections(frame.area(), header_mode);
+    draw_header(frame, header, header_mode);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Remove pair '{name}'?"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Files, SafetyNet archives, and run records are left untouched."),
+        Line::from(format!(
+            "Its run history becomes unreachable until a pair named '{name}' exists again."
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Remove Folder pair "),
+        ),
+        body,
+    );
+    frame.render_widget(Paragraph::new("y remove · n/Esc cancel"), footer);
 }
 
 fn draw_compare(frame: &mut Frame<'_>, pair_name: &str, comparing: bool, header_mode: HeaderMode) {
@@ -2297,7 +2811,7 @@ mod tests {
 
     #[test]
     fn pair_selector_uses_deterministic_keyboard_selection() {
-        let choices = vec![
+        let mut choices = vec![
             choice(
                 "documents",
                 Mode::Mirror,
@@ -2308,11 +2822,20 @@ mod tests {
         ];
         let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
         let mut events = ScriptedEvents::keys([KeyCode::Down, KeyCode::Enter]);
+        let mut selected = 0usize;
 
-        let selected =
-            select_pair_loop(&mut terminal, &mut events, &choices, &[], HeaderMode::Full).unwrap();
+        let outcome = select_pair_loop(
+            &mut terminal,
+            &mut events,
+            Path::new("/nonexistent/config.toml"),
+            &mut choices,
+            &mut selected,
+            &[],
+            HeaderMode::Full,
+        )
+        .unwrap();
 
-        assert_eq!(selected.as_deref(), Some("photos"));
+        assert!(matches!(outcome, SelectPairOutcome::Chosen(name) if name == "photos"));
     }
 
     #[test]
@@ -2975,5 +3498,381 @@ mod tests {
         fs::set_permissions(dir.path(), perms).unwrap();
 
         assert!(matches!(outcome, PaneOutcome::Proceed));
+    }
+
+    // --- Issue #57: two-pane browsing and Folder pair management ---
+
+    fn browse_tree() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("alpha")).unwrap();
+        fs::create_dir(root.path().join("beta")).unwrap();
+        fs::create_dir(root.path().join("alpha").join("child")).unwrap();
+        root
+    }
+
+    #[test]
+    fn browse_pane_descends_and_ascends_between_real_directories() {
+        let root = browse_tree();
+        let mut pane = BrowsePane::new(root.path().to_path_buf());
+        assert_eq!(pane.entries.len(), 2);
+
+        pane.descend(); // into "alpha" (first sorted entry)
+        assert_eq!(pane.current(), root.path().join("alpha"));
+        assert_eq!(pane.entries.len(), 1);
+
+        pane.ascend();
+        assert_eq!(pane.current(), root.path());
+        // Ascending restores the selection to where "alpha" was.
+        assert_eq!(pane.entries[pane.selected], root.path().join("alpha"));
+    }
+
+    #[test]
+    fn browse_pane_move_down_stops_at_the_last_entry() {
+        let root = browse_tree();
+        let mut pane = BrowsePane::new(root.path().to_path_buf());
+        pane.move_down();
+        pane.move_down();
+        pane.move_down();
+        assert_eq!(pane.selected, 1);
+    }
+
+    #[test]
+    fn both_panes_browse_and_render_their_own_directory_listing() {
+        let source_root = browse_tree();
+        let destination_root = browse_tree();
+        let model = PairFormModel::new_pair(source_root.path().to_path_buf());
+        let mut model = model;
+        model.destination = BrowsePane::new(destination_root.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_pair_form(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Source"), "{screen}");
+        assert!(screen.contains("Destination"), "{screen}");
+        assert!(screen.contains("alpha"), "{screen}");
+        assert!(screen.contains("beta"), "{screen}");
+    }
+
+    #[test]
+    fn new_pair_form_starts_on_update_mode_and_mirror_requires_an_explicit_change() {
+        let root = browse_tree();
+        let model = PairFormModel::new_pair(root.path().to_path_buf());
+        assert_eq!(model.mode, Mode::Update);
+
+        let mut model = model;
+        model.toggle_mode();
+        assert_eq!(model.mode, Mode::Mirror);
+    }
+
+    #[test]
+    fn saving_through_the_form_produces_a_pair_byte_identical_to_pair_add() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let mut model = PairFormModel::new_pair(source.path().to_path_buf());
+        model.destination = BrowsePane::new(destination.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys(
+            [KeyCode::Char('s')]
+                .into_iter()
+                .chain("photos".chars().map(KeyCode::Char))
+                .chain([KeyCode::Enter]),
+        );
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Saved(name) if name == "photos"));
+
+        // The reference config, produced the same way `pair add` produces it.
+        let reference_path = config_dir.path().join("reference.toml");
+        pair::add(
+            &reference_path,
+            "photos",
+            source.path(),
+            destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            fs::read_to_string(&reference_path).unwrap(),
+            "a pair saved through the form must be byte-identical to `pair add`"
+        );
+    }
+
+    #[test]
+    fn invalid_name_is_rejected_with_the_same_message_pair_add_gives() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let mut model = PairFormModel::new_pair(source.path().to_path_buf());
+        model.destination = BrowsePane::new(destination.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys(
+            [KeyCode::Char('s')]
+                .into_iter()
+                .chain("Bad Name".chars().map(KeyCode::Char))
+                .chain([KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')]),
+        );
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert!(!config_path.exists());
+
+        let cli_error = pair::add(
+            &config_path,
+            "Bad Name",
+            source.path(),
+            destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            model.message.as_deref(),
+            Some(cli_error.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn duplicate_name_is_rejected_with_the_same_message_pair_add_gives() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            source.path(),
+            destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+
+        let another_source = tempfile::tempdir().unwrap();
+        let mut model = PairFormModel::new_pair(another_source.path().to_path_buf());
+        model.destination = BrowsePane::new(destination.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys(
+            [KeyCode::Char('s')]
+                .into_iter()
+                .chain("photos".chars().map(KeyCode::Char))
+                .chain([KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')]),
+        );
+
+        pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(
+            model
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already exists"),
+            "{:?}",
+            model.message
+        );
+    }
+
+    #[test]
+    fn editing_a_pair_keeps_its_name_and_saves_source_destination_and_mode_atomically() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let original_source = tempfile::tempdir().unwrap();
+        let original_destination = tempfile::tempdir().unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            original_source.path(),
+            original_destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+
+        let cfg = config::load(&config_path).unwrap();
+        let cfg_pair = cfg.pairs.get("photos").unwrap().clone();
+        let mut model = PairFormModel::edit_pair("photos", &cfg_pair);
+        let new_destination = tempfile::tempdir().unwrap();
+        model.destination = BrowsePane::new(new_destination.path().to_path_buf());
+        model.toggle_mode();
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Char('s')]);
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Saved(name) if name == "photos"));
+        let reloaded = config::load(&config_path).unwrap();
+        assert_eq!(
+            reloaded.pairs.len(),
+            1,
+            "the edit must be one atomic save, not a rename"
+        );
+        let saved = reloaded.pairs.get("photos").expect("name is kept");
+        assert_eq!(saved.destination, new_destination.path());
+        assert_eq!(saved.mode, Mode::Mirror);
+    }
+
+    #[test]
+    fn editing_a_pair_never_enters_the_naming_stage_so_renaming_is_unreachable() {
+        let root = browse_tree();
+        let pair_value = config::Pair {
+            source: root.path().to_path_buf(),
+            source_volume_uuid: String::new(),
+            source_volume_name: None,
+            source_volume_relative_path: None,
+            destination: root.path().to_path_buf(),
+            destination_volume_uuid: String::new(),
+            destination_volume_name: None,
+            destination_volume_relative_path: None,
+            mode: Mode::Update,
+        };
+        let mut model = PairFormModel::edit_pair("photos", &pair_value);
+        // The only key that could start a save ('s') goes straight to a save
+        // attempt for an editing model — `Naming` is only reachable when
+        // `editing` is `None`, so an edit can never present a name field.
+        assert_eq!(model.editing.as_deref(), Some("photos"));
+        model.stage = FormStage::Browse;
+        assert!(!matches!(model.stage, FormStage::Naming));
+    }
+
+    #[test]
+    fn removal_confirmation_states_the_run_history_consequence() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_remove_confirm(frame, "photos", HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("Files, SafetyNet archives, and run records are left untouched."),
+            "{screen}"
+        );
+        assert!(
+            screen.contains(
+                "Its run history becomes unreachable until a pair named 'photos' exists again."
+            ),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn removal_leaves_files_and_run_records_untouched_and_only_edits_config() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("keep.txt"), b"data").unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            source.path(),
+            destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Char('y')]);
+
+        let outcome = confirm_remove_loop(
+            &mut terminal,
+            &mut events,
+            &config_path,
+            "photos",
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, RemoveOutcome::Removed);
+        assert!(source.path().join("keep.txt").exists());
+        let reloaded = config::load(&config_path).unwrap();
+        assert!(!reloaded.pairs.contains_key("photos"));
+    }
+
+    #[test]
+    fn cancelling_removal_leaves_the_pair_configured() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            source.path(),
+            destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Char('n')]);
+
+        let outcome = confirm_remove_loop(
+            &mut terminal,
+            &mut events,
+            &config_path,
+            "photos",
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, RemoveOutcome::Cancelled);
+        let reloaded = config::load(&config_path).unwrap();
+        assert!(reloaded.pairs.contains_key("photos"));
+    }
+
+    #[test]
+    fn pair_selector_offers_create_but_not_rename_when_no_pairs_exist() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_pair_selector(frame, &[], 0, &[], HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Press n to add one"), "{screen}");
+        assert!(!screen.to_lowercase().contains("rename"), "{screen}");
     }
 }
