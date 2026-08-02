@@ -1,7 +1,9 @@
 //! `vibesync`: hot-path verbs top-level, management namespaced, per
 //! ADR-0004. Implemented so far: Folder-pair management, the human Dry-run,
 //! safe `run`/`prune`, Journal-backed `status`/`history`, and streaming
-//! NDJSON plan/run surfaces, and the thin action-list TUI.
+//! NDJSON plan/run surfaces, and a staged `ratatui` TUI covering Select,
+//! Compare, Review, Confirm, Run, and Result, with two-pane Folder pair
+//! management (ADR-0010).
 
 mod banner;
 mod config;

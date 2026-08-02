@@ -3571,6 +3571,48 @@ fn tui_startup_with_a_single_match_never_enumerates_pair_choices() {
     assert!(fx.destination.path().join("selected.txt").is_file());
 }
 
+/// Issue #46 acceptance criterion 67: a crash must restore the terminal.
+/// `TerminalSession::start` is the single guarded entry point and its `Drop`
+/// restores raw mode, the alternate screen, and the cursor during unwinding
+/// (the crate unwinds by default). `VIBESYNC_TEST_CRASH_AT=panic`, unlike
+/// `startup_pair_choices`'s `abort()`, panics rather than aborting, so the
+/// unwind actually runs and this test can observe the restoration rather
+/// than merely proving a path is unreached.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tui_panic_after_terminal_takeover_still_restores_the_terminal() {
+    let fx = Fixture::new();
+
+    // The fault fires from inside the seeded-pane loop, right after its
+    // first `terminal.draw`, so no scripted key press is needed: the child
+    // panics on its own once it has provably taken the terminal over.
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let output = ProcessCommand::new("script")
+        .args(["-q", "/dev/null"])
+        .arg(binary.get_program())
+        .arg("tui")
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .env("VIBESYNC_TEST_CRASH_AT", "terminal_session_started")
+        .output()
+        .expect("script starts a pseudo-terminal");
+
+    assert!(
+        !output.status.success(),
+        "fault injection should panic, not exit cleanly: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `TUI_ALTERNATE_SCREEN` (`\x1b[?1049h`) is its counterpart: this proves
+    // the session guard's `Drop` ran during the panic's unwind rather than
+    // being skipped, which is exactly the property criterion 67 protects.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\x1b[?1049l"),
+        "panic must still leave the alternate screen: {stdout}"
+    );
+}
+
 #[test]
 fn tui_with_no_pairs_configured_opens_the_seeded_pane_instead_of_aborting() {
     let fx = Fixture::new();
