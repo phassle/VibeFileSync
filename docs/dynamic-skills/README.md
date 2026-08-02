@@ -19,8 +19,8 @@ Install all three directories as one compatible set:
 | Skill | Purpose | Normal entry |
 | --- | --- | --- |
 | `dynamic-implement` | Orient current work without an argument, or execute one issue through integration | Explicit invocation |
-| `setup-dynamic-skills` | Research and live-verify available model and reasoning-effort steps | Manual setup only |
-| `calibrate-dynamic-models` | Convert completed issue telemetry into repository-owned routing knowledge | Invoked before a feature PR or manually |
+| `dynamic-skills-setup` | Research and live-verify available model and reasoning-effort steps | Manual setup only |
+| `dynamic-skills-calibrate` | Convert completed issue telemetry into repository-owned routing knowledge | Invoked before a feature PR or manually |
 
 Do not copy only `SKILL.md`. Each complete directory is required because Dynamic Implement also uses bundled references, scripts, and UI metadata.
 
@@ -63,8 +63,8 @@ Set one source variable to a directory containing these three complete folders:
 
 ```text
 dynamic-implement/
-setup-dynamic-skills/
-calibrate-dynamic-models/
+dynamic-skills-setup/
+dynamic-skills-calibrate/
 ```
 
 Then copy the folders into the appropriate personal location:
@@ -82,7 +82,7 @@ Example for Codex:
 ```sh
 CODEX_SKILLS_SOURCE=/absolute/path/to/codex-build
 mkdir -p ~/.codex/skills
-for skill in dynamic-implement setup-dynamic-skills calibrate-dynamic-models; do
+for skill in dynamic-implement dynamic-skills-setup dynamic-skills-calibrate; do
   cp -R "${CODEX_SKILLS_SOURCE}/${skill}" ~/.codex/skills/
 done
 ```
@@ -92,7 +92,7 @@ Example for a shared Agent Skills installation:
 ```sh
 SHARED_SKILLS_SOURCE=/absolute/path/to/shared-build
 mkdir -p ~/.agents/skills
-for skill in dynamic-implement setup-dynamic-skills calibrate-dynamic-models; do
+for skill in dynamic-implement dynamic-skills-setup dynamic-skills-calibrate; do
   cp -R "${SHARED_SKILLS_SOURCE}/${skill}" ~/.agents/skills/
 done
 ```
@@ -101,7 +101,7 @@ Remove or replace an older destination directory before copying a new release. D
 
 ## OpenCode command adapters
 
-OpenCode needs explicit custom-command adapters for the two user-entered commands. Install the bundle's `dynamic-implement.md` and `setup-dynamic-skills.md` adapters under:
+OpenCode needs explicit custom-command adapters for the two user-entered commands. Install the bundle's `dynamic-implement.md` and `dynamic-skills-setup.md` adapters under:
 
 ```text
 ~/.config/opencode/commands/
@@ -121,7 +121,7 @@ DYNAMIC_IMPLEMENT_SLASH_ENTRY=1
 Load the installed `dynamic-implement` skill through the native skill tool. With no arguments, run its read-only Wayfinder-based orientation mode and stop. Otherwise execute it for this issue, URL, or smoke-test flag: $ARGUMENTS
 ```
 
-Create `setup-dynamic-skills.md` with:
+Create `dynamic-skills-setup.md` with:
 
 ```markdown
 ---
@@ -130,7 +130,7 @@ description: Manually configure Dynamic Implement capabilities
 
 SETUP_DYNAMIC_SKILLS_SLASH_ENTRY=1
 
-Load the installed `setup-dynamic-skills` skill through the native skill tool and execute manual setup. Do not continue into issue implementation: $ARGUMENTS
+Load the installed `dynamic-skills-setup` skill through the native skill tool and execute manual setup. Do not continue into issue implementation: $ARGUMENTS
 ```
 
 ## First-time repository setup
@@ -147,11 +147,11 @@ Next, run Dynamic Implement capability setup manually:
 
 | Harness | Manual setup entry |
 | --- | --- |
-| Codex | `$setup-dynamic-skills` or select it through `/skills` |
-| Claude Code | `/setup-dynamic-skills` |
-| GitHub Copilot | `/setup-dynamic-skills` |
-| OpenCode | `/setup-dynamic-skills` through its command adapter |
-| Pi | `/skill:setup-dynamic-skills` |
+| Codex | `$dynamic-skills-setup` or select it through `/skills` |
+| Claude Code | `/dynamic-skills-setup` |
+| GitHub Copilot | `/dynamic-skills-setup` |
+| OpenCode | `/dynamic-skills-setup` through its command adapter |
+| Pi | `/skill:dynamic-skills-setup` |
 
 Setup researches the current models and native reasoning-effort values, shows the complete candidate probe matrix and expected paid ceiling, and asks once before any paid live probes. It stores the verified machine-local capability profile at:
 
@@ -208,7 +208,7 @@ Keep the two data layers separate:
 | Executables, authentication state, live model/effort availability | `~/.agents/dynamic-skills/capabilities.json` | Local installation |
 | Eval outcomes, cost ranges, observed boundaries, and recommended starting steps | `<repository>/.agents/dynamic-implement/model-calibration.json` | Version-controlled team knowledge |
 
-Never store learned findings inside an installed skill directory. `calibrate-dynamic-models` updates the repository-owned file through the repository's Git strategy, so every team member receives the same compact evidence and a skill update cannot overwrite it.
+Never store learned findings inside an installed skill directory. `dynamic-skills-calibrate` updates the repository-owned file through the repository's Git strategy, so every team member receives the same compact evidence and a skill update cannot overwrite it.
 
 ## Updating
 
