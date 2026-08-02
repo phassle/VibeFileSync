@@ -9,15 +9,17 @@
 
 use assert_cmd::Command;
 use std::fs;
-use std::io::Write;
 #[cfg(feature = "fault-injection")]
 use std::io::{BufRead, BufReader};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 #[cfg(feature = "fault-injection")]
 use std::process::Stdio;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const EXIT_OK: i32 = 0;
 const EXIT_PARTIAL: i32 = 1;
@@ -74,6 +76,133 @@ fn vibesync_in_tty_with_input_and_env(
     vibesync_in_tty_with_input_after_start(config_home, home, args, input, extra_env, || {})
 }
 
+/// Bytes crossterm writes when the TUI takes the terminal over. Raw mode is
+/// enabled before this is sent (`src/tui.rs:138`), so observing it proves the
+/// line discipline can no longer echo or reinterpret a scripted key press.
+const TUI_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
+/// Tail of every ratatui frame flush. After the alternate-screen switch it can
+/// only come from a completed `terminal.draw`, so it marks the first rendered
+/// frame and therefore a TUI parked on its event read. The pseudo-terminal
+/// `script` hands the child has no window size, so the frame itself paints no
+/// glyphs to match on.
+const TUI_FRAME_FLUSHED: &[u8] = b"\x1b[0m";
+/// Deliberately generous: startup normally takes single-digit milliseconds, so
+/// only a genuinely wedged child should ever reach this ceiling.
+const TUI_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct PipeBuffer {
+    bytes: Vec<u8>,
+    at_end: bool,
+}
+
+/// Drains one of the child's pipes on a background thread. Draining keeps a
+/// full pipe from stalling the TUI, and the shared buffer lets a test wait on
+/// what the child has actually written rather than guess a startup budget.
+struct PipeDrain {
+    shared: Arc<(Mutex<PipeBuffer>, Condvar)>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl PipeDrain {
+    fn spawn(mut pipe: impl Read + Send + 'static) -> Self {
+        let shared = Arc::new((Mutex::new(PipeBuffer::default()), Condvar::new()));
+        let sink = Arc::clone(&shared);
+        let reader = std::thread::spawn(move || {
+            let (buffer, arrived) = &*sink;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        buffer
+                            .lock()
+                            .expect("pipe buffer is readable")
+                            .bytes
+                            .extend_from_slice(&chunk[..count]);
+                        arrived.notify_all();
+                    }
+                    // A signal landing mid-read is not end of output. Treating
+                    // it as one would report the pipe closed and fail the very
+                    // readiness gate this driver exists to make reliable.
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            buffer.lock().expect("pipe buffer is readable").at_end = true;
+            arrived.notify_all();
+        });
+        Self { shared, reader }
+    }
+
+    /// Blocks until `marker` appears at or after `from`, returning the offset
+    /// just past the match. Returns `None` once the pipe closes without it —
+    /// the child exited early — or when `timeout` elapses.
+    fn wait_for(&self, marker: &[u8], from: usize, timeout: Duration) -> Option<usize> {
+        let (buffer, arrived) = &*self.shared;
+        let deadline = Instant::now() + timeout;
+        let mut buffer = buffer.lock().expect("pipe buffer is readable");
+        loop {
+            if let Some(offset) = buffer
+                .bytes
+                .get(from..)
+                .and_then(|tail| tail.windows(marker.len()).position(|run| run == marker))
+            {
+                return Some(from + offset + marker.len());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if buffer.at_end || remaining.is_zero() {
+                return None;
+            }
+            buffer = arrived
+                .wait_timeout(buffer, remaining)
+                .expect("pipe buffer is readable")
+                .0;
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        let (buffer, _) = &*self.shared;
+        let buffer = buffer.lock().expect("pipe buffer is readable");
+        String::from_utf8_lossy(&buffer.bytes).into_owned()
+    }
+
+    /// Waits for the pipe to close and takes everything it carried.
+    fn collect(self) -> Vec<u8> {
+        let Self { shared, reader } = self;
+        reader.join().expect("pipe drain finishes");
+        let mut buffer = shared.0.lock().expect("pipe buffer is readable");
+        std::mem::take(&mut buffer.bytes)
+    }
+}
+
+/// `script` and the TUI share a dedicated process group. Every path that gives
+/// up on the child runs this first, so no failure leaves a live PTY behind for
+/// later tests to inherit.
+fn terminate_process_group(child: &mut std::process::Child) {
+    // SAFETY: the negative id targets only the dedicated process group we
+    // assign at spawn; the live child still owns that id here.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if child
+            .try_wait()
+            .expect("terminated TUI can be polled")
+            .is_some()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // SAFETY: same scoped process group; SIGKILL prevents a broken terminal
+    // teardown from hanging the test suite or leaving an orphaned PTY.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
 fn vibesync_in_tty_with_input_after_start(
     config_home: &Path,
     home: &Path,
@@ -98,9 +227,31 @@ fn vibesync_in_tty_with_input_after_start(
         command.env(name, value);
     }
     let mut child = command.spawn().expect("script starts a pseudo-terminal");
-    // Let the child switch the PTY to raw mode before sending key presses;
-    // otherwise the line discipline can retain a trailing confirmation key.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pty = PipeDrain::spawn(child.stdout.take().expect("script stdout is piped"));
+    let errors = PipeDrain::spawn(child.stderr.take().expect("script stderr is piped"));
+
+    // ADR-0011: wait on what the child actually wrote instead of assuming a
+    // startup budget. A key press sent before the PTY is raw is echoed and
+    // reshaped by the line discipline rather than reaching the review loop.
+    let taken_over = pty.wait_for(TUI_ALTERNATE_SCREEN, 0, TUI_READY_TIMEOUT);
+    let rendered =
+        taken_over.and_then(|from| pty.wait_for(TUI_FRAME_FLUSHED, from, TUI_READY_TIMEOUT));
+    if rendered.is_none() {
+        let stage = if taken_over.is_some() {
+            "render its first frame"
+        } else {
+            "take the terminal"
+        };
+        // The child never reached its event loop but still owns the process
+        // group, so it needs the same bounding a bad key sequence gets.
+        terminate_process_group(&mut child);
+        panic!(
+            "TUI never managed to {stage} for {args:?}: pty {:?}, stderr {:?}",
+            pty.snapshot(),
+            errors.snapshot()
+        );
+    }
+
     before_input();
     child
         .stdin
@@ -110,39 +261,18 @@ fn vibesync_in_tty_with_input_after_start(
         .expect("terminal input is written");
 
     for _ in 0..100 {
-        if child
-            .try_wait()
-            .expect("TUI status can be polled")
-            .is_some()
-        {
-            return child.wait_with_output().expect("TUI output is collected");
+        if let Some(status) = child.try_wait().expect("TUI status can be polled") {
+            return std::process::Output {
+                status,
+                stdout: pty.collect(),
+                stderr: errors.collect(),
+            };
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
-    // `script` and the TUI share this dedicated process group. Bound a bad
-    // key sequence without leaving a child PTY behind for later tests.
-    // SAFETY: the negative id targets only the dedicated process group we
-    // assigned above; the live child still owns that id during this branch.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGTERM);
-    }
-    for _ in 0..20 {
-        if child
-            .try_wait()
-            .expect("terminated TUI can be polled")
-            .is_some()
-        {
-            panic!("TUI did not exit within five seconds for {args:?}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    // SAFETY: same scoped process group; SIGKILL prevents a broken terminal
-    // teardown from hanging the test suite or leaving an orphaned PTY.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.wait();
+    // Bound a bad key sequence without leaving a child PTY behind.
+    terminate_process_group(&mut child);
     panic!("TUI did not exit within five seconds for {args:?}");
 }
 
@@ -2164,6 +2294,18 @@ fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
             .contains("later.txt"),
         "TUI exclusions must never persist"
     );
+}
+
+/// Guards ADR-0011 §4: the readiness gate must distinguish a slow child from
+/// one that never takes the terminal. Without the pipe-close check this would
+/// sit on the full timeout instead of failing immediately.
+#[test]
+#[should_panic(expected = "TUI never managed to take the terminal")]
+fn scripted_input_fails_fast_when_the_child_never_takes_the_terminal() {
+    let fx = Fixture::new();
+    // No Folder pair configured, so `tui` reports and exits before it starts a
+    // terminal session — the driver has no first frame to wait for.
+    vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"q");
 }
 
 #[test]
