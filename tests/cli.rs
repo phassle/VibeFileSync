@@ -2796,6 +2796,38 @@ fn tui_started_from_a_pair_source_preselects_it_and_discloses_the_match() {
     assert!(fx.journal_dir("photos").is_dir());
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tui_startup_with_a_single_match_never_enumerates_pair_choices() {
+    let fx = Fixture::new();
+    fx.write_source("selected.txt", "from the matched pair");
+    fx.add_photos_pair();
+
+    // A single working-directory match must preselect without ever
+    // building the full picker list, which is what classifies every
+    // configured pair's destination (issue #55: "no destination-side I/O").
+    // `VIBESYNC_TEST_CRASH_AT=startup_pair_choices` aborts the process if
+    // `pair_choices` runs at all, so this only stays green while the
+    // preselect branch never reaches it.
+    let output = vibesync_in_tty_with_input_after_start_in(
+        fx.xdg.path(),
+        fx.home.path(),
+        Some(fx.source.path()),
+        &["tui"],
+        b"\r\r\ry\r",
+        &[("VIBESYNC_TEST_CRASH_AT", "startup_pair_choices")],
+        || {},
+    );
+
+    assert!(
+        output.status.success(),
+        "single-match startup must not enumerate pair choices: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("selected.txt").is_file());
+}
+
 #[test]
 fn tui_with_no_pairs_configured_opens_the_seeded_pane_instead_of_aborting() {
     let fx = Fixture::new();

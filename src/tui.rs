@@ -737,16 +737,20 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
         return run_pair_flow(config_path, name, None);
     }
 
-    let choices = pair_choices(&cfg);
     let (seed_dir, seed_notice) = seed_directory();
     // Resolution errors on the seed directory itself (e.g. it sits on a
     // volume whose UUID cannot be read) are skipped, not raised: startup
     // must never abort just because the working directory can't be matched.
     let matches = pair::matching_source_names(&cfg, &seed_dir).unwrap_or_default();
 
+    // `pair_choices` classifies every configured pair's destination
+    // (`build_choice` -> `preconditions::classify_pair`), so it is built only
+    // once a branch is about to show the picker — never while deciding
+    // whether a single match preselects, and never for the empty-config
+    // case, which needs only `cfg.pairs.is_empty()`.
     match matches.len() {
-        0 if choices.is_empty() => show_seeded_pane(&seed_dir, seed_notice.as_deref()),
-        0 => match select_pair(&choices, &[])? {
+        0 if cfg.pairs.is_empty() => show_seeded_pane(&seed_dir, seed_notice.as_deref()),
+        0 => match select_pair(&pair_choices(&cfg), &[])? {
             Some(name) => run_pair_flow(config_path, &name, seed_notice),
             None => Ok(EXIT_OK),
         },
@@ -762,7 +766,7 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
             };
             run_pair_flow(config_path, &name, Some(notice))
         }
-        _ => match select_pair(&choices, &matches)? {
+        _ => match select_pair(&pair_choices(&cfg), &matches)? {
             Some(name) => run_pair_flow(config_path, &name, seed_notice),
             None => Ok(EXIT_OK),
         },
@@ -1004,7 +1008,16 @@ fn ensure_interactive() -> Result<(), AppError> {
     Ok(())
 }
 
+/// Enumerates every configured pair's picker choice, classifying both sides
+/// (including each pair's destination) along the way. Callers must defer
+/// this until a picker is actually about to be shown — see the fault hook
+/// below, which lets a test prove that a single-match startup never reaches
+/// here.
 fn pair_choices(config: &config::Config) -> Vec<PairChoice> {
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    if std::env::var("VIBESYNC_TEST_CRASH_AT").ok().as_deref() == Some("startup_pair_choices") {
+        std::process::abort();
+    }
     config
         .pairs
         .iter()
