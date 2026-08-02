@@ -146,6 +146,69 @@ fn vibesync_in_tty_with_input_after_start(
     panic!("TUI did not exit within five seconds for {args:?}");
 }
 
+/// Like `vibesync_in_tty_with_input_after_start`, but `between` runs once
+/// the TUI has had time to react to `first` (e.g. finish a Compare scan)
+/// and before `second` is written — used to land a filesystem change inside
+/// a specific stage rather than only before the TUI ever opens.
+fn vibesync_in_tty_with_staged_input(
+    config_home: &Path,
+    home: &Path,
+    args: &[&str],
+    first: &[u8],
+    second: &[u8],
+    between: impl FnOnce(),
+) -> std::process::Output {
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut command = ProcessCommand::new("script");
+    command
+        .args(["-q", "/dev/null"])
+        .arg(binary.get_program())
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().expect("script starts a pseudo-terminal");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut stdin = child.stdin.take().expect("script stdin is piped");
+    stdin.write_all(first).expect("first input is written");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    between();
+    stdin.write_all(second).expect("second input is written");
+    drop(stdin);
+
+    for _ in 0..100 {
+        if child
+            .try_wait()
+            .expect("TUI status can be polled")
+            .is_some()
+        {
+            return child.wait_with_output().expect("TUI output is collected");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if child
+            .try_wait()
+            .expect("terminated TUI can be polled")
+            .is_some()
+        {
+            panic!("TUI did not exit within five seconds for {args:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+    panic!("TUI did not exit within five seconds for {args:?}");
+}
+
 fn config_file(config_home: &Path) -> std::path::PathBuf {
     config_home.join("vibesync").join("config.toml")
 }
@@ -2082,9 +2145,14 @@ fn tui_confirmation_executes_the_reviewed_plan_through_the_run_engine() {
     fx.write_dest("changed.txt", "old destination version");
     fx.add_photos_pair();
 
-    // Enter advances from action review to confirmation; y confirms.
-    let output =
-        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\ry");
+    // Enter starts Compare; Enter advances from action review to
+    // confirmation; y confirms; Enter dismisses the persisted Result stage.
+    let output = vibesync_in_tty_with_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r\ry\r",
+    );
 
     assert!(
         output.status.success(),
@@ -2132,11 +2200,15 @@ fn tui_shows_preflight_warnings_before_final_confirmation() {
     fx.write_dest("_SafetyNet/old-run/old.txt", "archived bytes");
     fx.add_photos_pair();
 
-    // Enter reaches final confirmation; q cancels without mutation.
+    // Enter starts Compare; Enter reaches final confirmation; q cancels
+    // without mutation. The preflight warning's rendered text is asserted
+    // through the `Terminal<TestBackend>` seam (`tui::tests::
+    // confirm_screen_renders_compare_s_notices`) — a real pty's reported
+    // size is not guaranteed in this harness, so text assertions belong to
+    // the rendered-content seam, not this end-to-end one.
     let output =
-        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\rq");
-    let transcript = String::from_utf8_lossy(&output.stdout);
-    assert!(transcript.contains("_SafetyNet/ uses"), "{transcript}");
+        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\r\rq");
+    assert!(output.status.success());
     assert!(!fx.destination.path().join("new.txt").exists());
 }
 
@@ -2146,9 +2218,14 @@ fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
     fx.write_source("later.txt", "still needs copying");
     fx.add_photos_pair();
 
-    // Space excludes the selected row, Enter advances, y confirms.
-    let output =
-        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b" \ry");
+    // Enter starts Compare; Space excludes the selected row, Enter advances,
+    // y confirms, Enter dismisses the Result stage.
+    let output = vibesync_in_tty_with_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r \ry\r",
+    );
     assert!(output.status.success());
     assert!(!fx.destination.path().join("later.txt").exists());
 
@@ -2172,12 +2249,15 @@ fn tui_does_not_execute_an_action_that_appears_after_review_started() {
     fx.write_source("reviewed.txt", "reviewed before the TUI opened");
     fx.add_photos_pair();
 
-    let output = vibesync_in_tty_with_input_after_start(
+    // First "\r" starts Compare and lets its scan capture the plan; the
+    // extra file then lands after that scan, during Review, before the
+    // rest of the input (Enter to Confirm, y to run, Enter to dismiss).
+    let output = vibesync_in_tty_with_staged_input(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\ry",
-        &[],
+        b"\r",
+        b"\ry\r",
         || fx.write_source("unreviewed.txt", "appeared during review"),
     );
 
@@ -2219,8 +2299,9 @@ fn tui_without_a_pair_selects_from_configured_folder_pairs() {
     fx.add_pair("photos", "mirror");
     fx.add_pair("documents", "mirror");
 
-    // BTreeMap order puts documents first: select it, review, then confirm.
-    let output = vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"\r\ry");
+    // BTreeMap order puts documents first: select it, start Compare, review,
+    // confirm, then dismiss the persisted Result stage.
+    let output = vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"\r\r\ry\r");
     assert!(
         output.status.success(),
         "pair selection failed: {}",
@@ -2238,13 +2319,14 @@ fn tui_included_error_blocks_until_the_row_is_excluded() {
     std::os::unix::fs::symlink("target", fx.source.path().join("link")).unwrap();
     fx.add_photos_pair();
 
-    // Enter confirm; y is blocked; b returns; Space excludes the only row;
-    // Enter and y then run the now-valid reviewed subset.
+    // Enter starts Compare; Enter confirm; y is blocked; b returns; Space
+    // excludes the only row; Enter and y then run the now-valid reviewed
+    // subset; Enter dismisses the persisted Result stage.
     let output = vibesync_in_tty_with_input_and_env(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\ryb \ry",
+        b"\r\ryb \ry\r",
         &[("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")],
     );
 

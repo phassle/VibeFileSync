@@ -339,17 +339,6 @@ pub(crate) fn run_reviewed(
     execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, false)
 }
 
-pub(crate) fn present_default_preflight(
-    pair: &crate::config::Pair,
-    reviewed_plan: &plan::Plan,
-) -> Result<(), AppError> {
-    let reporter = RunReporter::Human;
-    let warnings = crate::preconditions::check_run(pair, reviewed_plan, false, false)?;
-    reporter.precondition_warnings(&warnings);
-    reporter.expected_degradations(&crate::volume::expected_degradations(&pair.destination));
-    Ok(())
-}
-
 fn configured_pair(config_path: &Path, pair_name: &str) -> Result<crate::config::Pair, AppError> {
     let config = crate::config::load(config_path)?;
     config
