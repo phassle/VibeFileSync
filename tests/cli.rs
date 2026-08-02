@@ -2415,6 +2415,42 @@ fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
     }
 }
 
+/// Lock contention at execute must still exit 2, per ADR-0010's lifecycle:
+/// the TUI now returns to Review instead of tearing down the session on
+/// contention (see `tui::is_lock_contention`), so the CLI's own exit code on
+/// the same contention is a regression guard the TUI change could otherwise
+/// silently break. Contention is made genuine by holding the pair's `.lock`
+/// file's flock from this test process before invoking the binary, exactly
+/// as `journal::PairLock::acquire` would from a concurrent run.
+#[test]
+fn lock_contention_at_run_exits_two() {
+    let fx = Fixture::new();
+    fx.write_source("photo.jpg", "contents");
+    fx.add_photos_pair();
+
+    let lock_dir = fx.journal_dir("photos");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_dir.join(".lock"))
+        .unwrap();
+    let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(locked, 0, "test process must hold the pair lock first");
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    assert!(
+        !fx.destination.path().join("photo.jpg").exists(),
+        "a run refused for lock contention must not touch the destination"
+    );
+
+    drop(lock_file);
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows() {
@@ -2875,6 +2911,41 @@ fn crash_at_archived_keeps_the_old_version_in_safetynet() {
     assert_eq!(fs::read_to_string(&archived[0]).unwrap(), "old content");
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn run_json_reports_a_file_that_appeared_after_review_as_discovered_after_review() {
+    let fx = Fixture::new();
+    fx.write_source("reviewed.txt", "reviewed before the run started");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "cleanup_complete:echo -n 'appeared during reconciliation' > \"$VIBESYNC_TEST_SOURCE/unreviewed.txt\"",
+        )
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    assert!(fx.destination.path().join("reviewed.txt").is_file());
+    assert!(
+        !fx.destination.path().join("unreviewed.txt").exists(),
+        "an action absent from the reviewed plan must wait for another run"
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary = rows
+        .iter()
+        .find(|row| row["type"] == "summary")
+        .expect("a summary event is always emitted");
+    assert_eq!(summary["discovered_after_review"], 1);
+}
+
 #[cfg(not(feature = "fault-injection"))]
 #[test]
 fn fault_injection_environment_is_absent_without_the_feature() {
@@ -3185,6 +3256,57 @@ fn tui_does_not_execute_an_action_that_appears_after_review_started() {
     assert!(
         !fx.destination.path().join("unreviewed.txt").exists(),
         "an action absent from the displayed plan must wait for another run"
+    );
+}
+
+#[test]
+fn tui_recompares_instead_of_crashing_when_the_pair_definition_changes_during_review() {
+    let fx = Fixture::new();
+    fx.write_source("reviewed.txt", "reviewed before the pair was redefined");
+    fx.add_photos_pair();
+    let redefined_destination = tempfile::tempdir().unwrap();
+
+    // First "\r\r" passes the volume-state pane gate and starts Compare,
+    // whose scan captures a plan against the original destination. Another
+    // process then redefines the pair (`pair add --replace`) before the
+    // first execute attempt: "\r" opens Confirm, "y" attempts to run and
+    // must be refused instead of crashing the session, discarding the
+    // stale plan and returning to Compare. The rest re-compares against the
+    // now-current definition and completes normally: "\r" starts the
+    // second scan, "\ry" confirms and runs, "\r" dismisses Result.
+    let output = vibesync_in_tty_with_staged_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r\r",
+        b"\ry\r\ry\r",
+        || {
+            fx.cmd()
+                .args([
+                    "pair",
+                    "add",
+                    "photos",
+                    "--source",
+                    fx.source.path().to_str().unwrap(),
+                    "--destination",
+                    redefined_destination.path().to_str().unwrap(),
+                    "--mode",
+                    "mirror",
+                    "--replace",
+                ])
+                .assert()
+                .success();
+        },
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !fx.destination.path().join("reviewed.txt").exists(),
+        "the stale plan must never reach a run against the original destination"
+    );
+    assert!(
+        redefined_destination.path().join("reviewed.txt").is_file(),
+        "the re-compared plan must run against the pair's current definition"
     );
 }
 
