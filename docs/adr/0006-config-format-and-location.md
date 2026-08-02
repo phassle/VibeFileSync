@@ -21,6 +21,8 @@ destination_volume_uuid = "C3D4…"   # written by `pair add`
 mode = "mirror"
 ```
 
+8. **Volume names are cosmetic only — amended** ([#60](https://github.com/phassle/VibeFileSync/issues/60)): `pair add` and `pair add --replace` additionally write the source and destination volume *names* (as distinct from the UUIDs in §6) into the pair record, for TUI and CLI display when a volume isn't mounted. These fields are never read for identity, matching, or resolution — the UUID pinned in §6 remains the sole authority — so a stale name after a drive is renamed is a display defect only, never a correctness one. They are optional and additive: `version = 1` is unchanged, and config written before this amendment loads unchanged with the names absent.
+
 ## Consequences
 
 - Config load failures are precondition aborts (exit 2 in the ADR-0004 taxonomy), before any destination mutation.

@@ -6,7 +6,7 @@
 
 `vibesync` is a crash-safe, one-way file-sync tool for macOS on Apple Silicon: a single pure-Rust binary that mirrors or updates folders onto external drives (APFS and exFAT) without ever silently losing a previous version.
 
-Every run is **review-first**: `plan` shows a comprehensible dry-run diff before anything mutates, `run` asks before executing, and agents get the same plan as an NDJSON stream.
+Every run is **review-first**: `plan` shows a comprehensible dry-run diff before anything mutates, `run` asks before executing, and agents get the same plan as an NDJSON stream. A `ratatui` TUI (`vibesync tui`) offers the same review over a staged, fully keyboard-operable interface. The CLI is the documented accessible path for screen-reader users.
 
 ## Safety is the product
 
@@ -24,5 +24,5 @@ Every run is **review-first**: `plan` shows a comprehensible dry-run diff before
 v1 is under active development from the spec in [issue #14](https://github.com/phassle/VibeFileSync/issues/14), broken into tracer-bullet tickets ([#15–#28](https://github.com/phassle/VibeFileSync/issues?q=label%3Aready-for-agent)).
 
 - **Domain glossary**: [`CONTEXT.md`](CONTEXT.md) — the normative vocabulary (Folder pair, Mirror, SafetyNet, Publish, Convergence, …)
-- **Architecture decisions**: [`docs/adr/`](docs/adr/) — ADR-0001…0009 back every decision in the spec
+- **Architecture decisions**: [`docs/adr/`](docs/adr/) — ADR-0001…0011 back every decision in the spec
 - **Agent instructions**: [`AGENTS.md`](AGENTS.md) — issue tracker, triage labels, gitflow
