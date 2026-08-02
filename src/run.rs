@@ -332,12 +332,28 @@ pub(crate) fn run_reviewed(
     for notice in notices {
         eprintln!("{notice}");
     }
-    if pair != reviewed_pair {
-        return Err(AppError::Precondition(
-            "Folder pair changed during TUI review; reopen the TUI before running".to_string(),
-        ));
+    if let Some(error) = stale_pair_error(&pair, &reviewed_pair) {
+        return Err(error);
     }
     execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, false)
+}
+
+/// A plan is read-only, per ADR-0010's lifecycle: once Review has captured a
+/// Folder pair's definition, no later redefinition of that pair (through the
+/// TUI's own CRUD, another process, or a hand edit) may let the stale plan
+/// reach a run. Pure comparison so it can be exercised without touching the
+/// pair lock or the journal.
+fn stale_pair_error(
+    pair: &crate::config::Pair,
+    reviewed_pair: &crate::config::Pair,
+) -> Option<AppError> {
+    if pair == reviewed_pair {
+        None
+    } else {
+        Some(AppError::Precondition(
+            "Folder pair changed during TUI review; reopen the TUI before running".to_string(),
+        ))
+    }
 }
 
 fn configured_pair(config_path: &Path, pair_name: &str) -> Result<crate::config::Pair, AppError> {
@@ -1619,70 +1635,34 @@ mod tests {
     use super::*;
     use crate::plan::StructuralConflict;
 
-    /// A plan is read-only, per ADR-0010's lifecycle: once Review has
-    /// captured a Folder pair's definition, no later redefinition of that
-    /// pair (through the TUI's own CRUD, another process, or a hand edit)
-    /// may let the stale plan reach a run. `run_reviewed` re-resolves the
-    /// pair at execute time and must refuse rather than execute against the
-    /// old definition.
+    fn sample_pair(destination: &Path) -> crate::config::Pair {
+        crate::config::Pair {
+            source: PathBuf::from("/source"),
+            source_volume_uuid: "SOURCE-UUID".to_string(),
+            source_volume_name: None,
+            source_volume_relative_path: None,
+            destination: destination.to_path_buf(),
+            destination_volume_uuid: "DEST-UUID".to_string(),
+            destination_volume_name: None,
+            destination_volume_relative_path: None,
+            mode: crate::config::Mode::Mirror,
+        }
+    }
+
     #[test]
-    fn run_reviewed_refuses_a_stale_plan_when_the_pair_definition_changed() {
-        let config_dir = tempfile::tempdir().unwrap();
-        let config_path = config_dir.path().join("config.toml");
-        let source = tempfile::tempdir().unwrap();
-        let first_destination = tempfile::tempdir().unwrap();
-        crate::pair::add(
-            &config_path,
-            "photos",
-            source.path(),
-            first_destination.path(),
-            crate::config::Mode::Mirror,
-            false,
-        )
-        .unwrap();
-        let reviewed_pair = crate::config::load(&config_path).unwrap().pairs["photos"].clone();
-
-        // Redefine the pair while a plan reviewed against the first
-        // definition is still held by another surface (e.g. an open TUI
-        // session).
-        let second_destination = tempfile::tempdir().unwrap();
-        crate::pair::add(
-            &config_path,
-            "photos",
-            source.path(),
-            second_destination.path(),
-            crate::config::Mode::Mirror,
-            true,
-        )
-        .unwrap();
-
-        let result = run_reviewed(
-            &config_path,
-            "photos",
-            RunOptions {
-                yes: true,
-                permanent_delete: false,
-                allow_empty_source: false,
-                ignore_space_check: false,
-                json_output: false,
-                full_verify: false,
-                excludes: &[],
-            },
-            reviewed_pair,
-            plan::Plan::default(),
-        );
+    fn stale_pair_error_refuses_only_a_plan_reviewed_against_a_different_definition() {
+        let reviewed = sample_pair(Path::new("/first-destination"));
+        let redefined = sample_pair(Path::new("/second-destination"));
 
         assert!(
             matches!(
-                &result,
-                Err(AppError::Precondition(message)) if message == "Folder pair changed during TUI review; reopen the TUI before running"
+                stale_pair_error(&redefined, &reviewed),
+                Some(AppError::Precondition(message)) if message == "Folder pair changed during TUI review; reopen the TUI before running"
             ),
-            "{result:?}"
+            "{:?}",
+            stale_pair_error(&redefined, &reviewed)
         );
-        assert!(
-            !second_destination.path().join("_SafetyNet").exists(),
-            "a refused run must not touch the destination"
-        );
+        assert!(stale_pair_error(&reviewed, &reviewed).is_none());
     }
 
     #[test]

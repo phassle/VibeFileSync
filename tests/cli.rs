@@ -2415,6 +2415,42 @@ fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
     }
 }
 
+/// Lock contention at execute must still exit 2, per ADR-0010's lifecycle:
+/// the TUI now returns to Review instead of tearing down the session on
+/// contention (see `tui::is_lock_contention`), so the CLI's own exit code on
+/// the same contention is a regression guard the TUI change could otherwise
+/// silently break. Contention is made genuine by holding the pair's `.lock`
+/// file's flock from this test process before invoking the binary, exactly
+/// as `journal::PairLock::acquire` would from a concurrent run.
+#[test]
+fn lock_contention_at_run_exits_two() {
+    let fx = Fixture::new();
+    fx.write_source("photo.jpg", "contents");
+    fx.add_photos_pair();
+
+    let lock_dir = fx.journal_dir("photos");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_dir.join(".lock"))
+        .unwrap();
+    let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(locked, 0, "test process must hold the pair lock first");
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    assert!(
+        !fx.destination.path().join("photo.jpg").exists(),
+        "a run refused for lock contention must not touch the destination"
+    );
+
+    drop(lock_file);
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn run_json_process_boundary_covers_failure_warning_delete_and_interruption_rows() {
