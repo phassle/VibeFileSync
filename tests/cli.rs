@@ -810,6 +810,73 @@ fn relocated_json_plan_reports_notice_on_stderr_and_keeps_stdout_ndjson_only() {
 }
 
 #[test]
+fn run_against_a_relocated_volume_records_the_path_it_actually_used() {
+    let fx = Fixture::new();
+    let source = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let destination = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    fs::write(source.path().join("photo.txt"), "photo").unwrap();
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            source.path().to_str().unwrap(),
+            "--destination",
+            destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+    let path = config_file(fx.xdg.path());
+    let original_source = source.path().display().to_string();
+    let original_destination = destination.path().display().to_string();
+    let stale_source = "/Volumes/VibeFileSync-Stale/Photos";
+    let stale_destination = "/Volumes/VibeFileSync-Stale/PhotosBackup";
+    let config = fs::read_to_string(&path)
+        .unwrap()
+        .replace(
+            &format!("source = \"{original_source}\""),
+            &format!("source = \"{stale_source}\""),
+        )
+        .replace(
+            &format!("destination = \"{original_destination}\""),
+            &format!("destination = \"{stale_destination}\""),
+        );
+    fs::write(&path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(stale_source), "{stderr}");
+    assert!(stderr.contains(stale_destination), "{stderr}");
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(rows.first().unwrap()["type"], "run_start");
+    let recorded_source = rows[0]["source"].as_str().unwrap();
+    assert!(
+        recorded_source.ends_with(&original_source),
+        "{recorded_source}"
+    );
+    assert_ne!(recorded_source, stale_source);
+    let recorded_destination = rows[0]["destination"].as_str().unwrap();
+    assert!(
+        recorded_destination.ends_with(&original_destination),
+        "{recorded_destination}"
+    );
+    assert_ne!(recorded_destination, stale_destination);
+}
+
+#[test]
 fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
     let orphaned_replacement = Fixture::new();
     orphaned_replacement.write_source("docs/new.txt", "new");
@@ -1290,6 +1357,14 @@ fn run_json_stream_reports_execution_order_verification_and_safetynet() {
     assert_eq!(rows.first().unwrap()["type"], "run_start");
     assert_eq!(rows.last().unwrap()["type"], "summary");
     assert!(rows[0]["degradations"].is_array());
+    assert_eq!(
+        rows[0]["source"],
+        fx.source.path().to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        rows[0]["destination"],
+        fx.destination.path().to_string_lossy().into_owned()
+    );
     let planned = rows[0]["planned_actions"]
         .as_array()
         .expect("run_start declares the reviewed action set");
@@ -3251,6 +3326,42 @@ fn completed_run_journal_correlates_every_event_and_safetynet_folder() {
         fs::read_to_string(fx.destination.path().join("report.txt")).unwrap(),
         "new version",
         "action_done describes content already Published at the process boundary"
+    );
+}
+
+#[test]
+fn retained_journal_run_start_records_resolved_source_and_destination() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "photo");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let journal_path = fs::read_dir(fx.journal_dir("photos"))
+        .expect("run creates the per-pair Journal directory")
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension().and_then(|value| value.to_str()) == Some("ndjson")).then_some(path)
+        })
+        .next()
+        .expect("one retained Journal exists");
+    let events: Vec<serde_json::Value> = fs::read_to_string(&journal_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every Journal line is JSON"))
+        .collect();
+
+    let run_start = events
+        .first()
+        .expect("Journal records at least the run_start event");
+    assert_eq!(run_start["type"], "run_start");
+    assert_eq!(
+        run_start["source"],
+        fx.source.path().to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        run_start["destination"],
+        fx.destination.path().to_string_lossy().into_owned()
     );
 }
 

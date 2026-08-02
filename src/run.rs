@@ -157,9 +157,8 @@ impl RunReporter {
     fn run_start(
         &self,
         run_id: &str,
-        pair: &str,
-        mode: crate::config::Mode,
-        destination: &Path,
+        pair_name: &str,
+        pair: &crate::config::Pair,
         warnings: &[String],
         plan: &plan::Plan,
     ) -> Result<(), AppError> {
@@ -168,11 +167,13 @@ impl RunReporter {
                 schema: RUN_SCHEMA,
                 run_id,
             },
-            pair,
+            pair_name,
+            &pair.source,
+            &pair.destination,
             warnings,
-            &crate::volume::expected_degradations(destination),
+            &crate::volume::expected_degradations(&pair.destination),
         );
-        event["mode"] = serde_json::json!(mode);
+        event["mode"] = serde_json::json!(pair.mode);
         let planned_actions = crate::event::planned_actions(plan);
         event["planned"] = planned_actions.len().into();
         event["planned_actions"] = planned_actions.into();
@@ -407,13 +408,19 @@ fn execute_reviewed_plan(
     })?;
     let mut journal = Journal::create(pair_name, &pair.destination).map_err(io_error)?;
     journal
-        .run_start(pair_name, &initial_plan, &run_warnings, &degradations)
+        .run_start(
+            pair_name,
+            &pair.source,
+            &pair.destination,
+            &initial_plan,
+            &run_warnings,
+            &degradations,
+        )
         .map_err(io_error)?;
     reporter.run_start(
         journal.run_id(),
         pair_name,
-        pair.mode,
-        &pair.destination,
+        &pair,
         &run_warnings,
         &initial_plan,
     )?;
