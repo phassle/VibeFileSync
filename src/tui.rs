@@ -965,81 +965,101 @@ fn run_pair_flow(
     }
     session.terminal().clear().map_err(tui_error)?;
 
-    let compared = compare(
-        session.terminal(),
-        &mut events,
-        config_path,
-        pair_name,
-        header_mode,
-    )?;
-    let (pair, dry_run, notices) = match compared {
-        CompareOutcome::Cancelled => {
-            drop(session);
-            println!("Run cancelled; destination unchanged.");
-            return Ok(EXIT_OK);
-        }
-        CompareOutcome::Ready(scan) => (scan.pair, scan.dry_run, scan.notices),
-    };
+    // Carries a notice across a re-compare: a plan is read-only, so any
+    // definition change discovered under it discards it visibly instead of
+    // silently reusing stale actions (see `is_pair_changed` below).
+    let mut recompare_notice: Option<String> = None;
 
-    session.terminal().clear().map_err(tui_error)?;
-    let mut model = ReviewModel::from_plan(pair_name, &pair, dry_run);
-    model.notices = notices.clone();
-
-    loop {
-        let outcome = review_loop(session.terminal(), &mut events, &mut model, header_mode)
-            .map_err(tui_error)?;
-        let ReviewOutcome::Execute(excludes) = outcome else {
-            drop(session);
-            println!("Run cancelled; destination unchanged.");
-            return Ok(EXIT_OK);
-        };
-        let reconciliation_excludes: Vec<String> = excludes
-            .iter()
-            .filter(|excluded| excluded.operation == Operation::Error)
-            .map(|excluded| excluded.path.clone())
-            .collect();
-        let destination = model.destination.clone();
-        let mode = model.mode;
-        let reviewed_pair = model.pair.clone();
-        let reviewed_plan = model.reviewed_plan(&excludes);
-
-        let run_result = run_engine::run_reviewed(
+    'recompare: loop {
+        let compared = compare(
+            session.terminal(),
+            &mut events,
             config_path,
             pair_name,
-            run_engine::RunOptions {
-                yes: true,
-                permanent_delete: false,
-                allow_empty_source: false,
-                ignore_space_check: false,
-                json_output: false,
-                full_verify: false,
-                // Ordinary actions are intersected with the reviewed Plan by
-                // run_reviewed. Excluded error rows must also be absent from
-                // its fresh plan-error gate; errors cannot share a path with
-                // another source action, so this remains operation-safe.
-                excludes: &reconciliation_excludes,
-            },
-            reviewed_pair,
-            reviewed_plan,
-        );
+            header_mode,
+        )?;
+        let (pair, dry_run, notices) = match compared {
+            CompareOutcome::Cancelled => {
+                drop(session);
+                println!("Run cancelled; destination unchanged.");
+                return Ok(EXIT_OK);
+            }
+            CompareOutcome::Ready(scan) => (scan.pair, scan.dry_run, scan.notices),
+        };
 
-        // The pair lock is taken at execute, not at Compare: a collision
-        // with another run in progress returns to Review with the model's
-        // selections intact rather than tearing down the whole session.
-        if is_lock_contention(&run_result) {
-            model.screen = Screen::Actions;
-            model.message = Some(
-                "Another run is already in progress for this pair; try again once it finishes."
-                    .to_string(),
-            );
-            continue;
-        }
-
-        let (exit_code, view) =
-            build_result_view(pair_name, &destination, mode, notices.clone(), run_result)?;
         session.terminal().clear().map_err(tui_error)?;
-        show_result(session.terminal(), &mut events, &view, header_mode).map_err(tui_error)?;
-        return Ok(exit_code);
+        let mut model = ReviewModel::from_plan(pair_name, &pair, dry_run);
+        model.notices = notices.clone();
+        model.message = recompare_notice.take();
+
+        loop {
+            let outcome = review_loop(session.terminal(), &mut events, &mut model, header_mode)
+                .map_err(tui_error)?;
+            let ReviewOutcome::Execute(excludes) = outcome else {
+                drop(session);
+                println!("Run cancelled; destination unchanged.");
+                return Ok(EXIT_OK);
+            };
+            let reconciliation_excludes: Vec<String> = excludes
+                .iter()
+                .filter(|excluded| excluded.operation == Operation::Error)
+                .map(|excluded| excluded.path.clone())
+                .collect();
+            let destination = model.destination.clone();
+            let mode = model.mode;
+            let reviewed_pair = model.pair.clone();
+            let reviewed_plan = model.reviewed_plan(&excludes);
+
+            let run_result = run_engine::run_reviewed(
+                config_path,
+                pair_name,
+                run_engine::RunOptions {
+                    yes: true,
+                    permanent_delete: false,
+                    allow_empty_source: false,
+                    ignore_space_check: false,
+                    json_output: false,
+                    full_verify: false,
+                    // Ordinary actions are intersected with the reviewed Plan by
+                    // run_reviewed. Excluded error rows must also be absent from
+                    // its fresh plan-error gate; errors cannot share a path with
+                    // another source action, so this remains operation-safe.
+                    excludes: &reconciliation_excludes,
+                },
+                reviewed_pair,
+                reviewed_plan,
+            );
+
+            // The pair lock is taken at execute, not at Compare: a collision
+            // with another run in progress returns to Review with the model's
+            // selections intact rather than tearing down the whole session.
+            if is_lock_contention(&run_result) {
+                model.screen = Screen::Actions;
+                model.message = Some(
+                    "Another run is already in progress for this pair; try again once it finishes."
+                        .to_string(),
+                );
+                continue;
+            }
+
+            // The reviewed plan is read-only; a definition change underneath
+            // it (this TUI's own selector, another process, or a hand edit)
+            // must discard it visibly rather than let a stale plan reach a
+            // run or crash the session. Re-compare instead of failing.
+            if is_pair_changed(&run_result) {
+                recompare_notice = Some(
+                    "The Folder pair's definition changed during review; the plan was discarded and re-compared."
+                        .to_string(),
+                );
+                continue 'recompare;
+            }
+
+            let (exit_code, view) =
+                build_result_view(pair_name, &destination, mode, notices.clone(), run_result)?;
+            session.terminal().clear().map_err(tui_error)?;
+            show_result(session.terminal(), &mut events, &view, header_mode).map_err(tui_error)?;
+            return Ok(exit_code);
+        }
     }
 }
 
@@ -1047,6 +1067,18 @@ fn is_lock_contention(run_result: &Result<i32, AppError>) -> bool {
     matches!(
         run_result,
         Err(AppError::Precondition(message)) if message == "run already in progress"
+    )
+}
+
+/// A stale plan must never reach a run: `run_reviewed` re-resolves the pair
+/// at execute time and refuses when it no longer matches what Review saw
+/// (see `run::run_reviewed`). This recognises that refusal so the TUI can
+/// discard the plan and re-compare instead of surfacing it as a crash.
+fn is_pair_changed(run_result: &Result<i32, AppError>) -> bool {
+    matches!(
+        run_result,
+        Err(AppError::Precondition(message))
+            if message == "Folder pair changed during TUI review; reopen the TUI before running"
     )
 }
 
@@ -2018,6 +2050,16 @@ fn draw_result(frame: &mut Frame<'_>, view: &ResultView, header_mode: HeaderMode
                     .join(&record.run_id)
                     .display()
             )));
+            // The reconciliation scan correctly drops work that appeared in
+            // the source after this plan was reviewed; that drop must stay
+            // visible rather than silent, so it is reported only when it
+            // actually happened.
+            if record.discovered_after_review > 0 {
+                lines.push(Line::from(format!(
+                    "Skipped {} change(s) that appeared after review and were not run; re-run to pick them up.",
+                    record.discovered_after_review
+                )));
+            }
         }
         None => lines.push(Line::from("No run record found in the Journal.")),
     }
@@ -3004,6 +3046,7 @@ mod tests {
                 },
                 bytes: 42,
                 warnings: 0,
+                discovered_after_review: 0,
             }),
             interrupted: false,
             message: None,
@@ -3023,6 +3066,47 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}: {screen}");
         }
+        assert!(
+            !screen.contains("appeared after review"),
+            "a zero discovered-after-review count must render nothing: {screen}"
+        );
+    }
+
+    #[test]
+    fn result_stage_reports_changes_discovered_after_review_were_skipped() {
+        let view = ResultView {
+            pair_name: "photos".to_string(),
+            mode: Mode::Mirror,
+            destination: PathBuf::from("/Volumes/Backup/Photos"),
+            notices: Vec::new(),
+            record: Some(crate::journal::RunRecord {
+                run_id: "20260801T120000Z".to_string(),
+                result: "success".to_string(),
+                counts: crate::journal::Counts {
+                    planned: 2,
+                    done: 2,
+                    failed: 0,
+                    copied: 2,
+                    updated: 0,
+                    deleted: 0,
+                },
+                bytes: 42,
+                warnings: 0,
+                discovered_after_review: 3,
+            }),
+            interrupted: false,
+            message: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Enter]);
+
+        show_result(&mut terminal, &mut events, &view, HeaderMode::Full).unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("Skipped 3 change(s) that appeared after review and were not run"),
+            "missing discovered-after-review report: {screen}"
+        );
     }
 
     #[test]
@@ -3073,6 +3157,17 @@ mod tests {
             "destination free space is insufficient".to_string()
         ))));
         assert!(!is_lock_contention(&Ok(0)));
+    }
+
+    #[test]
+    fn pair_changed_during_review_is_recognised_but_other_preconditions_are_not() {
+        assert!(is_pair_changed(&Err(AppError::Precondition(
+            "Folder pair changed during TUI review; reopen the TUI before running".to_string()
+        ))));
+        assert!(!is_pair_changed(&Err(AppError::Precondition(
+            "run already in progress".to_string()
+        ))));
+        assert!(!is_pair_changed(&Ok(0)));
     }
 
     #[test]

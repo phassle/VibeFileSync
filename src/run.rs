@@ -487,6 +487,11 @@ fn execute_reviewed_plan(
     // Cleanup changes the destination, so the action set below must come from
     // a new scan rather than from the scan that discovered the abandoned temp.
     let (pair, mut plan) = plan::build(config_path, pair_name, excludes)?;
+    // The reconciliation scan is authoritative and correctly drops anything
+    // it finds that was not in the reviewed plan (e.g. a file added to the
+    // source mid-review); this count is what makes that drop visible to the
+    // user and to agents reading the run summary event, instead of silent.
+    stats.discovered_after_review = discovered_after_review(&initial_plan, &plan);
     let missing = missing_reviewed_actions(&initial_plan, &plan);
     for (operation, action) in &missing {
         journal
@@ -868,6 +873,23 @@ fn missing_reviewed_actions<'a>(
                 .map(|action| (Operation::Delete, action)),
         )
         .collect()
+}
+
+/// Counts fresh-scan actions absent from the reviewed plan: work that
+/// appeared in the source after the human (or another surface) reviewed the
+/// plan, e.g. a file copied into the source mid-review. Only ordinary sync
+/// actions count; stray-temp cleanup runs before this reconciliation scan
+/// and is not part of what a reviewer saw.
+fn discovered_after_review(reviewed: &plan::Plan, fresh: &plan::Plan) -> usize {
+    let appeared = |fresh_actions: &[Action], reviewed_actions: &[Action]| {
+        fresh_actions
+            .iter()
+            .filter(|action| !reviewed_actions.contains(action))
+            .count()
+    };
+    appeared(&fresh.copies, &reviewed.copies)
+        + appeared(&fresh.updates, &reviewed.updates)
+        + appeared(&fresh.deletes, &reviewed.deletes)
 }
 
 fn copy_file(
@@ -1597,6 +1619,72 @@ mod tests {
     use super::*;
     use crate::plan::StructuralConflict;
 
+    /// A plan is read-only, per ADR-0010's lifecycle: once Review has
+    /// captured a Folder pair's definition, no later redefinition of that
+    /// pair (through the TUI's own CRUD, another process, or a hand edit)
+    /// may let the stale plan reach a run. `run_reviewed` re-resolves the
+    /// pair at execute time and must refuse rather than execute against the
+    /// old definition.
+    #[test]
+    fn run_reviewed_refuses_a_stale_plan_when_the_pair_definition_changed() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let first_destination = tempfile::tempdir().unwrap();
+        crate::pair::add(
+            &config_path,
+            "photos",
+            source.path(),
+            first_destination.path(),
+            crate::config::Mode::Mirror,
+            false,
+        )
+        .unwrap();
+        let reviewed_pair = crate::config::load(&config_path).unwrap().pairs["photos"].clone();
+
+        // Redefine the pair while a plan reviewed against the first
+        // definition is still held by another surface (e.g. an open TUI
+        // session).
+        let second_destination = tempfile::tempdir().unwrap();
+        crate::pair::add(
+            &config_path,
+            "photos",
+            source.path(),
+            second_destination.path(),
+            crate::config::Mode::Mirror,
+            true,
+        )
+        .unwrap();
+
+        let result = run_reviewed(
+            &config_path,
+            "photos",
+            RunOptions {
+                yes: true,
+                permanent_delete: false,
+                allow_empty_source: false,
+                ignore_space_check: false,
+                json_output: false,
+                full_verify: false,
+                excludes: &[],
+            },
+            reviewed_pair,
+            plan::Plan::default(),
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(AppError::Precondition(message)) if message == "Folder pair changed during TUI review; reopen the TUI before running"
+            ),
+            "{result:?}"
+        );
+        assert!(
+            !second_destination.path().join("_SafetyNet").exists(),
+            "a refused run must not touch the destination"
+        );
+    }
+
     #[test]
     fn temp_suffixes_are_sibling_dot_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -1638,6 +1726,38 @@ mod tests {
         retain_reviewed_actions(&mut fresh, &reviewed);
 
         assert_eq!(fresh.copies, reviewed.copies);
+    }
+
+    #[test]
+    fn discovered_after_review_counts_only_actions_absent_from_the_reviewed_plan() {
+        let reviewed = plan::Plan {
+            copies: vec![Action {
+                rel_path: PathBuf::from("reviewed.txt"),
+                bytes: 1,
+                source_mtime: None,
+                old_bytes: None,
+                reason: "new".to_string(),
+                structural_conflict: None,
+            }],
+            ..plan::Plan::default()
+        };
+        let fresh = plan::Plan {
+            copies: vec![
+                reviewed.copies[0].clone(),
+                Action {
+                    rel_path: PathBuf::from("arrived-during-review.txt"),
+                    bytes: 2,
+                    source_mtime: None,
+                    old_bytes: None,
+                    reason: "new".to_string(),
+                    structural_conflict: None,
+                },
+            ],
+            ..plan::Plan::default()
+        };
+
+        assert_eq!(discovered_after_review(&reviewed, &fresh), 1);
+        assert_eq!(discovered_after_review(&reviewed, &reviewed), 0);
     }
 
     #[test]

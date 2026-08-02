@@ -155,6 +155,7 @@ pub fn summary(context: Context<'_>, stats: &RunStats) -> Value {
         "schema": context.schema, "type": "summary", "run_id": context.run_id,
         "result": if stats.counts.failed == 0 { "success" } else { "partial" },
         "counts": stats.counts, "bytes": stats.bytes, "warnings": stats.warnings,
+        "discovered_after_review": stats.discovered_after_review,
     })
 }
 
