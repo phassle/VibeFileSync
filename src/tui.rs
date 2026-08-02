@@ -144,6 +144,11 @@ enum Operation {
     Delete,
     Cleanup,
     Error,
+    /// Present, identical on both sides — revealed by `u` (ADR-0010 §2).
+    /// Never constructed as a `ReviewRow`, so it never enters `rows`,
+    /// `totals()`, `exclusions()`, or the reviewed subset; it exists only
+    /// as a presentation row built straight from `Plan::unchanged_paths`.
+    Unchanged,
 }
 
 impl Operation {
@@ -154,6 +159,7 @@ impl Operation {
             Self::Delete => "− DELETE",
             Self::Cleanup => "⌫ CLEANUP",
             Self::Error => "! ERROR",
+            Self::Unchanged => "= UNCHANGED",
         }
     }
 
@@ -164,6 +170,7 @@ impl Operation {
             Self::Delete => Color::Magenta,
             Self::Cleanup => Color::Blue,
             Self::Error => Color::Red,
+            Self::Unchanged => Color::DarkGray,
         }
     }
 
@@ -174,27 +181,29 @@ impl Operation {
     /// The direction glyph for the Review table's two-sided row (ADR-0010):
     /// Copy/Update actually move source content toward the destination, so
     /// they share the flow arrow; Delete and Cleanup remove something from
-    /// the destination with no source content moving, and Error moves
-    /// nothing at all — each of those gets a glyph that does not claim a
-    /// flow that isn't happening. Never the only signal for an operation:
-    /// the operation word in its own column always distinguishes it too.
+    /// the destination with no source content moving, Error moves nothing
+    /// at all, and Unchanged is already identical on both sides — each of
+    /// those gets a glyph that does not claim a flow that isn't happening.
+    /// Never the only signal for an operation: the operation word in its
+    /// own column always distinguishes it too.
     fn direction_glyph(self) -> &'static str {
         match self {
             Self::Copy | Self::Update => "→",
             Self::Delete | Self::Cleanup => "✕",
             Self::Error => "!",
+            Self::Unchanged => "=",
         }
     }
 
     /// The two-sided cells for a row's path (ADR-0010, echoing ADR-0010 §3:
-    /// "every copy or delete leaves one side as an em dash"). Update is the
-    /// one operation genuinely present on both sides; every other operation
-    /// only has content on the side it actually affects.
+    /// "every copy or delete leaves one side as an em dash"). Update and
+    /// Unchanged are the operations genuinely present on both sides; every
+    /// other operation only has content on the side it actually affects.
     fn sides(self, path: &str) -> (String, String) {
         const ABSENT: &str = "—";
         match self {
             Self::Copy | Self::Error => (path.to_string(), ABSENT.to_string()),
-            Self::Update => (path.to_string(), path.to_string()),
+            Self::Update | Self::Unchanged => (path.to_string(), path.to_string()),
             Self::Delete | Self::Cleanup => (ABSENT.to_string(), path.to_string()),
         }
     }
@@ -633,6 +642,9 @@ impl ReviewModel {
                 Operation::Delete => totals.deletes += 1,
                 Operation::Cleanup => totals.cleanups += 1,
                 Operation::Error => totals.errors += 1,
+                Operation::Unchanged => {
+                    unreachable!("Unchanged is presentation-only and never a ReviewRow")
+                }
             }
             totals.bytes += row.bytes.unwrap_or(0);
         }
@@ -1415,19 +1427,30 @@ fn draw_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &Revi
     });
 
     let unchanged = model.dry_run.unchanged;
-    let unchanged_row = if model.show_unchanged && unchanged > 0 {
-        Some(Row::new(vec![
+    // Revealed rows come straight from `Plan::unchanged_paths` — the same
+    // source every other row is derived from — never a recomputed diff.
+    // The check column stays blank: unchanged items are not actions, so
+    // they carry no include/exclude mark and never join `model.rows`
+    // (ADR-0010 §2, criterion 6: the reviewed subset only ever comes from
+    // `copies`/`updates`/`deletes`/`errors`).
+    let unchanged_rows = model.dry_run.unchanged_paths.iter().map(|path| {
+        let path = path.to_string_lossy();
+        let (source, destination) = Operation::Unchanged.sides(&path);
+        Row::new(vec![
             Cell::from(""),
-            Cell::from("UNCHANGED").style(Style::default().add_modifier(Modifier::DIM)),
-            Cell::from(format!("{unchanged} file(s)")),
-            Cell::from(""),
-            Cell::from(""),
+            Cell::from(Operation::Unchanged.label())
+                .style(Style::default().fg(Operation::Unchanged.color())),
+            Cell::from(source),
+            Cell::from(Operation::Unchanged.direction_glyph()),
+            Cell::from(destination),
             Cell::from("identical on both sides"),
-        ]))
+        ])
+    });
+    let rows: Vec<Row<'_>> = if model.show_unchanged {
+        rows.chain(unchanged_rows).collect()
     } else {
-        None
+        rows.collect()
     };
-    let rows: Vec<Row<'_>> = rows.chain(unchanged_row).collect();
 
     let reveal_hint = if unchanged == 0 {
         String::new()
@@ -1446,7 +1469,7 @@ fn draw_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &Revi
         rows,
         [
             Constraint::Length(3),
-            Constraint::Length(10),
+            Constraint::Length(11),
             Constraint::Min(12),
             Constraint::Length(3),
             Constraint::Min(12),
@@ -1773,6 +1796,7 @@ mod tests {
             Operation::Delete,
             Operation::Cleanup,
             Operation::Error,
+            Operation::Unchanged,
         ] {
             assert!(operation.label().chars().any(|c| c.is_ascii_alphabetic()));
         }
@@ -1782,11 +1806,12 @@ mod tests {
             Operation::Delete,
             Operation::Cleanup,
             Operation::Error,
+            Operation::Unchanged,
         ]
         .iter()
         .map(|op| op.label())
         .collect();
-        assert_eq!(labels.len(), 5, "operation words must all be distinct");
+        assert_eq!(labels.len(), 6, "operation words must all be distinct");
     }
 
     #[test]
@@ -1809,9 +1834,14 @@ mod tests {
     }
 
     #[test]
-    fn u_reveals_the_unchanged_count_as_a_row_and_toggles_back() {
+    fn u_reveals_each_unchanged_item_as_its_own_row_and_toggles_back() {
         let mut dry_run = plan::Plan {
             copies: vec![action("new.txt", 5, "new")],
+            unchanged_paths: vec![
+                PathBuf::from("alpha.txt"),
+                PathBuf::from("beta.txt"),
+                PathBuf::from("gamma.txt"),
+            ],
             ..plan::Plan::default()
         };
         dry_run.unchanged = 3;
@@ -1823,8 +1853,13 @@ mod tests {
 
         let screen = buffer_text(&terminal);
         assert!(screen.contains("3 unchanged shown"), "{screen}");
-        assert!(screen.contains("3 file(s)"), "{screen}");
+        // Each unchanged item is its own row — not one aggregate summary.
+        assert!(screen.contains("alpha.txt"), "{screen}");
+        assert!(screen.contains("beta.txt"), "{screen}");
+        assert!(screen.contains("gamma.txt"), "{screen}");
+        assert!(!screen.contains("3 file(s)"), "{screen}");
         assert!(screen.contains("identical on both sides"), "{screen}");
+        assert!(screen.contains("UNCHANGED"), "{screen}");
 
         model.toggle_unchanged();
         terminal
@@ -1833,6 +1868,7 @@ mod tests {
         let screen = buffer_text(&terminal);
         assert!(screen.contains("3 unchanged hidden"), "{screen}");
         assert!(!screen.contains("identical on both sides"), "{screen}");
+        assert!(!screen.contains("alpha.txt"), "{screen}");
     }
 
     #[test]
