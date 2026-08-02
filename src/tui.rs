@@ -802,9 +802,11 @@ mod tests {
         config::Pair {
             source: PathBuf::from("/source"),
             source_volume_uuid: "source-uuid".to_string(),
+            source_volume_name: None,
             source_volume_relative_path: None,
             destination: PathBuf::from("/Volumes/Backup/Photos"),
             destination_volume_uuid: "destination-uuid".to_string(),
+            destination_volume_name: None,
             destination_volume_relative_path: None,
             mode,
         }

@@ -325,6 +325,118 @@ fn pair_add_pins_both_volume_uuids_into_the_config_file() {
 }
 
 #[test]
+fn pair_add_writes_cosmetic_volume_names_into_the_config_file() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let contents = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(
+        contents.contains("source_volume_name"),
+        "config should record a cosmetic source volume name: {contents}"
+    );
+    assert!(
+        contents.contains("destination_volume_name"),
+        "config should record a cosmetic destination volume name: {contents}"
+    );
+}
+
+#[test]
+fn pair_list_without_check_does_no_volume_io_and_is_byte_identical_to_plain_list() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let baseline = fx.cmd().args(["pair", "list"]).output().unwrap();
+    let repeated = fx.cmd().args(["pair", "list"]).output().unwrap();
+    assert_eq!(baseline.stdout, repeated.stdout);
+
+    let baseline_json = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    let repeated_json = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    assert_eq!(baseline_json.stdout, repeated_json.stdout);
+    let value: serde_json::Value = serde_json::from_slice(&baseline_json.stdout).unwrap();
+    assert!(value["pairs"][0].get("status").is_none());
+}
+
+#[test]
+fn pair_list_check_reports_ready_state_for_both_sides_in_json() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"][0]["status"]["source"]["state"], "ready");
+    assert_eq!(value["pairs"][0]["status"]["destination"]["state"], "ready");
+    assert!(value["pairs"][0]["status"]["source"]["volume"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn pair_list_check_reports_state_in_the_human_table() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx.cmd().args(["pair", "list", "--check"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("STATUS"), "{stdout}");
+    assert!(stdout.contains("source"), "{stdout}");
+    assert!(stdout.contains("ready"), "{stdout}");
+}
+
+#[test]
+fn pair_list_check_reports_volume_absent_for_an_unmounted_uuid() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let path = config_file(fx.xdg.path());
+    let contents = fs::read_to_string(&path).unwrap();
+    let rewritten = contents
+        .replacen(
+            "destination_volume_uuid = \"",
+            "destination_volume_uuid = \"00000000-0000-0000-0000-000000000000#",
+            1,
+        )
+        .replacen(
+            &format!("destination = \"{}\"", fx.destination.path().display()),
+            "destination = \"/no/such/path/vibesync-volume-absent-test\"",
+            1,
+        );
+    fs::write(&path, rewritten).unwrap();
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["pairs"][0]["status"]["destination"]["state"],
+        "volume_absent"
+    );
+}
+
+#[test]
+fn pair_list_check_matching_nothing_is_still_an_empty_list_exit_0() {
+    let fx = Fixture::new();
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn config_rewrite_is_atomic_no_stray_temp_files_survive() {
     let fx = Fixture::new();
     fx.add_photos_pair();
