@@ -698,6 +698,54 @@ fn relocated_json_plan_reports_notice_on_stderr_and_keeps_stdout_ndjson_only() {
 }
 
 #[test]
+fn run_against_a_relocated_volume_records_the_path_it_actually_used() {
+    let fx = Fixture::new();
+    let source = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    fs::write(source.path().join("photo.txt"), "photo").unwrap();
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            source.path().to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+    let path = config_file(fx.xdg.path());
+    let original = source.path().display().to_string();
+    let stale = "/Volumes/VibeFileSync-Stale/Photos";
+    let config = fs::read_to_string(&path).unwrap().replace(
+        &format!("source = \"{original}\""),
+        &format!("source = \"{stale}\""),
+    );
+    fs::write(&path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(stale), "{stderr}");
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(rows.first().unwrap()["type"], "run_start");
+    let recorded_source = rows[0]["source"].as_str().unwrap();
+    assert!(recorded_source.ends_with(&original), "{recorded_source}");
+    assert_ne!(recorded_source, stale);
+}
+
+#[test]
 fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
     let orphaned_replacement = Fixture::new();
     orphaned_replacement.write_source("docs/new.txt", "new");
@@ -1178,6 +1226,14 @@ fn run_json_stream_reports_execution_order_verification_and_safetynet() {
     assert_eq!(rows.first().unwrap()["type"], "run_start");
     assert_eq!(rows.last().unwrap()["type"], "summary");
     assert!(rows[0]["degradations"].is_array());
+    assert_eq!(
+        rows[0]["source"],
+        fx.source.path().to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        rows[0]["destination"],
+        fx.destination.path().to_string_lossy().into_owned()
+    );
     let planned = rows[0]["planned_actions"]
         .as_array()
         .expect("run_start declares the reviewed action set");

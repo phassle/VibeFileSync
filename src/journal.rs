@@ -81,6 +81,8 @@ impl Journal {
     pub fn run_start(
         &mut self,
         pair_name: &str,
+        source: &Path,
+        destination: &Path,
         plan: &Plan,
         run_warnings: &[String],
         degradations: &[&str],
@@ -92,6 +94,8 @@ impl Journal {
                 run_id: &self.run_id,
             },
             pair_name,
+            source,
+            destination,
             run_warnings,
             degradations,
         );
