@@ -180,7 +180,10 @@ fn header(frame: &mut Frame, area: Rect, title: &str, subtitle: &str) {
 }
 
 fn footer(frame: &mut Frame, area: Rect, app: &App, keys: &str) {
-    let status = if app.blocked() {
+    // Screens with no plan behind them get keys only — no action count, no gate.
+    let status = if !matches!(app.screen, 1..=3) {
+        Line::from("")
+    } else if app.blocked() {
         Line::from(Span::styled(
             " ! an included ERROR row blocks the Run — exclude it or fix the source ",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
