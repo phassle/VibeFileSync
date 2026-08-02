@@ -144,6 +144,11 @@ enum Operation {
     Delete,
     Cleanup,
     Error,
+    /// Present, identical on both sides — revealed by `u` (ADR-0010 §2).
+    /// Never constructed as a `ReviewRow`, so it never enters `rows`,
+    /// `totals()`, `exclusions()`, or the reviewed subset; it exists only
+    /// as a presentation row built straight from `Plan::unchanged_paths`.
+    Unchanged,
 }
 
 impl Operation {
@@ -154,6 +159,7 @@ impl Operation {
             Self::Delete => "− DELETE",
             Self::Cleanup => "⌫ CLEANUP",
             Self::Error => "! ERROR",
+            Self::Unchanged => "= UNCHANGED",
         }
     }
 
@@ -164,11 +170,42 @@ impl Operation {
             Self::Delete => Color::Magenta,
             Self::Cleanup => Color::Blue,
             Self::Error => Color::Red,
+            Self::Unchanged => Color::DarkGray,
         }
     }
 
     fn uses_safety_net(self) -> bool {
         matches!(self, Self::Update | Self::Delete)
+    }
+
+    /// The direction glyph for the Review table's two-sided row (ADR-0010):
+    /// Copy/Update actually move source content toward the destination, so
+    /// they share the flow arrow; Delete and Cleanup remove something from
+    /// the destination with no source content moving, Error moves nothing
+    /// at all, and Unchanged is already identical on both sides — each of
+    /// those gets a glyph that does not claim a flow that isn't happening.
+    /// Never the only signal for an operation: the operation word in its
+    /// own column always distinguishes it too.
+    fn direction_glyph(self) -> &'static str {
+        match self {
+            Self::Copy | Self::Update => "→",
+            Self::Delete | Self::Cleanup => "✕",
+            Self::Error => "!",
+            Self::Unchanged => "=",
+        }
+    }
+
+    /// The two-sided cells for a row's path (ADR-0010, echoing ADR-0010 §3:
+    /// "every copy or delete leaves one side as an em dash"). Update and
+    /// Unchanged are the operations genuinely present on both sides; every
+    /// other operation only has content on the side it actually affects.
+    fn sides(self, path: &str) -> (String, String) {
+        const ABSENT: &str = "—";
+        match self {
+            Self::Copy | Self::Error => (path.to_string(), ABSENT.to_string()),
+            Self::Update | Self::Unchanged => (path.to_string(), path.to_string()),
+            Self::Delete | Self::Cleanup => (ABSENT.to_string(), path.to_string()),
+        }
     }
 }
 
@@ -202,6 +239,12 @@ struct ReviewModel {
     /// interface instead of printed to the plain terminal. Empty unless
     /// Compare set them.
     notices: Vec<String>,
+    /// Whether the unchanged-file count (ADR-0010) is expanded into a
+    /// visible summary row. Starts hidden every time Review is entered, so
+    /// the table opens on what will happen, not on the unchanged majority;
+    /// this is presentation state only and is never part of the reviewed
+    /// action subset the engine receives.
+    show_unchanged: bool,
 }
 
 #[derive(Default)]
@@ -582,6 +625,7 @@ impl ReviewModel {
             message: None,
             dry_run,
             notices: Vec::new(),
+            show_unchanged: false,
         }
     }
 
@@ -598,6 +642,9 @@ impl ReviewModel {
                 Operation::Delete => totals.deletes += 1,
                 Operation::Cleanup => totals.cleanups += 1,
                 Operation::Error => totals.errors += 1,
+                Operation::Unchanged => {
+                    unreachable!("Unchanged is presentation-only and never a ReviewRow")
+                }
             }
             totals.bytes += row.bytes.unwrap_or(0);
         }
@@ -706,6 +753,10 @@ impl ReviewModel {
                 row.included = false;
             }
         }
+    }
+
+    fn toggle_unchanged(&mut self) {
+        self.show_unchanged = !self.show_unchanged;
     }
 }
 
@@ -1106,6 +1157,7 @@ fn review_loop<B: Backend, E: Events>(
                 KeyCode::Up | KeyCode::Char('k') => model.move_up(),
                 KeyCode::Down | KeyCode::Char('j') => model.move_down(),
                 KeyCode::Char(' ') => model.toggle(),
+                KeyCode::Char('u') | KeyCode::Char('U') => model.toggle_unchanged(),
                 KeyCode::Enter => {
                     model.screen = Screen::Confirm;
                     model.message = None;
@@ -1281,7 +1333,7 @@ fn draw_review(frame: &mut Frame<'_>, model: &ReviewModel, header_mode: HeaderMo
     }
     let help = match model.screen {
         Screen::Actions => {
-            "↑/↓ or j/k move · Space include/exclude · Enter review confirmation · q cancel"
+            "↑/↓ or j/k move · Space include/exclude · u unchanged · Enter review confirmation · q cancel"
         }
         Screen::Confirm => "y confirm and run · b/n/Esc return to actions · q cancel",
     };
@@ -1348,29 +1400,67 @@ fn gradient_mark(mark: [&'static str; 3]) -> Vec<Span<'static>> {
     .collect()
 }
 
+/// The Review stage's two-sided action table (ADR-0010, superseding
+/// ADR-0003 §3): one row per planned action, columns in priority order —
+/// include mark, operation name, source, direction glyph, destination,
+/// reason. The row model is presentation derived from the `Plan` the engine
+/// already produced; nothing here recomputes a diff.
 fn draw_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &ReviewModel) {
     let rows = model.rows.iter().map(|row| {
         let check = if row.included { "[x]" } else { "[ ]" };
-        let size = row
-            .bytes
-            .map(plan::human_size)
-            .unwrap_or_else(|| "—".to_string());
-        let safety_net = if row.operation.uses_safety_net() {
-            plan::SAFETYNET_NOTE
-        } else {
-            ""
-        };
+        let (source, destination) = row.operation.sides(&row.path);
+        let mut reason = row.detail.clone();
+        if let Some(bytes) = row.bytes {
+            reason = format!("{reason} · {}", plan::human_size(bytes));
+        }
+        if row.operation.uses_safety_net() {
+            reason = format!("{reason} · {}", plan::SAFETYNET_NOTE);
+        }
         Row::new(vec![
             Cell::from(check),
             Cell::from(row.operation.label()).style(Style::default().fg(row.operation.color())),
-            Cell::from(row.path.clone()),
-            Cell::from(size),
-            Cell::from(safety_net),
-            Cell::from(row.detail.clone()),
+            Cell::from(source),
+            Cell::from(row.operation.direction_glyph()),
+            Cell::from(destination),
+            Cell::from(reason),
         ])
     });
+
+    let unchanged = model.dry_run.unchanged;
+    // Revealed rows come straight from `Plan::unchanged_paths` — the same
+    // source every other row is derived from — never a recomputed diff.
+    // The check column stays blank: unchanged items are not actions, so
+    // they carry no include/exclude mark and never join `model.rows`
+    // (ADR-0010 §2, criterion 6: the reviewed subset only ever comes from
+    // `copies`/`updates`/`deletes`/`errors`).
+    let unchanged_rows = model.dry_run.unchanged_paths.iter().map(|path| {
+        let path = path.to_string_lossy();
+        let (source, destination) = Operation::Unchanged.sides(&path);
+        Row::new(vec![
+            Cell::from(""),
+            Cell::from(Operation::Unchanged.label())
+                .style(Style::default().fg(Operation::Unchanged.color())),
+            Cell::from(source),
+            Cell::from(Operation::Unchanged.direction_glyph()),
+            Cell::from(destination),
+            Cell::from("identical on both sides"),
+        ])
+    });
+    let rows: Vec<Row<'_>> = if model.show_unchanged {
+        rows.chain(unchanged_rows).collect()
+    } else {
+        rows.collect()
+    };
+
+    let reveal_hint = if unchanged == 0 {
+        String::new()
+    } else if model.show_unchanged {
+        format!(", {unchanged} unchanged shown (u to hide)")
+    } else {
+        format!(", {unchanged} unchanged hidden (u to show)")
+    };
     let title = format!(
-        " {} ({}) — {} action(s) ",
+        " {} ({}) — {} action(s){reveal_hint} ",
         model.pair_name,
         model.mode,
         model.rows.len()
@@ -1379,15 +1469,15 @@ fn draw_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &Revi
         rows,
         [
             Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Min(18),
-            Constraint::Length(9),
-            Constraint::Length(27),
+            Constraint::Length(11),
             Constraint::Min(12),
+            Constraint::Length(3),
+            Constraint::Min(12),
+            Constraint::Fill(2),
         ],
     )
     .header(
-        Row::new(["", "Operation", "Path", "Size", "SafetyNet", "Reason"])
+        Row::new(["", "Operation", "Source", "", "Destination", "Reason"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::ALL).title(title))
@@ -1657,6 +1747,145 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}: {screen}");
         }
+    }
+
+    #[test]
+    fn every_row_shows_both_sides_with_a_direction_glyph_and_an_em_dash_for_the_absent_side() {
+        let mut deletion = action("changed.txt", 0, "old version");
+        deletion.structural_conflict = None;
+        let dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "new")],
+            updates: vec![action("changed.txt", 7, "size changed")],
+            deletes: vec![action("gone.txt", 3, "not in source")],
+            strays: vec![PathBuf::from(".old.vibesync-tmp-run")],
+            errors: vec![plan::PlanError {
+                rel_path: PathBuf::from("link"),
+                message: "symlink not supported".to_string(),
+            }],
+            ..plan::Plan::default()
+        };
+        let model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+
+        // ADR-0010 §3: "every copy or delete leaves one side as an em dash".
+        // Copy and Error show source only; Delete and Cleanup show
+        // destination only; Update is the one operation shown on both sides.
+        assert!(screen.contains("new.txt"), "{screen}");
+        assert!(screen.contains("gone.txt"), "{screen}");
+        assert!(screen.contains(".old.vibesync-tmp-run"), "{screen}");
+        assert!(screen.contains("link"), "{screen}");
+        assert!(screen.contains("changed.txt"), "{screen}");
+        assert!(screen.contains('—'), "no em dash rendered: {screen}");
+        assert!(screen.contains('→'), "no flow glyph rendered: {screen}");
+        assert!(screen.contains('✕'), "no removal glyph rendered: {screen}");
+    }
+
+    #[test]
+    fn every_operation_is_distinguishable_by_word_alone() {
+        // Criterion 5: every operation must stay distinguishable with
+        // colour disabled — verified here by asserting on the rendered
+        // text only, never on any `Style`/`Color` field.
+        for operation in [
+            Operation::Copy,
+            Operation::Update,
+            Operation::Delete,
+            Operation::Cleanup,
+            Operation::Error,
+            Operation::Unchanged,
+        ] {
+            assert!(operation.label().chars().any(|c| c.is_ascii_alphabetic()));
+        }
+        let labels: std::collections::HashSet<&str> = [
+            Operation::Copy,
+            Operation::Update,
+            Operation::Delete,
+            Operation::Cleanup,
+            Operation::Error,
+            Operation::Unchanged,
+        ]
+        .iter()
+        .map(|op| op.label())
+        .collect();
+        assert_eq!(labels.len(), 6, "operation words must all be distinct");
+    }
+
+    #[test]
+    fn unchanged_rows_are_hidden_by_default_with_their_count_visible_in_the_title() {
+        let mut dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "new")],
+            ..plan::Plan::default()
+        };
+        dry_run.unchanged = 42;
+        let model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("42 unchanged hidden"), "{screen}");
+        assert!(!screen.contains("identical on both sides"), "{screen}");
+    }
+
+    #[test]
+    fn u_reveals_each_unchanged_item_as_its_own_row_and_toggles_back() {
+        let mut dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "new")],
+            unchanged_paths: vec![
+                PathBuf::from("alpha.txt"),
+                PathBuf::from("beta.txt"),
+                PathBuf::from("gamma.txt"),
+            ],
+            ..plan::Plan::default()
+        };
+        dry_run.unchanged = 3;
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Char('u'), KeyCode::Char('q')]);
+
+        review_loop(&mut terminal, &mut events, &mut model, HeaderMode::Full).unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("3 unchanged shown"), "{screen}");
+        // Each unchanged item is its own row — not one aggregate summary.
+        assert!(screen.contains("alpha.txt"), "{screen}");
+        assert!(screen.contains("beta.txt"), "{screen}");
+        assert!(screen.contains("gamma.txt"), "{screen}");
+        assert!(!screen.contains("3 file(s)"), "{screen}");
+        assert!(screen.contains("identical on both sides"), "{screen}");
+        assert!(screen.contains("UNCHANGED"), "{screen}");
+
+        model.toggle_unchanged();
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("3 unchanged hidden"), "{screen}");
+        assert!(!screen.contains("identical on both sides"), "{screen}");
+        assert!(!screen.contains("alpha.txt"), "{screen}");
+    }
+
+    #[test]
+    fn toggling_unchanged_never_changes_the_reviewed_action_subset() {
+        let mut dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "new")],
+            ..plan::Plan::default()
+        };
+        dry_run.unchanged = 3;
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+
+        model.toggle_unchanged();
+        let exclusions = model.exclusions();
+        let reviewed = model.reviewed_plan(&exclusions);
+
+        assert_eq!(reviewed.copies.len(), 1);
+        assert!(exclusions.is_empty());
     }
 
     #[test]
