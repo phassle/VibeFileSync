@@ -701,6 +701,7 @@ fn relocated_json_plan_reports_notice_on_stderr_and_keeps_stdout_ndjson_only() {
 fn run_against_a_relocated_volume_records_the_path_it_actually_used() {
     let fx = Fixture::new();
     let source = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let destination = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
     fs::write(source.path().join("photo.txt"), "photo").unwrap();
     fx.cmd()
         .args([
@@ -710,19 +711,27 @@ fn run_against_a_relocated_volume_records_the_path_it_actually_used() {
             "--source",
             source.path().to_str().unwrap(),
             "--destination",
-            fx.destination.path().to_str().unwrap(),
+            destination.path().to_str().unwrap(),
             "--mode",
             "mirror",
         ])
         .assert()
         .success();
     let path = config_file(fx.xdg.path());
-    let original = source.path().display().to_string();
-    let stale = "/Volumes/VibeFileSync-Stale/Photos";
-    let config = fs::read_to_string(&path).unwrap().replace(
-        &format!("source = \"{original}\""),
-        &format!("source = \"{stale}\""),
-    );
+    let original_source = source.path().display().to_string();
+    let original_destination = destination.path().display().to_string();
+    let stale_source = "/Volumes/VibeFileSync-Stale/Photos";
+    let stale_destination = "/Volumes/VibeFileSync-Stale/PhotosBackup";
+    let config = fs::read_to_string(&path)
+        .unwrap()
+        .replace(
+            &format!("source = \"{original_source}\""),
+            &format!("source = \"{stale_source}\""),
+        )
+        .replace(
+            &format!("destination = \"{original_destination}\""),
+            &format!("destination = \"{stale_destination}\""),
+        );
     fs::write(&path, config).unwrap();
 
     let output = fx
@@ -733,7 +742,8 @@ fn run_against_a_relocated_volume_records_the_path_it_actually_used() {
 
     assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains(stale), "{stderr}");
+    assert!(stderr.contains(stale_source), "{stderr}");
+    assert!(stderr.contains(stale_destination), "{stderr}");
     let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -741,8 +751,17 @@ fn run_against_a_relocated_volume_records_the_path_it_actually_used() {
         .collect();
     assert_eq!(rows.first().unwrap()["type"], "run_start");
     let recorded_source = rows[0]["source"].as_str().unwrap();
-    assert!(recorded_source.ends_with(&original), "{recorded_source}");
-    assert_ne!(recorded_source, stale);
+    assert!(
+        recorded_source.ends_with(&original_source),
+        "{recorded_source}"
+    );
+    assert_ne!(recorded_source, stale_source);
+    let recorded_destination = rows[0]["destination"].as_str().unwrap();
+    assert!(
+        recorded_destination.ends_with(&original_destination),
+        "{recorded_destination}"
+    );
+    assert_ne!(recorded_destination, stale_destination);
 }
 
 #[test]
