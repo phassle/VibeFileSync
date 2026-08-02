@@ -114,6 +114,45 @@ pub fn add(
     Ok(())
 }
 
+/// Names of the Folder pairs whose *source* is `target`, decided by macOS
+/// directory identity (device and inode) rather than path text — so a
+/// different case, a symlink, or a volume remounted elsewhere still
+/// matches. Matching is source-side only: a pair's destination, and any
+/// path inside a pair's source, never match.
+///
+/// `target` is by definition on a mounted volume (the caller passed a real
+/// filesystem path), so the candidate's expected source directory is
+/// derived from `target`'s own mount plus the candidate's recorded
+/// volume-relative path — no volume enumeration, and a candidate that
+/// cannot be resolved this way (no relative path recorded, or its expected
+/// directory doesn't exist) is skipped rather than raised.
+fn matching_source_names(cfg: &Config, target: &Path) -> Result<Vec<String>, AppError> {
+    let target_identity = volume::directory_identity(target)
+        .map_err(|e| AppError::Usage(format!("{}: not a directory ({e})", target.display())))?;
+    let target_uuid = volume::volume_uuid(target).map_err(|e| {
+        AppError::Precondition(format!(
+            "could not read volume UUID for {}: {e}",
+            target.display()
+        ))
+    })?;
+    let target_mount =
+        volume::mount_point_for_path(target).map_err(|e| AppError::Precondition(e.to_string()))?;
+
+    Ok(cfg
+        .pairs
+        .iter()
+        .filter_map(|(name, pair)| {
+            if pair.source_volume_uuid != target_uuid {
+                return None;
+            }
+            let relative = pair.source_volume_relative_path.as_deref()?;
+            let candidate = target_mount.join(relative);
+            let candidate_identity = volume::directory_identity(&candidate).ok()?;
+            (candidate_identity == target_identity).then(|| name.clone())
+        })
+        .collect())
+}
+
 pub fn remove(config_path: &Path, name: &str) -> Result<(), AppError> {
     let mut cfg = config::load(config_path)?;
     if cfg.pairs.remove(name).is_none() {
@@ -155,13 +194,21 @@ struct PairsListJson<'a> {
     pairs: Vec<PairJson<'a>>,
 }
 
-pub fn list_json(config_path: &Path, check: bool) -> Result<String, AppError> {
+pub fn list_json(
+    config_path: &Path,
+    check: bool,
+    source: Option<&Path>,
+) -> Result<String, AppError> {
     let cfg = config::load(config_path)?;
+    let matching = source
+        .map(|target| matching_source_names(&cfg, target))
+        .transpose()?;
     let payload = PairsListJson {
         schema: PAIRS_SCHEMA,
         pairs: cfg
             .pairs
             .iter()
+            .filter(|(name, _)| matching.as_ref().is_none_or(|m| m.contains(name)))
             .map(|(name, pair)| PairJson {
                 name,
                 source: &pair.source,
@@ -219,9 +266,16 @@ fn state_name_and_location(state: &VolumeState) -> (&'static str, Option<&Path>)
     }
 }
 
-pub fn list_table(config_path: &Path, check: bool) -> Result<String, AppError> {
+pub fn list_table(
+    config_path: &Path,
+    check: bool,
+    source: Option<&Path>,
+) -> Result<String, AppError> {
     let cfg = config::load(config_path)?;
-    Ok(render_table(&cfg, check))
+    let matching = source
+        .map(|target| matching_source_names(&cfg, target))
+        .transpose()?;
+    Ok(render_table(&cfg, check, matching.as_deref()))
 }
 
 /// Cosmetic label for a Folder pair's side: the recorded volume name if
@@ -251,12 +305,22 @@ fn strip_suffix_components(path: &Path, suffix: &Path) -> Option<PathBuf> {
     )
 }
 
-fn render_table(cfg: &Config, check: bool) -> String {
-    if cfg.pairs.is_empty() {
-        return "No Folder pairs configured. Add one with `vibesync pair add`.\n".to_string();
+fn render_table(cfg: &Config, check: bool, matching: Option<&[String]>) -> String {
+    let pairs: Vec<(&String, &Pair)> = cfg
+        .pairs
+        .iter()
+        .filter(|(name, _)| matching.is_none_or(|m| m.iter().any(|n| n == *name)))
+        .collect();
+
+    if pairs.is_empty() {
+        return if matching.is_some() {
+            "No Folder pairs match that source.\n".to_string()
+        } else {
+            "No Folder pairs configured. Add one with `vibesync pair add`.\n".to_string()
+        };
     }
 
-    let name_width = cfg.pairs.keys().map(|n| n.len()).max().unwrap_or(4).max(4);
+    let name_width = pairs.iter().map(|(n, _)| n.len()).max().unwrap_or(4).max(4);
     let mode_width = 6usize; // "mirror" / "update"
 
     let mut out = String::new();
@@ -273,7 +337,7 @@ fn render_table(cfg: &Config, check: bool) -> String {
         out.push_str("  STATUS");
     }
     out.push('\n');
-    for (name, pair) in &cfg.pairs {
+    for (name, pair) in pairs {
         out.push_str(&format!(
             "{:<name_width$}  {:<mode_width$}  {:<40}  {}",
             name,
@@ -335,7 +399,7 @@ mod tests {
     #[test]
     fn empty_config_renders_a_friendly_table() {
         let cfg = Config::default();
-        let table = render_table(&cfg, false);
+        let table = render_table(&cfg, false, None);
         assert!(table.contains("No Folder pairs configured"));
     }
 
@@ -365,6 +429,82 @@ mod tests {
             volume_label(None, Path::new("/Volumes/Backup/Photos"), None),
             "/Volumes/Backup/Photos"
         );
+    }
+
+    fn config_with_one_pair() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let config_dir = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        add(
+            &config_path,
+            "photos",
+            source.path(),
+            destination.path(),
+            Mode::Mirror,
+        )
+        .unwrap();
+        (config_dir, source, destination, config_path)
+    }
+
+    #[test]
+    fn matching_source_names_finds_the_pair_whose_source_it_is() {
+        let (_config_dir, source, _destination, config_path) = config_with_one_pair();
+        let cfg = config::load(&config_path).unwrap();
+
+        let matches = matching_source_names(&cfg, source.path()).unwrap();
+
+        assert_eq!(matches, vec!["photos".to_string()]);
+    }
+
+    #[test]
+    fn matching_source_names_ignores_a_symlink_to_the_source() {
+        let (config_dir, source, _destination, config_path) = config_with_one_pair();
+        let cfg = config::load(&config_path).unwrap();
+        let alias = config_dir.path().join("alias-to-source");
+        std::os::unix::fs::symlink(source.path(), &alias).unwrap();
+
+        let matches = matching_source_names(&cfg, &alias).unwrap();
+
+        assert_eq!(matches, vec!["photos".to_string()]);
+    }
+
+    #[test]
+    fn matching_source_names_excludes_the_destination() {
+        let (_config_dir, _source, destination, config_path) = config_with_one_pair();
+        let cfg = config::load(&config_path).unwrap();
+
+        let matches = matching_source_names(&cfg, destination.path()).unwrap();
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn matching_source_names_excludes_a_path_inside_the_source() {
+        let (_config_dir, source, _destination, config_path) = config_with_one_pair();
+        let cfg = config::load(&config_path).unwrap();
+        let inner = source.path().join("child");
+        std::fs::create_dir(&inner).unwrap();
+
+        let matches = matching_source_names(&cfg, &inner).unwrap();
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn matching_source_names_is_empty_when_nothing_matches() {
+        let (_config_dir, _source, _destination, config_path) = config_with_one_pair();
+        let cfg = config::load(&config_path).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        let matches = matching_source_names(&cfg, elsewhere.path()).unwrap();
+
+        assert!(matches.is_empty());
     }
 
     #[test]
