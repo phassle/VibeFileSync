@@ -2,6 +2,7 @@
 //! by `plan` and `run`; this module only selects a Folder pair and produces
 //! the exact reviewed action subset handed to the ordinary Run engine.
 
+use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Stdout};
 use std::path::{Path, PathBuf};
@@ -725,27 +726,145 @@ impl ReviewRow {
 pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppError> {
     ensure_interactive()?;
     let cfg = config::load(config_path)?;
-    let choices = pair_choices(&cfg);
-    let pair_name = match requested_pair {
-        Some(name) => {
-            if !cfg.pairs.contains_key(name) {
-                return Err(AppError::Usage(format!("pair '{name}' not found")));
-            }
-            name.to_string()
-        }
-        None if choices.is_empty() => {
-            return Err(AppError::Usage(
-                "no Folder pairs configured; use `vibesync pair add` first".to_string(),
-            ));
-        }
-        None if choices.len() == 1 => choices[0].name.clone(),
-        None => match select_pair(&choices)? {
-            Some(name) => name,
-            None => return Ok(EXIT_OK),
-        },
-    };
 
-    run_pair_flow(config_path, &pair_name)
+    // With a pair named on the command line the working directory is never
+    // consulted, so the same invocation behaves identically wherever it is
+    // run.
+    if let Some(name) = requested_pair {
+        if !cfg.pairs.contains_key(name) {
+            return Err(AppError::Usage(format!("pair '{name}' not found")));
+        }
+        return run_pair_flow(config_path, name, None);
+    }
+
+    let choices = pair_choices(&cfg);
+    let (seed_dir, seed_notice) = seed_directory();
+    // Resolution errors on the seed directory itself (e.g. it sits on a
+    // volume whose UUID cannot be read) are skipped, not raised: startup
+    // must never abort just because the working directory can't be matched.
+    let matches = pair::matching_source_names(&cfg, &seed_dir).unwrap_or_default();
+
+    match matches.len() {
+        0 if choices.is_empty() => show_seeded_pane(&seed_dir, seed_notice.as_deref()),
+        0 => match select_pair(&choices, &[])? {
+            Some(name) => run_pair_flow(config_path, &name, seed_notice),
+            None => Ok(EXIT_OK),
+        },
+        1 => {
+            let name = matches[0].clone();
+            let match_notice = format!(
+                "Preselected '{name}': its Folder pair source matches this working directory ({}).",
+                seed_dir.display()
+            );
+            let notice = match seed_notice {
+                Some(seed_notice) => format!("{seed_notice} {match_notice}"),
+                None => match_notice,
+            };
+            run_pair_flow(config_path, &name, Some(notice))
+        }
+        _ => match select_pair(&choices, &matches)? {
+            Some(name) => run_pair_flow(config_path, &name, seed_notice),
+            None => Ok(EXIT_OK),
+        },
+    }
+}
+
+/// The directory startup seeds the source pane from: the process's working
+/// directory, or the user's home (with a disclosed notice) if the working
+/// directory was deleted out from under the process or is unreadable.
+/// Startup performs no destination-side I/O here and writes nothing.
+fn seed_directory() -> (PathBuf, Option<String>) {
+    match env::current_dir() {
+        Ok(dir) if fs::metadata(&dir).is_ok() => (dir, None),
+        _ => (
+            home_directory(),
+            Some(
+                "The working directory is missing or unreadable; started from your home folder instead."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+fn home_directory() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Shown when no Folder pair is configured at all: the first-use state, not
+/// an abort. Discloses the seeded source directory and how to configure a
+/// pair from it; performs no scan and saves nothing.
+fn show_seeded_pane(seed_dir: &Path, notice: Option<&str>) -> Result<i32, AppError> {
+    let mut session = TerminalSession::start().map_err(tui_error)?;
+    let mut events = CrosstermEvents::default();
+    let header_mode = crate::banner::header_mode();
+    seeded_pane_loop(
+        session.terminal(),
+        &mut events,
+        seed_dir,
+        notice,
+        header_mode,
+    )
+    .map_err(tui_error)?;
+    Ok(EXIT_OK)
+}
+
+fn seeded_pane_loop<B: Backend, E: Events>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    seed_dir: &Path,
+    notice: Option<&str>,
+    header_mode: HeaderMode,
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|frame| draw_seeded_pane(frame, seed_dir, notice, header_mode))?;
+        let Event::Key(key) = events.next()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            return Ok(());
+        }
+    }
+}
+
+fn draw_seeded_pane(
+    frame: &mut Frame<'_>,
+    seed_dir: &Path,
+    notice: Option<&str>,
+    header_mode: HeaderMode,
+) {
+    let [header, body, footer] = vertical_sections(frame.area(), header_mode);
+    draw_header(frame, header, header_mode);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "No Folder pairs configured yet",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Source (from this directory): {}", seed_dir.display())),
+        Line::from(""),
+        Line::from(
+            "Add one with `vibesync pair add <name> --source <dir> --destination <dir> --mode <mirror|update>`.",
+        ),
+    ];
+    if let Some(notice) = notice {
+        lines.push(Line::from(""));
+        lines.push(Line::from(notice.to_string()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Folder pairs "),
+        ),
+        body,
+    );
+    frame.render_widget(Paragraph::new("q quit"), footer);
 }
 
 /// Drives Compare, Review, Confirm, Run and Result for one already-chosen
@@ -753,7 +872,11 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
 /// so Run-precondition warnings, expected degradations and
 /// volume-relocation notices render as interface content instead of
 /// ordinary terminal output.
-fn run_pair_flow(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
+fn run_pair_flow(
+    config_path: &Path,
+    pair_name: &str,
+    startup_notice: Option<String>,
+) -> Result<i32, AppError> {
     let mut session = TerminalSession::start().map_err(tui_error)?;
     let mut events = CrosstermEvents::default();
     let header_mode = crate::banner::header_mode();
@@ -773,6 +896,7 @@ fn run_pair_flow(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
         &mut events,
         pair_name,
         &cfg_pair,
+        startup_notice.as_deref(),
         header_mode,
     )
     .map_err(tui_error)?
@@ -944,6 +1068,7 @@ fn pane_gate<B: Backend, E: Events>(
     events: &mut E,
     pair_name: &str,
     cfg_pair: &config::Pair,
+    startup_notice: Option<&str>,
     header_mode: HeaderMode,
 ) -> io::Result<PaneOutcome> {
     let (mut source_state, mut destination_state) = preconditions::classify_pair(cfg_pair);
@@ -958,8 +1083,11 @@ fn pane_gate<B: Backend, E: Events>(
                 pair_name,
                 &source_view,
                 &destination_view,
-                blocked,
-                message.as_deref(),
+                PanesStatus {
+                    blocked,
+                    message: message.as_deref(),
+                    startup_notice,
+                },
                 header_mode,
             )
         })?;
@@ -993,17 +1121,41 @@ fn pane_gate<B: Backend, E: Events>(
     }
 }
 
+/// Bundles the pane gate's transient state so `draw_panes` stays within
+/// clippy's argument-count lint: `blocked` and `message` are the existing
+/// gate state, `startup_notice` is the persistent working-directory-match
+/// disclosure that survives an `r` refresh.
+struct PanesStatus<'a> {
+    blocked: bool,
+    message: Option<&'a str>,
+    startup_notice: Option<&'a str>,
+}
+
 fn draw_panes(
     frame: &mut Frame<'_>,
     pair_name: &str,
     source: &SideView,
     destination: &SideView,
-    blocked: bool,
-    message: Option<&str>,
+    status: PanesStatus<'_>,
     header_mode: HeaderMode,
 ) {
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
+
+    let body = match status.startup_notice {
+        Some(notice) => {
+            let [notice_area, panes_area] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(5)])
+                .areas(body);
+            frame.render_widget(
+                Paragraph::new(notice.to_string()).wrap(Wrap { trim: false }),
+                notice_area,
+            );
+            panes_area
+        }
+        None => body,
+    };
 
     let [left, right] = Layout::default()
         .direction(Direction::Horizontal)
@@ -1018,12 +1170,12 @@ fn draw_panes(
         destination,
     );
 
-    let base_help = if blocked {
+    let base_help = if status.blocked {
         "BLOCKED: fix the side above, then press r to refresh · q cancel"
     } else {
         "Enter/c compare · r refresh · q cancel"
     };
-    let help = match message {
+    let help = match status.message {
         Some(message) => format!("{message} ({base_help})"),
         None => base_help.to_string(),
     };
@@ -1050,27 +1202,43 @@ fn draw_pane(frame: &mut Frame<'_>, area: ratatui::layout::Rect, title: &str, vi
     );
 }
 
-fn select_pair(choices: &[PairChoice]) -> Result<Option<String>, AppError> {
+/// Opens the pair picker. `matched` names (already ordered by pair name,
+/// per `pair::matching_source_names`' `BTreeMap` iteration) are reordered
+/// ahead of the rest and marked, but nothing is auto-selected — several
+/// working-directory matches are still a choice for the user to make.
+fn select_pair(choices: &[PairChoice], matched: &[String]) -> Result<Option<String>, AppError> {
+    let ordered = order_choices(choices, matched);
     let mut session = TerminalSession::start().map_err(tui_error)?;
     let mut events = CrosstermEvents::default();
     select_pair_loop(
         session.terminal(),
         &mut events,
-        choices,
+        &ordered,
+        matched,
         crate::banner::header_mode(),
     )
     .map_err(tui_error)
+}
+
+/// Matched choices first (sorted by name, since both `choices` and `matched`
+/// already iterate a `BTreeMap` in name order), then the rest, also by name.
+fn order_choices(choices: &[PairChoice], matched: &[String]) -> Vec<PairChoice> {
+    let mut ordered: Vec<PairChoice> = choices.to_vec();
+    ordered.sort_by_key(|choice| (!matched.contains(&choice.name), choice.name.clone()));
+    ordered
 }
 
 fn select_pair_loop<B: Backend, E: Events>(
     terminal: &mut Terminal<B>,
     events: &mut E,
     choices: &[PairChoice],
+    matched: &[String],
     header_mode: HeaderMode,
 ) -> io::Result<Option<String>> {
     let mut selected = 0;
     loop {
-        terminal.draw(|frame| draw_pair_selector(frame, choices, selected, header_mode))?;
+        terminal
+            .draw(|frame| draw_pair_selector(frame, choices, selected, matched, header_mode))?;
         let Event::Key(key) = events.next()? else {
             continue;
         };
@@ -1138,6 +1306,7 @@ fn draw_pair_selector(
     frame: &mut Frame<'_>,
     choices: &[PairChoice],
     selected: usize,
+    matched: &[String],
     header_mode: HeaderMode,
 ) {
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
@@ -1151,14 +1320,28 @@ fn draw_pair_selector(
             let signal = if view.blocked { "BLOCKED" } else { "OK" };
             format!("{signal} · {}", view.state_tag)
         };
-        ListItem::new(vec![
+        // Meaning carried by a word, not colour: "matches this directory"
+        // is spelled out, not merely implied by list position.
+        let name_line = if matched.contains(&choice.name) {
             Line::from(vec![
                 Span::styled(
                     choice.name.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  ({})", choice.pair.mode)),
-            ]),
+                Span::raw("  — matches this directory"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    choice.name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  ({})", choice.pair.mode)),
+            ])
+        };
+        ListItem::new(vec![
+            name_line,
             Line::from(format!(
                 "Source [{}]: {}",
                 tag(&choice.source_view),
@@ -1171,12 +1354,16 @@ fn draw_pair_selector(
             )),
         ])
     });
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Select a Folder pair "),
+    let title = if matched.is_empty() {
+        " Select a Folder pair ".to_string()
+    } else {
+        format!(
+            " Select a Folder pair ({} match this directory) ",
+            matched.len()
         )
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_symbol("▶ ")
         .highlight_style(
             Style::default()
@@ -1755,6 +1942,118 @@ mod tests {
     }
 
     #[test]
+    fn order_choices_puts_matches_first_by_name_then_the_rest_by_name() {
+        let choices = vec![
+            choice("zebra", Mode::Mirror, "/zebra", "/Volumes/Backup/Zebra"),
+            choice("apple", Mode::Mirror, "/apple", "/Volumes/Backup/Apple"),
+            choice("mango", Mode::Mirror, "/mango", "/Volumes/Backup/Mango"),
+        ];
+        let matched = vec!["zebra".to_string(), "mango".to_string()];
+
+        let ordered = order_choices(&choices, &matched);
+
+        let names: Vec<&str> = ordered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["mango", "zebra", "apple"]);
+    }
+
+    #[test]
+    fn pair_selector_marks_matched_choices_and_names_the_count_in_the_title() {
+        let choices = vec![
+            choice(
+                "documents",
+                Mode::Mirror,
+                "/documents",
+                "/Volumes/Backup/Documents",
+            ),
+            choice("photos", Mode::Update, "/photos", "/Volumes/Backup/Photos"),
+        ];
+        let matched = vec!["photos".to_string()];
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_pair_selector(frame, &choices, 0, &matched, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("matches this directory"), "{screen}");
+        assert!(
+            screen.contains("1 match this directory") || screen.contains("(1 match"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn seeded_pane_discloses_the_working_directory_and_how_to_add_a_pair() {
+        let seed_dir = PathBuf::from("/tmp/my-project");
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_seeded_pane(frame, &seed_dir, None, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("No Folder pairs configured yet"),
+            "{screen}"
+        );
+        assert!(screen.contains("/tmp/my-project"), "{screen}");
+        assert!(screen.contains("pair add"), "{screen}");
+    }
+
+    #[test]
+    fn seeded_pane_discloses_a_home_fallback_notice() {
+        let seed_dir = PathBuf::from("/Users/someone");
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_seeded_pane(
+                    frame,
+                    &seed_dir,
+                    Some("The working directory is missing or unreadable; started from your home folder instead."),
+                    HeaderMode::Full,
+                )
+            })
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("started from your home folder instead"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn panes_screen_discloses_a_startup_match_notice() {
+        let cfg_pair = pair(Mode::Mirror);
+        let (source_view, destination_view) =
+            side_views(&cfg_pair, &VolumeState::Ready, &VolumeState::Ready);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_panes(
+                    frame,
+                    "photos",
+                    &source_view,
+                    &destination_view,
+                    PanesStatus {
+                        blocked: false,
+                        message: None,
+                        startup_notice: Some(
+                            "Preselected 'photos': its Folder pair source matches this working directory.",
+                        ),
+                    },
+                    HeaderMode::Full,
+                )
+            })
+            .unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Preselected 'photos'"), "{screen}");
+    }
+
+    #[test]
     fn pair_selector_uses_deterministic_keyboard_selection() {
         let choices = vec![
             choice(
@@ -1769,7 +2068,7 @@ mod tests {
         let mut events = ScriptedEvents::keys([KeyCode::Down, KeyCode::Enter]);
 
         let selected =
-            select_pair_loop(&mut terminal, &mut events, &choices, HeaderMode::Full).unwrap();
+            select_pair_loop(&mut terminal, &mut events, &choices, &[], HeaderMode::Full).unwrap();
 
         assert_eq!(selected.as_deref(), Some("photos"));
     }
@@ -1799,7 +2098,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
 
         terminal
-            .draw(|frame| draw_pair_selector(frame, &choices, 0, HeaderMode::Full))
+            .draw(|frame| draw_pair_selector(frame, &choices, 0, &[], HeaderMode::Full))
             .unwrap();
 
         let footer_start = terminal.backend().buffer().cell((0, 17)).unwrap();
@@ -2234,7 +2533,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
 
         terminal
-            .draw(|frame| draw_pair_selector(frame, &[choice], 0, HeaderMode::Full))
+            .draw(|frame| draw_pair_selector(frame, &[choice], 0, &[], HeaderMode::Full))
             .unwrap();
 
         let screen = buffer_text(&terminal);
@@ -2252,7 +2551,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
 
         terminal
-            .draw(|frame| draw_pair_selector(frame, &[choice], 0, HeaderMode::Full))
+            .draw(|frame| draw_pair_selector(frame, &[choice], 0, &[], HeaderMode::Full))
             .unwrap();
 
         let screen = buffer_text(&terminal);
@@ -2299,7 +2598,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
         terminal
-            .draw(|frame| draw_pair_selector(frame, &choices, 0, HeaderMode::Full))
+            .draw(|frame| draw_pair_selector(frame, &choices, 0, &[], HeaderMode::Full))
             .unwrap();
         let screen = buffer_text(&terminal);
 
@@ -2348,6 +2647,7 @@ mod tests {
             &mut events,
             "photos",
             &cfg_pair,
+            None,
             HeaderMode::Full,
         )
         .unwrap();
@@ -2424,6 +2724,7 @@ mod tests {
             &mut events,
             "photos",
             &cfg_pair,
+            None,
             HeaderMode::Full,
         )
         .unwrap();

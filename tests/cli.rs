@@ -74,9 +74,42 @@ fn vibesync_in_tty_with_input_and_env(
     vibesync_in_tty_with_input_after_start(config_home, home, args, input, extra_env, || {})
 }
 
+/// Like `vibesync_in_tty_with_input`, but also sets the child's working
+/// directory — the seam startup-matching scenarios need, since they are
+/// entirely about where the tool is launched from.
+fn vibesync_in_tty_with_input_and_cwd(
+    config_home: &Path,
+    home: &Path,
+    cwd: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> std::process::Output {
+    vibesync_in_tty_with_input_after_start_in(config_home, home, Some(cwd), args, input, &[], || {})
+}
+
 fn vibesync_in_tty_with_input_after_start(
     config_home: &Path,
     home: &Path,
+    args: &[&str],
+    input: &[u8],
+    extra_env: &[(&str, &str)],
+    before_input: impl FnOnce(),
+) -> std::process::Output {
+    vibesync_in_tty_with_input_after_start_in(
+        config_home,
+        home,
+        None,
+        args,
+        input,
+        extra_env,
+        before_input,
+    )
+}
+
+fn vibesync_in_tty_with_input_after_start_in(
+    config_home: &Path,
+    home: &Path,
+    cwd: Option<&Path>,
     args: &[&str],
     input: &[u8],
     extra_env: &[(&str, &str)],
@@ -94,6 +127,9 @@ fn vibesync_in_tty_with_input_after_start(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     for (name, value) in extra_env {
         command.env(name, value);
     }
@@ -2731,6 +2767,173 @@ fn tui_without_a_pair_selects_from_configured_folder_pairs() {
     assert!(!fx.journal_dir("photos").exists());
 }
 
+// --- Slice 15: startup seeds from the working directory (issue #55) ---
+
+#[test]
+fn tui_started_from_a_pair_source_preselects_it_and_discloses_the_match() {
+    let fx = Fixture::new();
+    fx.write_source("selected.txt", "from the matched pair");
+    fx.add_photos_pair();
+
+    // No pair name and no picker: launching from the pair's source directory
+    // preselects it, so the input sequence is identical to `tui photos`
+    // (pane gate, Compare, Confirm, run, dismiss Result).
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.source.path(),
+        &["tui"],
+        b"\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "startup match failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("selected.txt").is_file());
+    assert!(fx.journal_dir("photos").is_dir());
+}
+
+#[test]
+fn tui_with_no_pairs_configured_opens_the_seeded_pane_instead_of_aborting() {
+    let fx = Fixture::new();
+
+    // No pairs exist at all: startup must not abort. `q` dismisses the
+    // seeded pane.
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.source.path(),
+        &["tui"],
+        b"q",
+    );
+
+    assert!(
+        output.status.success(),
+        "empty-config startup must not abort: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tui_started_from_a_shared_source_opens_the_picker_with_both_matches() {
+    let fx = Fixture::new();
+    fx.write_source("shared.txt", "from whichever pair is picked");
+    let other_destination = tempfile::tempdir().expect("other destination tempdir");
+    fx.add_pair("photos", "mirror");
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "vault",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            other_destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+
+    // Both pairs share this source; the picker still opens (nothing
+    // auto-selected). Alphabetically "photos" < "vault", so Enter on the
+    // first row picks "photos": pane gate, Compare, Confirm, run, dismiss.
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.source.path(),
+        &["tui"],
+        b"\r\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "shared-source picker failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("shared.txt").is_file());
+    assert!(!other_destination.path().join("shared.txt").exists());
+}
+
+#[test]
+fn tui_with_a_named_pair_never_reads_the_working_directory() {
+    let fx = Fixture::new();
+    fx.write_source("named.txt", "reached by name, not by directory");
+    fx.add_photos_pair();
+    let other_source = tempfile::tempdir().expect("unrelated cwd tempdir");
+    let other_destination = tempfile::tempdir().expect("unrelated destination tempdir");
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "vault",
+            "--source",
+            other_source.path().to_str().unwrap(),
+            "--destination",
+            other_destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+
+    // Launched from "vault"'s source directory but naming "photos": the
+    // working directory must never be consulted, so this opens "photos"
+    // directly rather than preselecting or picking "vault".
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        other_source.path(),
+        &["tui", "photos"],
+        b"\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "named pair launch failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("named.txt").is_file());
+    assert!(!other_destination.path().join("named.txt").exists());
+}
+
+#[test]
+fn tui_started_from_a_pairs_destination_does_not_preselect_it() {
+    let fx = Fixture::new();
+    fx.write_source("standing_in_destination.txt", "destination is not a match");
+    fx.add_photos_pair();
+
+    // Standing in the one configured pair's destination is not a source
+    // match (AC6), so this behaves like the no-match, single-choice case:
+    // the picker still opens rather than auto-selecting, per AC8.
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.destination.path(),
+        &["tui"],
+        b"\r\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "destination cwd should still reach the picker: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx
+        .destination
+        .path()
+        .join("standing_in_destination.txt")
+        .is_file());
+    assert!(fx.journal_dir("photos").is_dir());
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn tui_included_error_blocks_until_the_row_is_excluded() {
@@ -2765,7 +2968,14 @@ fn banner_renders_on_bare_help_and_tui_tty_surfaces() {
     let fx = Fixture::new();
 
     for args in [&[][..], &["--help"][..], &["tui"][..]] {
-        let output = vibesync_in_tty(fx.xdg.path(), args, false);
+        // `tui` with zero pairs configured opens the seeded pane rather
+        // than exiting immediately (issue #55, AC8), so it needs a `q` to
+        // dismiss; the other two surfaces exit on their own.
+        let output = if args == &["tui"][..] {
+            vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), args, b"q")
+        } else {
+            vibesync_in_tty(fx.xdg.path(), args, false)
+        };
         let output = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.contains('◢') && output.contains('█') && output.contains('◣'),
