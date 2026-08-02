@@ -307,7 +307,7 @@ OpenCode lists configured-provider candidates with `opencode models
 through `--model`
 ([model-list command](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/cli.mdx#L306-L334),
 [model selection](https://github.com/anomalyco/opencode/blob/c69abee0c73253aebae65e87e4e1b9bfa8c38021/packages/web/src/content/docs/models.mdx#L204-L220)).
-`setup-dynamic-skills` should treat that list as candidates, then run a
+`dynamic-skills-setup` should treat that list as candidates, then run a
 minimal fresh-session prompt before recording a model as callable; a cached
 catalog entry alone is not authentication evidence. Model family must be
 derived from the selected model identity, not just provider ID, because a
@@ -435,7 +435,7 @@ of truth.
 
 ### Resulting capability-probe rules
 
-For every detected harness, `setup-dynamic-skills` should separately record:
+For every detected harness, `dynamic-skills-setup` should separately record:
 
 1. skill discovery (does the shared `dynamic-implement` name appear/load?);
 2. candidate models through that harness's documented catalog/selector
