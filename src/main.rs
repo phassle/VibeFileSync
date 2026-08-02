@@ -108,6 +108,9 @@ enum PairCommand {
     List {
         #[arg(long)]
         json: bool,
+        /// Classify each side's volume state (advisory; does volume I/O).
+        #[arg(long)]
+        check: bool,
     },
     /// Remove a Folder pair.
     Remove { name: String },
@@ -211,11 +214,11 @@ fn run_pair(action: &PairCommand, config_path: &std::path::Path) -> Result<i32, 
             pair::add(config_path, name, source, destination, *mode)?;
             Ok(error::EXIT_OK)
         }
-        PairCommand::List { json } => {
+        PairCommand::List { json, check } => {
             let output = if *json {
-                pair::list_json(config_path)?
+                pair::list_json(config_path, *check)?
             } else {
-                pair::list_table(config_path)?
+                pair::list_table(config_path, *check)?
             };
             print!("{output}");
             Ok(error::EXIT_OK)

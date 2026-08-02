@@ -34,6 +34,7 @@ const FILESYSTEMS: [Filesystem; 2] = [
 
 struct MountedImage {
     _root: tempfile::TempDir,
+    image: PathBuf,
     mount: PathBuf,
     device: Option<String>,
 }
@@ -75,10 +76,29 @@ impl MountedImage {
             .expect("hdiutil create starts");
         assert_command_success(&format!("hdiutil create {}", filesystem.slug), &created);
 
+        let mut mounted_image = Self {
+            _root: root,
+            image,
+            mount,
+            device: None,
+        };
+        mounted_image.attach_at(mounted_image.mount.clone());
+        mounted_image
+    }
+
+    /// Attaches this suite's already-created image at `mount`, recording the
+    /// device so `Drop`/`detach` can find it. Used both by `create_sized`
+    /// (first attach) and by tests simulating a volume relocation (a
+    /// detach followed by a re-attach at a different mount point).
+    fn attach_at(&mut self, mount: PathBuf) {
+        assert!(self.device.is_none(), "image is already attached");
+        if !mount.is_dir() {
+            fs::create_dir_all(&mount).expect("mount point for re-attach");
+        }
         let attached = Command::new("hdiutil")
             .args(["attach", "-nobrowse", "-noverify", "-plist", "-mountpoint"])
             .arg(&mount)
-            .arg(&image)
+            .arg(&self.image)
             .output()
             .expect("hdiutil attach starts");
         assert_command_success("hdiutil attach", &attached);
@@ -90,12 +110,8 @@ impl MountedImage {
             "unexpected device returned by hdiutil: {device}"
         );
         assert!(mount.is_dir(), "image mounted at the suite-scoped path");
-
-        Self {
-            _root: root,
-            mount,
-            device: Some(device),
-        }
+        self.mount = mount;
+        self.device = Some(device);
     }
 
     fn detach(&mut self) -> Result<(), String> {
@@ -253,6 +269,101 @@ fn full_crash_and_fault_matrix_passes_on_real_filesystems() {
     exercise_f8_concurrent_run(&images[0].1, images[0].0);
 
     detach_all(&mut images);
+}
+
+/// Issue #48: `volume_absent` and `relocated` are the two classifier states
+/// whose outcome macOS itself decides (an unmounted volume, a volume
+/// remounted at a new path), so per the testing decisions they are proven
+/// here against a real APFS image rather than through the injected lookup.
+#[test]
+fn volume_state_classifier_reports_absent_and_relocated_against_a_real_image() {
+    let filesystem = FILESYSTEMS[0]; // APFS
+    let mut image = MountedImage::create(filesystem);
+
+    let xdg = tempfile::tempdir().expect("case config home");
+    let home = tempfile::tempdir().expect("case state home");
+    let source = tempfile::tempdir().expect("case source on native APFS");
+    fs::write(source.path().join("f.txt"), CONTENT).expect("source fixture");
+    let destination = image.mount.join("dest");
+    fs::create_dir_all(&destination).expect("fresh case destination");
+
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vibesync"));
+        command
+            .env("XDG_CONFIG_HOME", xdg.path())
+            .env("HOME", home.path());
+        command
+    };
+
+    let added = command()
+        .args([
+            "pair",
+            "add",
+            "vs-classifier",
+            "--source",
+            source.path().to_str().unwrap(),
+            "--destination",
+            destination.to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .output()
+        .expect("pair add starts");
+    assert_command_success("pair add", &added);
+
+    let ready = command()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .expect("pair list --check starts");
+    assert_command_success("pair list --check (ready)", &ready);
+    let ready_status: Value = serde_json::from_slice(&ready.stdout).expect("valid JSON output");
+    assert_eq!(
+        ready_status["pairs"][0]["status"]["destination"]["state"],
+        "ready"
+    );
+
+    image
+        .detach()
+        .expect("detach the image to simulate an absent volume");
+    let absent = command()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .expect("pair list --check starts");
+    assert_command_success("pair list --check (volume_absent)", &absent);
+    let absent_status: Value = serde_json::from_slice(&absent.stdout).expect("valid JSON output");
+    assert_eq!(
+        absent_status["pairs"][0]["status"]["destination"]["state"],
+        "volume_absent"
+    );
+
+    let relocated_root = tempfile::tempdir().expect("relocated mount root");
+    let relocated_mount = relocated_root.path().join("mount");
+    image.attach_at(relocated_mount.clone());
+    let relocated = command()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .expect("pair list --check starts");
+    assert_command_success("pair list --check (relocated)", &relocated);
+    let relocated_status: Value =
+        serde_json::from_slice(&relocated.stdout).expect("valid JSON output");
+    assert_eq!(
+        relocated_status["pairs"][0]["status"]["destination"]["state"],
+        "relocated"
+    );
+    let at = relocated_status["pairs"][0]["status"]["destination"]["at"]
+        .as_str()
+        .expect("relocated state reports a resolved path");
+    assert!(at.ends_with("/dest"), "{at}");
+    // The mount table reports canonical paths (e.g. `/private/var/...` for
+    // a `/var/...` symlink), so compare against the canonical mount rather
+    // than the literal path this test constructed it from.
+    let canonical_mount = relocated_mount.canonicalize().unwrap();
+    assert!(
+        at.starts_with(canonical_mount.to_str().unwrap()),
+        "resolved path should be under the new mount point: {at}"
+    );
+
+    image.detach().expect("detach the harness-owned image");
 }
 
 fn exercise_new_file_crash_transitions(images: &[(Filesystem, MountedImage)]) {
