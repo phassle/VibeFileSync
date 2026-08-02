@@ -54,6 +54,11 @@ struct SideView {
     /// empty one), but any state short of Ready/Relocated blocks the same
     /// way, since Compare could not resolve the pair regardless.
     blocked: bool,
+    /// The short state name from `pair::state_name_and_location` — the same
+    /// vocabulary `pair list --check` renders, reused here so the pair
+    /// selector's compact per-side tag distinguishes all six `VolumeState`
+    /// variants instead of collapsing them to `blocked`'s two.
+    state_tag: &'static str,
 }
 
 fn side_view(
@@ -84,9 +89,11 @@ fn side_view(
         Err(_) => format!("{base_label} (filesystem unknown)"),
     };
     let (description, blocked) = describe_state(state, &label);
+    let (state_tag, _) = pair::state_name_and_location(state);
     SideView {
         description,
         blocked,
+        state_tag,
     }
 }
 
@@ -1136,7 +1143,14 @@ fn draw_pair_selector(
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
     let items = choices.iter().map(|choice| {
-        let tag = |view: &SideView| if view.blocked { "BLOCKED" } else { "OK" };
+        // "OK"/"BLOCKED" keeps the at-a-glance runnable signal; the
+        // `state_tag` suffix distinguishes Ready from Relocated within "OK"
+        // and the four blocked states from each other within "BLOCKED" —
+        // meaning carried entirely by these words, not by colour.
+        let tag = |view: &SideView| {
+            let signal = if view.blocked { "BLOCKED" } else { "OK" };
+            format!("{signal} · {}", view.state_tag)
+        };
         ListItem::new(vec![
             Line::from(vec![
                 Span::styled(
@@ -2244,6 +2258,73 @@ mod tests {
         let screen = buffer_text(&terminal);
         assert!(screen.contains("Source ["), "{screen}");
         assert!(screen.contains("Destination ["), "{screen}");
+    }
+
+    #[test]
+    fn pair_selector_distinguishes_all_six_volume_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounted = dir.path().to_path_buf();
+        let missing_folder = mounted.join("gone");
+
+        let states = [
+            VolumeState::Ready,
+            VolumeState::Relocated {
+                at: mounted.clone(),
+            },
+            VolumeState::VolumeAbsent,
+            VolumeState::FolderMissing {
+                at: missing_folder.clone(),
+            },
+            VolumeState::ForeignVolume {
+                at: mounted.clone(),
+            },
+            VolumeState::Inaccessible,
+        ];
+
+        let choices: Vec<PairChoice> = states
+            .iter()
+            .enumerate()
+            .map(|(i, state)| PairChoice {
+                name: format!("pair-{i}"),
+                pair: pair(Mode::Update),
+                source_view: side_view(state, Some("Backup Drive"), &mounted, None),
+                destination_view: side_view(
+                    &VolumeState::Ready,
+                    Some("Backup Drive"),
+                    &mounted,
+                    None,
+                ),
+            })
+            .collect();
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
+        terminal
+            .draw(|frame| draw_pair_selector(frame, &choices, 0, HeaderMode::Full))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+
+        // Six distinct source tags: two "OK" states (Ready vs Relocated,
+        // otherwise both collapsed under "OK") and four "BLOCKED" states
+        // (otherwise all collapsed under "BLOCKED"), each still carrying
+        // the shared runnable/not-runnable signal as a prefix word.
+        assert!(screen.contains("Source [OK · ready]"), "{screen}");
+        assert!(screen.contains("Source [OK · relocated]"), "{screen}");
+        assert!(
+            screen.contains("Source [BLOCKED · volume_absent]"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Source [BLOCKED · folder_missing]"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Source [BLOCKED · foreign_volume]"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Source [BLOCKED · inaccessible]"),
+            "{screen}"
+        );
     }
 
     #[test]

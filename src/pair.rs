@@ -208,7 +208,11 @@ fn side_status_json(
     }
 }
 
-fn state_name_and_location(state: &VolumeState) -> (&'static str, Option<&Path>) {
+/// The short machine-readable state vocabulary shared by `pair list --check`
+/// (JSON `state` field and table `STATUS` column) and the TUI pair
+/// selector's per-side tag — one name per `VolumeState`, so the wording
+/// never diverges between the two surfaces.
+pub(crate) fn state_name_and_location(state: &VolumeState) -> (&'static str, Option<&Path>) {
     match state {
         VolumeState::Ready => ("ready", None),
         VolumeState::Relocated { at } => ("relocated", Some(at.as_path())),
