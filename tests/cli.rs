@@ -11,7 +11,7 @@ use assert_cmd::Command;
 use std::fs;
 #[cfg(feature = "fault-injection")]
 use std::io::{BufRead, BufReader};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -113,7 +113,7 @@ impl PipeDrain {
             let mut chunk = [0u8; 4096];
             loop {
                 match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(count) => {
                         buffer
                             .lock()
@@ -122,6 +122,11 @@ impl PipeDrain {
                             .extend_from_slice(&chunk[..count]);
                         arrived.notify_all();
                     }
+                    // A signal landing mid-read is not end of output. Treating
+                    // it as one would report the pipe closed and fail the very
+                    // readiness gate this driver exists to make reliable.
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
             buffer.lock().expect("pipe buffer is readable").at_end = true;
@@ -171,6 +176,33 @@ impl PipeDrain {
     }
 }
 
+/// `script` and the TUI share a dedicated process group. Every path that gives
+/// up on the child runs this first, so no failure leaves a live PTY behind for
+/// later tests to inherit.
+fn terminate_process_group(child: &mut std::process::Child) {
+    // SAFETY: the negative id targets only the dedicated process group we
+    // assign at spawn; the live child still owns that id here.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if child
+            .try_wait()
+            .expect("terminated TUI can be polled")
+            .is_some()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // SAFETY: same scoped process group; SIGKILL prevents a broken terminal
+    // teardown from hanging the test suite or leaving an orphaned PTY.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
 fn vibesync_in_tty_with_input_after_start(
     config_home: &Path,
     home: &Path,
@@ -201,21 +233,22 @@ fn vibesync_in_tty_with_input_after_start(
     // ADR-0011: wait on what the child actually wrote instead of assuming a
     // startup budget. A key press sent before the PTY is raw is echoed and
     // reshaped by the line discipline rather than reaching the review loop.
-    let taken_over = pty
-        .wait_for(TUI_ALTERNATE_SCREEN, 0, TUI_READY_TIMEOUT)
-        .unwrap_or_else(|| {
-            panic!(
-                "TUI never took the terminal for {args:?}: {:?}",
-                pty.snapshot()
-            )
-        });
-    if pty
-        .wait_for(TUI_FRAME_FLUSHED, taken_over, TUI_READY_TIMEOUT)
-        .is_none()
-    {
+    let taken_over = pty.wait_for(TUI_ALTERNATE_SCREEN, 0, TUI_READY_TIMEOUT);
+    let rendered =
+        taken_over.and_then(|from| pty.wait_for(TUI_FRAME_FLUSHED, from, TUI_READY_TIMEOUT));
+    if rendered.is_none() {
+        let stage = if taken_over.is_some() {
+            "render its first frame"
+        } else {
+            "take the terminal"
+        };
+        // The child never reached its event loop but still owns the process
+        // group, so it needs the same bounding a bad key sequence gets.
+        terminate_process_group(&mut child);
         panic!(
-            "TUI never rendered its first frame for {args:?}: {:?}",
-            pty.snapshot()
+            "TUI never managed to {stage} for {args:?}: pty {:?}, stderr {:?}",
+            pty.snapshot(),
+            errors.snapshot()
         );
     }
 
@@ -238,29 +271,8 @@ fn vibesync_in_tty_with_input_after_start(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // `script` and the TUI share this dedicated process group. Bound a bad
-    // key sequence without leaving a child PTY behind for later tests.
-    // SAFETY: the negative id targets only the dedicated process group we
-    // assigned above; the live child still owns that id during this branch.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGTERM);
-    }
-    for _ in 0..20 {
-        if child
-            .try_wait()
-            .expect("terminated TUI can be polled")
-            .is_some()
-        {
-            panic!("TUI did not exit within five seconds for {args:?}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    // SAFETY: same scoped process group; SIGKILL prevents a broken terminal
-    // teardown from hanging the test suite or leaving an orphaned PTY.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.wait();
+    // Bound a bad key sequence without leaving a child PTY behind.
+    terminate_process_group(&mut child);
     panic!("TUI did not exit within five seconds for {args:?}");
 }
 
@@ -2282,6 +2294,18 @@ fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
             .contains("later.txt"),
         "TUI exclusions must never persist"
     );
+}
+
+/// Guards ADR-0011 §4: the readiness gate must distinguish a slow child from
+/// one that never takes the terminal. Without the pipe-close check this would
+/// sit on the full timeout instead of failing immediately.
+#[test]
+#[should_panic(expected = "TUI never managed to take the terminal")]
+fn scripted_input_fails_fast_when_the_child_never_takes_the_terminal() {
+    let fx = Fixture::new();
+    // No Folder pair configured, so `tui` reports and exits before it starts a
+    // terminal session — the driver has no first frame to wait for.
+    vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"q");
 }
 
 #[test]
