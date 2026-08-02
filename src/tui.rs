@@ -259,6 +259,11 @@ struct ReviewModel {
     /// this is presentation state only and is never part of the reviewed
     /// action subset the engine receives.
     show_unchanged: bool,
+    /// The action table's scroll offset (first visible row), persisted
+    /// across draws — including a resize — so the cursor row does not jump
+    /// back into view when it was deliberately scrolled out of it. Interior
+    /// mutability because the render path only ever holds `&ReviewModel`.
+    table_offset: std::cell::Cell<usize>,
 }
 
 #[derive(Default)]
@@ -651,6 +656,7 @@ impl ReviewModel {
             dry_run,
             notices: Vec::new(),
             show_unchanged: false,
+            table_offset: std::cell::Cell::new(0),
         }
     }
 
@@ -759,7 +765,6 @@ impl ReviewModel {
                 return;
             }
             row.included = !row.included;
-            self.message = None;
         }
         self.reconcile_structural_dependencies();
     }
@@ -782,7 +787,6 @@ impl ReviewModel {
                 row.included = true;
             }
         }
-        self.message = None;
         self.reconcile_structural_dependencies();
     }
 
@@ -794,7 +798,6 @@ impl ReviewModel {
                 row.included = false;
             }
         }
-        self.message = None;
         self.reconcile_structural_dependencies();
     }
 
@@ -1557,7 +1560,6 @@ fn review_loop<B: Backend, E: Events>(
                 KeyCode::Char('u') | KeyCode::Char('U') => model.toggle_unchanged(),
                 KeyCode::Enter => {
                     model.screen = Screen::Confirm;
-                    model.message = None;
                 }
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(ReviewOutcome::Cancelled),
                 KeyCode::Char('?') => {
@@ -1579,7 +1581,6 @@ fn review_loop<B: Backend, E: Events>(
                 }
                 KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Char('n') | KeyCode::Esc => {
                     model.screen = Screen::Actions;
-                    model.message = None;
                 }
                 KeyCode::Char('q') => return Ok(ReviewOutcome::Cancelled),
                 KeyCode::Char('?') => {
@@ -1918,6 +1919,11 @@ fn pair_form_loop<B: Backend, E: Events>(
                 KeyCode::Backspace => {
                     model.name_input.pop();
                 }
+                KeyCode::Char('?') => {
+                    show_help_overlay(terminal, events, |frame| {
+                        draw_pair_form(frame, model, header_mode)
+                    })?;
+                }
                 KeyCode::Char(c) => model.name_input.push(c),
                 _ => {}
             },
@@ -2009,11 +2015,7 @@ fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: Hea
                 body,
             );
             frame.render_widget(
-                // No `? help` here: `Naming` is free-text entry where every
-                // character is data, so `?` must stay typeable rather than
-                // being intercepted — advertising it as a hint would be a
-                // hint for a key that doesn't do what it claims.
-                Paragraph::new("Type a name · Enter save · Esc back"),
+                Paragraph::new("Type a name · Enter save · Esc back · ? help"),
                 footer,
             );
         }
@@ -2419,11 +2421,12 @@ fn draw_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &Revi
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶");
-    let mut state = TableState::default();
+    let mut state = TableState::default().with_offset(model.table_offset.get());
     if !model.rows.is_empty() {
         state.select(Some(model.selected));
     }
     frame.render_stateful_widget(table, area, &mut state);
+    model.table_offset.set(state.offset());
 }
 
 /// Below 80 columns: one row per action still (never an aggregate — #54's
@@ -2470,11 +2473,12 @@ fn draw_actions_collapsed(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶");
-    let mut state = TableState::default();
+    let mut state = TableState::default().with_offset(model.table_offset.get());
     if !model.rows.is_empty() {
         state.select(Some(model.selected));
     }
     frame.render_stateful_widget(table, area, &mut state);
+    model.table_offset.set(state.offset());
 }
 
 fn draw_confirmation(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &ReviewModel) {
@@ -4548,6 +4552,49 @@ mod tests {
     }
 
     #[test]
+    fn a_status_message_survives_unrelated_navigation_until_replaced() {
+        let dry_run = plan::Plan {
+            copies: vec![action("a.txt", 1, "new")],
+            strays: vec![PathBuf::from(".old.vibesync-tmp-run")],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        model.selected = model
+            .rows
+            .iter()
+            .position(|row| row.operation == Operation::Cleanup)
+            .expect("cleanup row must exist");
+
+        model.toggle();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence")
+        );
+
+        model.move_up();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence"),
+            "an unrelated navigation keypress must not clear a pending status message"
+        );
+
+        model.move_down();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence"),
+            "an unrelated navigation keypress must not clear a pending status message"
+        );
+
+        model.selected = 0;
+        model.toggle();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence"),
+            "toggling a row without producing a new message must not silently clear the old one"
+        );
+    }
+
+    #[test]
     fn resizing_preserves_review_selection_and_stage() {
         let dry_run = plan::Plan {
             copies: vec![action("a.txt", 1, "new"), action("b.txt", 1, "new")],
@@ -4575,8 +4622,89 @@ mod tests {
         assert_eq!(model.screen, Screen::Actions);
     }
 
+    /// Reproduces `TableState`'s own scroll hysteresis: once the table has
+    /// scrolled to make a far-down row visible, moving the selection back up
+    /// *within that same visible window* must not snap the window back to
+    /// the top. That only holds if the offset from the previous draw feeds
+    /// into the next one — a fresh `TableState::default()` every frame (the
+    /// bug this test guards) recomputes the window purely from the current
+    /// selection, discarding the fact that the wider window was already
+    /// open, so it snaps to the top instead. Resize must not disturb that
+    /// carried-over offset either.
     #[test]
-    fn naming_stage_never_advertises_help_and_types_a_literal_question_mark_instead() {
+    fn resizing_preserves_review_scroll_offset() {
+        let copies = (0..30)
+            .map(|i| action(&format!("a{i:02}.txt"), 1, "new"))
+            .collect();
+        let dry_run = plan::Plan {
+            copies,
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        for _ in 0..25 {
+            model.move_down();
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let offset_before = model.table_offset.get();
+        assert!(
+            offset_before > 0,
+            "selecting a row far down a 30-row list must scroll the table: {offset_before}"
+        );
+
+        // Move the cursor up, but stay inside the window that scrolling
+        // down to row 25 already opened — a reset-to-zero offset would
+        // still keep row 20 visible (it's within the first 17 rows too),
+        // so this alone wouldn't tell the two implementations apart.
+        // Checking the top-of-window row, not just "is the cursor
+        // visible", is what actually distinguishes carried-over scroll
+        // state from a window recomputed from scratch.
+        for _ in 0..5 {
+            model.move_up();
+        }
+        assert_eq!(model.selected, 20);
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        assert_eq!(
+            model.table_offset.get(),
+            offset_before,
+            "moving the cursor within an already-open window must not re-close it"
+        );
+        let screen_before_resize = buffer_text(&terminal);
+        assert!(
+            !screen_before_resize.contains("a00.txt"),
+            "the window must stay scrolled down, not snap back to the top: {screen_before_resize}"
+        );
+
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 100, 24))
+            .unwrap();
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        assert_eq!(
+            model.table_offset.get(),
+            offset_before,
+            "resize must not reset the scroll offset when the visible height is unchanged"
+        );
+        let screen_after = buffer_text_sized(&terminal, 100, 24);
+        assert!(
+            !screen_after.contains("a00.txt"),
+            "resize must not snap the scrolled window back to the top: {screen_after}"
+        );
+        assert!(
+            screen_after.contains("a20.txt"),
+            "the selected row must stay visible after resize: {screen_after}"
+        );
+    }
+
+    #[test]
+    fn naming_stage_advertises_help_and_opens_it_instead_of_typing_a_question_mark() {
         let root = browse_tree();
         let mut model = PairFormModel::new_pair(root.path().to_path_buf());
         model.stage = FormStage::Naming;
@@ -4587,12 +4715,13 @@ mod tests {
             .unwrap();
         let screen = buffer_text(&terminal);
         assert!(
-            !screen.contains("? help"),
-            "Naming's footer must not claim a key it doesn't honour: {screen}"
+            screen.contains("? help"),
+            "Naming's footer must advertise the help key like every other stage: {screen}"
         );
 
-        let mut events = ScriptedEvents::keys([KeyCode::Char('?'), KeyCode::Esc, KeyCode::Esc]);
-        pair_form_loop(
+        let mut events =
+            ScriptedEvents::keys([KeyCode::Char('?'), KeyCode::Esc, KeyCode::Esc, KeyCode::Esc]);
+        let outcome = pair_form_loop(
             &mut terminal,
             &mut events,
             &mut model,
@@ -4601,9 +4730,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            model.name_input, "?",
-            "in free-text entry, '?' must be typed into the name, not intercepted as help"
+            model.name_input, "",
+            "'?' must open help, not be intercepted as a name character, even in free-text entry"
         );
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
     }
 
     #[test]
