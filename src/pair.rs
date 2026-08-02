@@ -46,6 +46,7 @@ pub fn add(
     source: &Path,
     destination: &Path,
     mode: Mode,
+    replace: bool,
 ) -> Result<(), AppError> {
     if !is_valid_name(name) {
         return Err(AppError::Usage(format!(
@@ -54,7 +55,13 @@ pub fn add(
     }
 
     let mut cfg = config::load(config_path)?;
-    if cfg.pairs.contains_key(name) {
+    let already_exists = cfg.pairs.contains_key(name);
+    if replace && !already_exists {
+        return Err(AppError::Usage(format!(
+            "pair '{name}' not found (`pair add` without --replace creates it)"
+        )));
+    }
+    if !replace && already_exists {
         return Err(AppError::Usage(format!(
             "pair '{name}' already exists (`pair remove {name}` first to redefine it)"
         )));
@@ -455,6 +462,7 @@ mod tests {
             source.path(),
             destination.path(),
             Mode::Mirror,
+            false,
         )
         .unwrap();
         (config_dir, source, destination, config_path)

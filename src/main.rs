@@ -103,6 +103,11 @@ enum PairCommand {
         destination: PathBuf,
         #[arg(long)]
         mode: Mode,
+        /// Redefine an existing pair in one atomic save, re-pinning both
+        /// volume UUIDs and refreshing the volume names. The pair keeps its
+        /// name and its run history.
+        #[arg(long)]
+        replace: bool,
     },
     /// List configured Folder pairs.
     List {
@@ -214,8 +219,9 @@ fn run_pair(action: &PairCommand, config_path: &std::path::Path) -> Result<i32, 
             source,
             destination,
             mode,
+            replace,
         } => {
-            pair::add(config_path, name, source, destination, *mode)?;
+            pair::add(config_path, name, source, destination, *mode, *replace)?;
             Ok(error::EXIT_OK)
         }
         PairCommand::List {

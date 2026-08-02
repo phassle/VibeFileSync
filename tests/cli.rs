@@ -807,6 +807,214 @@ fn pair_add_with_a_nonexistent_source_is_a_usage_error_exit_64() {
 }
 
 #[test]
+fn pair_add_without_replace_is_still_a_duplicate_error_when_a_new_destination_is_also_given() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let other_destination = tempfile::tempdir().unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            other_destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("photos"),
+        "error should name the pair: {stderr}"
+    );
+    let contents = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(
+        contents.contains(fx.destination.path().to_str().unwrap()),
+        "the original destination must survive the rejected add: {contents}"
+    );
+}
+
+#[test]
+fn pair_add_replace_redefines_the_pair_in_one_atomic_save() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let new_destination = tempfile::tempdir().unwrap();
+
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            new_destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .assert()
+        .success();
+
+    let output = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "replace must not create a second pair");
+    assert_eq!(pairs[0]["name"], "photos");
+    assert_eq!(pairs[0]["mode"], "update");
+    assert_eq!(
+        pairs[0]["destination"],
+        new_destination.path().to_str().unwrap()
+    );
+}
+
+#[test]
+fn pair_add_replace_with_unchanged_paths_repins_uuids_and_refreshes_volume_names() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+
+    let after = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(after.contains("source_volume_uuid"));
+    assert!(after.contains("destination_volume_uuid"));
+    assert!(after.contains("source_volume_name"));
+    assert!(after.contains("destination_volume_name"));
+    // The pair's identity (name) and both paths are unchanged.
+    assert!(after.contains("[pairs.photos]"));
+    assert_eq!(
+        before.contains(fx.source.path().to_str().unwrap()),
+        after.contains(fx.source.path().to_str().unwrap())
+    );
+}
+
+#[test]
+fn pair_add_replace_keeps_the_pair_name_and_therefore_its_run_history() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    fx.write_source("a.txt", "hello");
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let history_before = fx
+        .cmd()
+        .args(["history", "photos", "--json"])
+        .output()
+        .unwrap();
+    let value_before: serde_json::Value = serde_json::from_slice(&history_before.stdout).unwrap();
+    assert!(!value_before["runs"].as_array().unwrap().is_empty());
+
+    let new_destination = tempfile::tempdir().unwrap();
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            new_destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .assert()
+        .success();
+
+    let history_after = fx
+        .cmd()
+        .args(["history", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(history_after.status.code(), Some(EXIT_OK));
+    let value_after: serde_json::Value = serde_json::from_slice(&history_after.stdout).unwrap();
+    assert_eq!(
+        value_before["runs"].as_array().unwrap().len(),
+        value_after["runs"].as_array().unwrap().len(),
+        "history for the pair name must survive the replace: {value_after}"
+    );
+}
+
+#[test]
+fn pair_add_replace_on_an_unknown_pair_is_a_usage_error_exit_64() {
+    let fx = Fixture::new();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("photos"),
+        "error should name the pair: {stderr}"
+    );
+}
+
+#[test]
+fn a_failed_replace_leaves_the_previous_definition_intact() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    let missing_source = fx.source.path().join("does-not-exist");
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            missing_source.to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let after = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert_eq!(before, after, "a failed replace must not alter the config");
+}
+
+#[test]
 fn invalid_pair_name_is_a_usage_error_exit_64() {
     let fx = Fixture::new();
 
