@@ -2,6 +2,7 @@
 //! before SafetyNet archives any old destination object and Publish renames the
 //! verified temp into place (ADR-0001 and ADR-0008).
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -760,20 +761,32 @@ fn fail_structural_delete(
     reporter.action_failed(journal.run_id(), Operation::Delete, deletion, &failure)
 }
 
+/// Indexes actions by whole value for the reconciliation comparisons below,
+/// which each ask the same question — "did the review cover this exact
+/// action?" — once per action. `Action`'s `Hash` is field-wise and agrees
+/// with its `PartialEq` (`plan.rs`), so membership here answers exactly what
+/// a `Vec::contains` scan answered, without the per-action linear scan.
+fn action_index(actions: &[Action]) -> HashSet<&Action> {
+    actions.iter().collect()
+}
+
 /// A reconciliation scan is authoritative about the destination, but it must
 /// not broaden a reviewed run when source or destination content changes
 /// between the review and the cleanup. Newly discovered work waits for the
 /// next `plan`/`run` invocation.
 fn retain_reviewed_actions(fresh: &mut plan::Plan, reviewed: &plan::Plan) {
+    let reviewed_copies = action_index(&reviewed.copies);
+    let reviewed_updates = action_index(&reviewed.updates);
+    let reviewed_deletes = action_index(&reviewed.deletes);
     fresh
         .copies
-        .retain(|action| reviewed.copies.contains(action));
+        .retain(|action| reviewed_copies.contains(action));
     fresh
         .updates
-        .retain(|action| reviewed.updates.contains(action));
+        .retain(|action| reviewed_updates.contains(action));
     fresh
         .deletes
-        .retain(|action| reviewed.deletes.contains(action));
+        .retain(|action| reviewed_deletes.contains(action));
     fresh
         .directory_copies
         .retain(|path| reviewed.directory_copies.contains(path));
@@ -869,23 +882,26 @@ fn missing_reviewed_actions<'a>(
     reviewed: &'a plan::Plan,
     fresh: &plan::Plan,
 ) -> Vec<(Operation, &'a Action)> {
+    let fresh_copies = action_index(&fresh.copies);
+    let fresh_updates = action_index(&fresh.updates);
+    let fresh_deletes = action_index(&fresh.deletes);
     reviewed
         .copies
         .iter()
-        .filter(|action| !fresh.copies.contains(*action))
+        .filter(|action| !fresh_copies.contains(*action))
         .map(|action| (Operation::Copy, action))
         .chain(
             reviewed
                 .updates
                 .iter()
-                .filter(|action| !fresh.updates.contains(*action))
+                .filter(|action| !fresh_updates.contains(*action))
                 .map(|action| (Operation::Update, action)),
         )
         .chain(
             reviewed
                 .deletes
                 .iter()
-                .filter(|action| !fresh.deletes.contains(*action))
+                .filter(|action| !fresh_deletes.contains(*action))
                 .map(|action| (Operation::Delete, action)),
         )
         .collect()
@@ -898,9 +914,10 @@ fn missing_reviewed_actions<'a>(
 /// and is not part of what a reviewer saw.
 fn discovered_after_review(reviewed: &plan::Plan, fresh: &plan::Plan) -> usize {
     let appeared = |fresh_actions: &[Action], reviewed_actions: &[Action]| {
+        let reviewed_actions = action_index(reviewed_actions);
         fresh_actions
             .iter()
-            .filter(|action| !reviewed_actions.contains(action))
+            .filter(|action| !reviewed_actions.contains(*action))
             .count()
     };
     appeared(&fresh.copies, &reviewed.copies)

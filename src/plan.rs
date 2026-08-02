@@ -39,7 +39,7 @@ pub struct Entry {
 /// One planned file operation, carrying what the human diff row shows. The
 /// operation itself (copy/update/delete) is encoded by which [`Plan`] vector
 /// the action lives in, so it isn't repeated as a field here.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StructuralConflict {
     DestinationFile,
     DestinationDirectory,
@@ -54,7 +54,12 @@ impl StructuralConflict {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Equality is whole-value and field-wise; `Eq` and `Hash` derive from the
+/// same fields, so they agree with the `PartialEq` this type has always had.
+/// Reconciliation depends on that agreement: it indexes whole `Action`
+/// values — not paths — to decide what a review covered (`run.rs`), so
+/// hashing must separate exactly the values equality separates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Action {
     pub rel_path: PathBuf,
     pub bytes: u64,
