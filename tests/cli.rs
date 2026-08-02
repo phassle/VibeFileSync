@@ -3199,6 +3199,42 @@ fn completed_run_journal_correlates_every_event_and_safetynet_folder() {
 }
 
 #[test]
+fn retained_journal_run_start_records_resolved_source_and_destination() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "photo");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let journal_path = fs::read_dir(fx.journal_dir("photos"))
+        .expect("run creates the per-pair Journal directory")
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension().and_then(|value| value.to_str()) == Some("ndjson")).then_some(path)
+        })
+        .next()
+        .expect("one retained Journal exists");
+    let events: Vec<serde_json::Value> = fs::read_to_string(&journal_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every Journal line is JSON"))
+        .collect();
+
+    let run_start = events
+        .first()
+        .expect("Journal records at least the run_start event");
+    assert_eq!(run_start["type"], "run_start");
+    assert_eq!(
+        run_start["source"],
+        fx.source.path().to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        run_start["destination"],
+        fx.destination.path().to_string_lossy().into_owned()
+    );
+}
+
+#[test]
 fn pair_lock_rejects_overlap_and_dies_with_a_killed_process() {
     let fx = Fixture::new();
     fx.write_source("photo.txt", "complete photo");
