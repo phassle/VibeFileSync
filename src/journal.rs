@@ -334,7 +334,7 @@ pub fn history_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError
     Ok(EXIT_OK)
 }
 
-fn latest_record(pair_name: &str) -> io::Result<Option<RunRecord>> {
+pub(crate) fn latest_record(pair_name: &str) -> io::Result<Option<RunRecord>> {
     Ok(records(pair_name)?.into_iter().next())
 }
 

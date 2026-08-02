@@ -102,7 +102,7 @@ enum SourceClassification {
 }
 
 /// The computed Dry-run diff for one Folder pair.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Plan {
     pub copies: Vec<Action>,
     pub updates: Vec<Action>,
