@@ -101,6 +101,7 @@ Domain and architecture:
 - `docs/adr/0009-acceptance-test-harness.md:1` — crash/fault acceptance strategy and invariants.
 - `docs/adr/0010-commander-two-sided-review.md:1` — two-sided action table for TUI review; supersedes ADR-0003 §3.
 - `docs/adr/0011-scripted-tui-input-synchronisation.md:1` — how scripted-keystroke TUI tests rendezvous with the child.
+- `docs/adr/0012-run-record-resolved-paths.md:1` — `run_start` also records the resolved source and destination.
 
 Agent operations:
 

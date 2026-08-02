@@ -28,5 +28,5 @@ Every run is **review-first**: `plan` shows a comprehensible dry-run diff before
 v1 is under active development from the spec in [issue #14](https://github.com/phassle/VibeFileSync/issues/14), broken into tracer-bullet tickets ([#15–#28](https://github.com/phassle/VibeFileSync/issues?q=label%3Aready-for-agent)).
 
 - **Domain glossary**: [`CONTEXT.md`](CONTEXT.md) — the normative vocabulary (Folder pair, Mirror, SafetyNet, Publish, Convergence, …)
-- **Architecture decisions**: [`docs/adr/`](docs/adr/) — ADR-0001…0009 back every decision in the spec
+- **Architecture decisions**: [`docs/adr/`](docs/adr/) — ADR-0001…0012 back every decision in the spec
 - **Agent instructions**: [`AGENTS.md`](AGENTS.md) — issue tracker, triage labels, gitflow
