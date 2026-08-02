@@ -208,6 +208,19 @@ impl Operation {
             Self::Delete | Self::Cleanup => (ABSENT.to_string(), path.to_string()),
         }
     }
+
+    /// The word naming which side a collapsed single-path row (below 80
+    /// columns) stands for — derived from the same source/destination split
+    /// `sides()` already encodes, rather than a second independent match on
+    /// this enum, so the two can never drift apart.
+    fn side_word(self) -> &'static str {
+        const ABSENT: &str = "—";
+        match self.sides("x") {
+            (_, destination) if destination == ABSENT => "source",
+            (source, _) if source == ABSENT => "destination",
+            _ => "both",
+        }
+    }
 }
 
 struct ReviewRow {
@@ -219,7 +232,7 @@ struct ReviewRow {
     structural_conflict: Option<plan::StructuralConflict>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Actions,
     Confirm,
@@ -246,6 +259,11 @@ struct ReviewModel {
     /// this is presentation state only and is never part of the reviewed
     /// action subset the engine receives.
     show_unchanged: bool,
+    /// The action table's scroll offset (first visible row), persisted
+    /// across draws — including a resize — so the cursor row does not jump
+    /// back into view when it was deliberately scrolled out of it. Interior
+    /// mutability because the render path only ever holds `&ReviewModel`.
+    table_offset: std::cell::Cell<usize>,
 }
 
 #[derive(Default)]
@@ -458,6 +476,12 @@ fn compare_with_scanner<B: Backend, E: Events, S: Scanner>(
         match key.code {
             KeyCode::Enter | KeyCode::Char('c') => scanner = Some(spawn_scanner()),
             KeyCode::Esc | KeyCode::Char('q') => return Ok(CompareOutcome::Cancelled),
+            KeyCode::Char('?') => {
+                show_help_overlay(terminal, events, |frame| {
+                    draw_compare(frame, pair_name, false, header_mode)
+                })
+                .map_err(tui_error)?;
+            }
             _ => {}
         }
     }
@@ -528,6 +552,11 @@ fn show_result<B: Backend, E: Events>(
         }
         if matches!(key.code, KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc) {
             return Ok(());
+        }
+        if key.code == KeyCode::Char('?') {
+            show_help_overlay(terminal, events, |frame| {
+                draw_result(frame, view, header_mode)
+            })?;
         }
     }
 }
@@ -627,6 +656,7 @@ impl ReviewModel {
             dry_run,
             notices: Vec::new(),
             show_unchanged: false,
+            table_offset: std::cell::Cell::new(0),
         }
     }
 
@@ -735,8 +765,47 @@ impl ReviewModel {
                 return;
             }
             row.included = !row.included;
-            self.message = None;
         }
+        self.reconcile_structural_dependencies();
+    }
+
+    /// `a`/`A` for all/none is the parent spec's own Review key map — despite
+    /// this module's general rule that adjacent keys must not cause opposite
+    /// outcomes, `a` and `A` are a deliberate, spec-mandated exception:
+    /// neither key runs anything or touches the destination, both stay
+    /// reversible from the same Actions screen before Confirm, and the shift
+    /// distinction mirrors ordinary shell conventions (e.g. `rm`/`RM`-style
+    /// case pairs are not this codebase's precedent, but case-paired
+    /// all/none toggles are a common terminal-UI idiom).
+    ///
+    /// `a`: include every row that can be included — mandatory Cleanup rows
+    /// are already always included, so this only ever adds inclusions, never
+    /// removes one.
+    fn select_all(&mut self) {
+        for row in &mut self.rows {
+            if row.operation != Operation::Cleanup {
+                row.included = true;
+            }
+        }
+        self.reconcile_structural_dependencies();
+    }
+
+    /// `A`: exclude every row that can be excluded — Cleanup stays included
+    /// (mandatory for convergence), matching `toggle`'s single-row refusal.
+    fn select_none(&mut self) {
+        for row in &mut self.rows {
+            if row.operation != Operation::Cleanup {
+                row.included = false;
+            }
+        }
+        self.reconcile_structural_dependencies();
+    }
+
+    /// A structurally-conflicting delete can only stay included alongside
+    /// the copy it depends on; dropping that copy's inclusion (by any of
+    /// `toggle`, `select_all`, `select_none`) must drop the delete too, so
+    /// this is shared by all three instead of duplicated per caller.
+    fn reconcile_structural_dependencies(&mut self) {
         let included_copies: Vec<String> = self
             .rows
             .iter()
@@ -883,6 +952,11 @@ fn seeded_pane_loop<B: Backend, E: Events>(
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             return Ok(());
         }
+        if key.code == KeyCode::Char('?') {
+            show_help_overlay(terminal, events, |frame| {
+                draw_seeded_pane(frame, seed_dir, notice, header_mode)
+            })?;
+        }
     }
 }
 
@@ -892,6 +966,9 @@ fn draw_seeded_pane(
     notice: Option<&str>,
     header_mode: HeaderMode,
 ) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
 
@@ -919,7 +996,7 @@ fn draw_seeded_pane(
         ),
         body,
     );
-    frame.render_widget(Paragraph::new("q quit"), footer);
+    frame.render_widget(Paragraph::new("q quit · ? help"), footer);
 }
 
 /// Drives Compare, Review, Confirm, Run and Result for one already-chosen
@@ -1199,7 +1276,15 @@ fn pane_gate<B: Backend, E: Events>(
                 let (source, destination) = preconditions::classify_pair(cfg_pair);
                 source_state = source;
                 destination_state = destination;
-                message = None;
+                let (refreshed_source, refreshed_destination) =
+                    side_views(cfg_pair, &source_state, &destination_state);
+                message = Some(
+                    if refreshed_source.blocked || refreshed_destination.blocked {
+                        "Refreshed — a side still needs attention above.".to_string()
+                    } else {
+                        "Refreshed — both sides are ready.".to_string()
+                    },
+                );
             }
             KeyCode::Enter | KeyCode::Char('c') => {
                 if blocked {
@@ -1212,6 +1297,22 @@ fn pane_gate<B: Backend, E: Events>(
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => return Ok(PaneOutcome::Cancelled),
+            KeyCode::Char('?') => {
+                show_help_overlay(terminal, events, |frame| {
+                    draw_panes(
+                        frame,
+                        pair_name,
+                        &source_view,
+                        &destination_view,
+                        PanesStatus {
+                            blocked,
+                            message: message.as_deref(),
+                            startup_notice,
+                        },
+                        header_mode,
+                    )
+                })?;
+            }
             _ => {}
         }
     }
@@ -1235,6 +1336,9 @@ fn draw_panes(
     status: PanesStatus<'_>,
     header_mode: HeaderMode,
 ) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
 
@@ -1267,9 +1371,9 @@ fn draw_panes(
     );
 
     let base_help = if status.blocked {
-        "BLOCKED: fix the side above, then press r to refresh · q cancel"
+        "BLOCKED: fix the side above, then press r to refresh · q cancel · ? help"
     } else {
-        "Enter/c compare · r refresh · q cancel"
+        "Enter/c compare · r refresh · q cancel · ? help"
     };
     let help = match status.message {
         Some(message) => format!("{message} ({base_help})"),
@@ -1408,6 +1512,12 @@ fn select_pair_loop<B: Backend, E: Events>(
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => return Ok(SelectPairOutcome::Cancelled),
+            KeyCode::Char('?') => {
+                show_help_overlay(terminal, events, |frame| {
+                    draw_pair_selector(frame, choices, *selected, matched, header_mode)
+                })
+                .map_err(tui_error)?;
+            }
             _ => {}
         }
     }
@@ -1453,12 +1563,18 @@ fn review_loop<B: Backend, E: Events>(
                 KeyCode::Up | KeyCode::Char('k') => model.move_up(),
                 KeyCode::Down | KeyCode::Char('j') => model.move_down(),
                 KeyCode::Char(' ') => model.toggle(),
+                KeyCode::Char('a') => model.select_all(),
+                KeyCode::Char('A') => model.select_none(),
                 KeyCode::Char('u') | KeyCode::Char('U') => model.toggle_unchanged(),
                 KeyCode::Enter => {
                     model.screen = Screen::Confirm;
-                    model.message = None;
                 }
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(ReviewOutcome::Cancelled),
+                KeyCode::Char('?') => {
+                    show_help_overlay(terminal, events, |frame| {
+                        draw_review(frame, model, header_mode)
+                    })?;
+                }
                 _ => {}
             },
             Screen::Confirm => match key.code {
@@ -1473,9 +1589,13 @@ fn review_loop<B: Backend, E: Events>(
                 }
                 KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Char('n') | KeyCode::Esc => {
                     model.screen = Screen::Actions;
-                    model.message = None;
                 }
                 KeyCode::Char('q') => return Ok(ReviewOutcome::Cancelled),
+                KeyCode::Char('?') => {
+                    show_help_overlay(terminal, events, |frame| {
+                        draw_review(frame, model, header_mode)
+                    })?;
+                }
                 _ => {}
             },
         }
@@ -1489,6 +1609,9 @@ fn draw_pair_selector(
     matched: &[String],
     header_mode: HeaderMode,
 ) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
     if choices.is_empty() {
@@ -1500,7 +1623,7 @@ fn draw_pair_selector(
             ),
             body,
         );
-        frame.render_widget(Paragraph::new("n new · q cancel"), footer);
+        frame.render_widget(Paragraph::new("n new · q cancel · ? help"), footer);
         return;
     }
     let items = choices.iter().map(|choice| {
@@ -1557,15 +1680,13 @@ fn draw_pair_selector(
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_symbol("▶ ")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(fg(Color::Cyan).add_modifier(Modifier::BOLD));
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, body, &mut state);
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k move · Enter select · n new · e edit · x remove · q cancel"),
+        Paragraph::new(
+            "↑/↓ or j/k move · Enter select · n new · e edit · x remove · q cancel · ? help",
+        ),
         footer,
     );
 }
@@ -1650,11 +1771,15 @@ impl BrowsePane {
 
 /// Which screen a Folder pair form is showing. `Naming` only exists for
 /// creation — an edit keeps its `editing` name fixed and never visits it, so
-/// renaming stays unreachable from every path through this model.
+/// renaming stays unreachable from every path through this model. `Confirm`
+/// is the mandatory gate before any write: an edit stages there directly
+/// from `Browse`, a creation after `Naming`, so no single keystroke ever
+/// calls `pair::add` — the one rule governing this key map.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FormStage {
     Browse,
     Naming,
+    Confirm,
 }
 
 /// The create/edit form: both panes browse the filesystem, and `s` saves by
@@ -1723,6 +1848,23 @@ impl PairFormModel {
             Mode::Mirror => Mode::Update,
         };
     }
+
+    /// The name that would be written if the pending change is confirmed:
+    /// the fixed name being edited, or the one just typed in `Naming`.
+    fn pending_name(&self) -> &str {
+        self.editing.as_deref().unwrap_or(&self.name_input)
+    }
+
+    /// Where a rejected confirmation returns to: `Browse` for an edit —
+    /// there is no naming step to revisit — or `Naming` for a creation, so
+    /// the typed name survives the rejection.
+    fn stage_before_confirm(&self) -> FormStage {
+        if self.editing.is_some() {
+            FormStage::Browse
+        } else {
+            FormStage::Naming
+        }
+    }
 }
 
 enum PairFormOutcome {
@@ -1759,41 +1901,20 @@ fn pair_form_loop<B: Backend, E: Events>(
                 KeyCode::Backspace | KeyCode::Char('h') => model.active_pane_mut().ascend(),
                 KeyCode::Char('m') | KeyCode::Char('M') => model.toggle_mode(),
                 KeyCode::Char('s') | KeyCode::Char('S') => match &model.editing {
-                    Some(name) => {
-                        match pair::add(
-                            config_path,
-                            name,
-                            model.source.current(),
-                            model.destination.current(),
-                            model.mode,
-                            true,
-                        ) {
-                            Ok(()) => return Ok(PairFormOutcome::Saved(name.clone())),
-                            Err(error) => model.message = Some(error.to_string()),
-                        }
-                    }
-                    None => {
-                        model.stage = FormStage::Naming;
-                        model.message = None;
-                    }
+                    Some(_) => model.stage = FormStage::Confirm,
+                    None => model.stage = FormStage::Naming,
                 },
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(PairFormOutcome::Cancelled),
+                KeyCode::Char('?') => {
+                    show_help_overlay(terminal, events, |frame| {
+                        draw_pair_form(frame, model, header_mode)
+                    })?;
+                }
                 _ => {}
             },
             FormStage::Naming => match key.code {
                 KeyCode::Enter => {
-                    let name = model.name_input.clone();
-                    match pair::add(
-                        config_path,
-                        &name,
-                        model.source.current(),
-                        model.destination.current(),
-                        model.mode,
-                        false,
-                    ) {
-                        Ok(()) => return Ok(PairFormOutcome::Saved(name)),
-                        Err(error) => model.message = Some(error.to_string()),
-                    }
+                    model.stage = FormStage::Confirm;
                 }
                 KeyCode::Esc => {
                     model.stage = FormStage::Browse;
@@ -1801,7 +1922,42 @@ fn pair_form_loop<B: Backend, E: Events>(
                 KeyCode::Backspace => {
                     model.name_input.pop();
                 }
+                KeyCode::Char('?') => {
+                    show_help_overlay(terminal, events, |frame| {
+                        draw_pair_form(frame, model, header_mode)
+                    })?;
+                }
                 KeyCode::Char(c) => model.name_input.push(c),
+                _ => {}
+            },
+            FormStage::Confirm => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let name = model.pending_name().to_string();
+                    let replace = model.editing.is_some();
+                    match pair::add(
+                        config_path,
+                        &name,
+                        model.source.current(),
+                        model.destination.current(),
+                        model.mode,
+                        replace,
+                    ) {
+                        Ok(()) => return Ok(PairFormOutcome::Saved(name)),
+                        Err(error) => {
+                            model.message = Some(error.to_string());
+                            model.stage = model.stage_before_confirm();
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    model.stage = model.stage_before_confirm();
+                }
+                KeyCode::Char('q') => return Ok(PairFormOutcome::Cancelled),
+                KeyCode::Char('?') => {
+                    show_help_overlay(terminal, events, |frame| {
+                        draw_pair_form(frame, model, header_mode)
+                    })?;
+                }
                 _ => {}
             },
         }
@@ -1844,12 +2000,21 @@ fn confirm_remove_loop<B: Backend, E: Events>(
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 return Ok(RemoveOutcome::Cancelled);
             }
+            KeyCode::Char('?') => {
+                show_help_overlay(terminal, events, |frame| {
+                    draw_remove_confirm(frame, name, header_mode)
+                })
+                .map_err(tui_error)?;
+            }
             _ => {}
         }
     }
 }
 
 fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: HeaderMode) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
 
@@ -1872,10 +2037,7 @@ fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: Hea
             ];
             if let Some(message) = &model.message {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    message.clone(),
-                    Style::default().fg(Color::Red),
-                )));
+                lines.push(Line::from(Span::styled(message.clone(), fg(Color::Red))));
             }
             frame.render_widget(
                 Paragraph::new(lines).wrap(Wrap { trim: false }).block(
@@ -1886,7 +2048,48 @@ fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: Hea
                 body,
             );
             frame.render_widget(
-                Paragraph::new("Type a name · Enter save · Esc back"),
+                Paragraph::new("Type a name · Enter save (confirm screen) · Esc back · ? help"),
+                footer,
+            );
+        }
+        FormStage::Confirm => {
+            let mut lines = vec![Line::from(Span::styled(
+                match &model.editing {
+                    Some(name) => format!("Replace pair '{name}'?"),
+                    None => format!("Create pair '{}'?", model.name_input),
+                },
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            lines.push(Line::from(""));
+            if model.editing.is_some() {
+                lines.push(Line::from(
+                    "This replaces the existing definition; its previous source and destination are discarded.",
+                ));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(format!(
+                "Source: {}",
+                model.source.current().display()
+            )));
+            lines.push(Line::from(format!(
+                "Destination: {}",
+                model.destination.current().display()
+            )));
+            lines.push(Line::from(format!("Mode: {}", model.mode)));
+            if let Some(message) = &model.message {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(message.clone(), fg(Color::Red))));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Confirm pair "),
+                ),
+                body,
+            );
+            frame.render_widget(
+                Paragraph::new("y confirm · n/Esc back · q cancel · ? help"),
                 footer,
             );
         }
@@ -1914,8 +2117,12 @@ fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: Hea
                 Some(name) => format!("Editing '{name}' — mode: {}", model.mode),
                 None => format!("New pair — mode: {}", model.mode),
             };
+            let focus_name = match model.focus {
+                PaneFocus::Source => "Source",
+                PaneFocus::Destination => "Destination",
+            };
             let base_help = format!(
-                "{title} · Tab switch pane · \u{2191}/\u{2193} or j/k move · Enter/l descend · Backspace/h ascend · m mode · s save · q cancel"
+                "{title} · Focus: {focus_name} · Tab switch pane · \u{2191}/\u{2193} or j/k move · Enter/l descend · Backspace/h ascend · m mode · s save (confirm screen) · q cancel · {HELP_HINT}"
             );
             let help = match &model.message {
                 Some(message) => format!("{message} ({base_help})"),
@@ -1951,9 +2158,7 @@ fn draw_browse_pane(
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_symbol("▶ ")
         .highlight_style(if focused {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         });
@@ -1965,6 +2170,9 @@ fn draw_browse_pane(
 }
 
 fn draw_remove_confirm(frame: &mut Frame<'_>, name: &str, header_mode: HeaderMode) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
     let lines = vec![
@@ -1986,23 +2194,26 @@ fn draw_remove_confirm(frame: &mut Frame<'_>, name: &str, header_mode: HeaderMod
         ),
         body,
     );
-    frame.render_widget(Paragraph::new("y remove · n/Esc cancel"), footer);
+    frame.render_widget(Paragraph::new("y remove · n/Esc cancel · ? help"), footer);
 }
 
 fn draw_compare(frame: &mut Frame<'_>, pair_name: &str, comparing: bool, header_mode: HeaderMode) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
     let (lines, help): (Vec<Line<'_>>, &str) = if comparing {
         (
             vec![Line::from(format!("Scanning '{pair_name}'…"))],
-            "Esc/q abandon the scan · destination and configuration stay untouched",
+            "Esc/q abandon the scan · destination and configuration stay untouched · ? help",
         )
     } else {
         (
             vec![Line::from(format!(
                 "Pair '{pair_name}' selected; no scan has started yet."
             ))],
-            "Enter/c compare · q cancel",
+            "Enter/c compare · q cancel · ? help",
         )
     };
     frame.render_widget(
@@ -2013,6 +2224,9 @@ fn draw_compare(frame: &mut Frame<'_>, pair_name: &str, comparing: bool, header_
 }
 
 fn draw_result(frame: &mut Frame<'_>, view: &ResultView, header_mode: HeaderMode) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
     let mut lines = vec![
@@ -2025,7 +2239,7 @@ fn draw_result(frame: &mut Frame<'_>, view: &ResultView, header_mode: HeaderMode
     if view.interrupted {
         lines.push(Line::from(Span::styled(
             "Run interrupted; running again converges.",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
         if let Some(message) = &view.message {
             lines.push(Line::from(message.clone()));
@@ -2077,10 +2291,13 @@ fn draw_result(frame: &mut Frame<'_>, view: &ResultView, header_mode: HeaderMode
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Result ")),
         body,
     );
-    frame.render_widget(Paragraph::new("Enter/q dismiss"), footer);
+    frame.render_widget(Paragraph::new("Enter/q dismiss · ? help"), footer);
 }
 
 fn draw_review(frame: &mut Frame<'_>, model: &ReviewModel, header_mode: HeaderMode) {
+    if is_too_small(frame.area()) {
+        return draw_too_small(frame);
+    }
     let [header, body, footer] = vertical_sections(frame.area(), header_mode);
     draw_header(frame, header, header_mode);
     match model.screen {
@@ -2089,9 +2306,25 @@ fn draw_review(frame: &mut Frame<'_>, model: &ReviewModel, header_mode: HeaderMo
     }
     let help = match model.screen {
         Screen::Actions => {
-            "↑/↓ or j/k move · Space include/exclude · u unchanged · Enter review confirmation · q cancel"
+            let base = format!(
+                "↑/↓ or j/k move · Space include/exclude · u unchanged · Enter review confirmation · q cancel · {HELP_HINT}"
+            );
+            // 80-99 columns drop the Reason column from the table (ADR-0010
+            // narrowing): the cursor row's reason moves here instead of
+            // disappearing, so nothing readable is lost, only relocated.
+            if (80..100).contains(&body.width) {
+                if let Some(row) = model.rows.get(model.selected) {
+                    format!("Reason: {} ({base})", row.detail)
+                } else {
+                    base
+                }
+            } else {
+                base
+            }
         }
-        Screen::Confirm => "y confirm and run · b/n/Esc return to actions · q cancel",
+        Screen::Confirm => {
+            format!("y confirm and run · b/n/Esc return to actions · q cancel · {HELP_HINT}")
+        }
     };
     frame.render_widget(Paragraph::new(help), footer);
 }
@@ -2162,52 +2395,7 @@ fn gradient_mark(mark: [&'static str; 3]) -> Vec<Span<'static>> {
 /// reason. The row model is presentation derived from the `Plan` the engine
 /// already produced; nothing here recomputes a diff.
 fn draw_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &ReviewModel) {
-    let rows = model.rows.iter().map(|row| {
-        let check = if row.included { "[x]" } else { "[ ]" };
-        let (source, destination) = row.operation.sides(&row.path);
-        let mut reason = row.detail.clone();
-        if let Some(bytes) = row.bytes {
-            reason = format!("{reason} · {}", plan::human_size(bytes));
-        }
-        if row.operation.uses_safety_net() {
-            reason = format!("{reason} · {}", plan::SAFETYNET_NOTE);
-        }
-        Row::new(vec![
-            Cell::from(check),
-            Cell::from(row.operation.label()).style(Style::default().fg(row.operation.color())),
-            Cell::from(source),
-            Cell::from(row.operation.direction_glyph()),
-            Cell::from(destination),
-            Cell::from(reason),
-        ])
-    });
-
     let unchanged = model.dry_run.unchanged;
-    // Revealed rows come straight from `Plan::unchanged_paths` — the same
-    // source every other row is derived from — never a recomputed diff.
-    // The check column stays blank: unchanged items are not actions, so
-    // they carry no include/exclude mark and never join `model.rows`
-    // (ADR-0010 §2, criterion 6: the reviewed subset only ever comes from
-    // `copies`/`updates`/`deletes`/`errors`).
-    let unchanged_rows = model.dry_run.unchanged_paths.iter().map(|path| {
-        let path = path.to_string_lossy();
-        let (source, destination) = Operation::Unchanged.sides(&path);
-        Row::new(vec![
-            Cell::from(""),
-            Cell::from(Operation::Unchanged.label())
-                .style(Style::default().fg(Operation::Unchanged.color())),
-            Cell::from(source),
-            Cell::from(Operation::Unchanged.direction_glyph()),
-            Cell::from(destination),
-            Cell::from("identical on both sides"),
-        ])
-    });
-    let rows: Vec<Row<'_>> = if model.show_unchanged {
-        rows.chain(unchanged_rows).collect()
-    } else {
-        rows.collect()
-    };
-
     let reveal_hint = if unchanged == 0 {
         String::new()
     } else if model.show_unchanged {
@@ -2221,33 +2409,150 @@ fn draw_actions(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &Revi
         model.mode,
         model.rows.len()
     );
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Length(11),
-            Constraint::Min(12),
-            Constraint::Length(3),
-            Constraint::Min(12),
-            Constraint::Fill(2),
-        ],
-    )
-    .header(
-        Row::new(["", "Operation", "Source", "", "Destination", "Reason"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(Block::default().borders(Borders::ALL).title(title))
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("▶");
-    let mut state = TableState::default();
+
+    // ADR-0010's two-sided row degrades by width, never by hiding which
+    // side an action affects and never by scrolling sideways: 100+ columns
+    // keep every column including Reason; 80-99 drop Reason only (moved to
+    // the status line by the caller); below 80 the table collapses to one
+    // path column plus the operation — still one row per action, per #54's
+    // ruling against an aggregated unchanged count.
+    if area.width < 80 {
+        draw_actions_collapsed(frame, area, model, title);
+        return;
+    }
+    let show_reason = area.width >= 100;
+
+    let row_cells = |row: &ReviewRow| {
+        let check = if row.included { "[x]" } else { "[ ]" };
+        let (source, destination) = row.operation.sides(&row.path);
+        let mut cells = vec![
+            Cell::from(check),
+            Cell::from(row.operation.label()).style(fg(row.operation.color())),
+            Cell::from(source),
+            Cell::from(row.operation.direction_glyph()),
+            Cell::from(destination),
+        ];
+        if show_reason {
+            let mut reason = row.detail.clone();
+            if let Some(bytes) = row.bytes {
+                reason = format!("{reason} · {}", plan::human_size(bytes));
+            }
+            if row.operation.uses_safety_net() {
+                reason = format!("{reason} · {}", plan::SAFETYNET_NOTE);
+            }
+            cells.push(Cell::from(reason));
+        }
+        Row::new(cells)
+    };
+    let rows = model.rows.iter().map(row_cells);
+
+    // Revealed rows come straight from `Plan::unchanged_paths` — the same
+    // source every other row is derived from — never a recomputed diff.
+    // The check column stays blank: unchanged items are not actions, so
+    // they carry no include/exclude mark and never join `model.rows`
+    // (ADR-0010 §2, criterion 6: the reviewed subset only ever comes from
+    // `copies`/`updates`/`deletes`/`errors`).
+    let unchanged_rows = model.dry_run.unchanged_paths.iter().map(|path| {
+        let path = path.to_string_lossy();
+        let (source, destination) = Operation::Unchanged.sides(&path);
+        let mut cells = vec![
+            Cell::from(""),
+            Cell::from(Operation::Unchanged.label()).style(fg(Operation::Unchanged.color())),
+            Cell::from(source),
+            Cell::from(Operation::Unchanged.direction_glyph()),
+            Cell::from(destination),
+        ];
+        if show_reason {
+            cells.push(Cell::from("identical on both sides"));
+        }
+        Row::new(cells)
+    });
+    let rows: Vec<Row<'_>> = if model.show_unchanged {
+        rows.chain(unchanged_rows).collect()
+    } else {
+        rows.collect()
+    };
+
+    let mut widths = vec![
+        Constraint::Length(3),
+        Constraint::Length(11),
+        Constraint::Min(12),
+        Constraint::Length(3),
+        Constraint::Min(12),
+    ];
+    let mut header = vec!["", "Operation", "Source", "", "Destination"];
+    if show_reason {
+        widths.push(Constraint::Fill(2));
+        header.push("Reason");
+    }
+
+    let table = Table::new(rows, widths)
+        .header(Row::new(header).style(Style::default().add_modifier(Modifier::BOLD)))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶");
+    let mut state = TableState::default().with_offset(model.table_offset.get());
     if !model.rows.is_empty() {
         state.select(Some(model.selected));
     }
     frame.render_stateful_widget(table, area, &mut state);
+    model.table_offset.set(state.offset());
+}
+
+/// Below 80 columns: one row per action still (never an aggregate — #54's
+/// ruling), collapsed to the operation plus a single path column that
+/// always names which side it stands for, so a shrunk terminal can never be
+/// mistaken about which side an action affects.
+fn draw_actions_collapsed(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    model: &ReviewModel,
+    title: String,
+) {
+    let rows = model.rows.iter().map(|row| {
+        let check = if row.included { "[x]" } else { "[ ]" };
+        let operation = format!("{check} {}", row.operation.label());
+        let path = format!("{}: {}", row.operation.side_word(), row.path);
+        Row::new(vec![
+            Cell::from(operation).style(fg(row.operation.color())),
+            Cell::from(path),
+        ])
+    });
+    let unchanged_rows = model.dry_run.unchanged_paths.iter().map(|path| {
+        let operation = format!("  {}", Operation::Unchanged.label());
+        let path = format!("{}: {}", Operation::Unchanged.side_word(), path.display());
+        Row::new(vec![
+            Cell::from(operation).style(fg(Operation::Unchanged.color())),
+            Cell::from(path),
+        ])
+    });
+    let rows: Vec<Row<'_>> = if model.show_unchanged {
+        rows.chain(unchanged_rows).collect()
+    } else {
+        rows.collect()
+    };
+
+    let table = Table::new(rows, [Constraint::Length(14), Constraint::Fill(1)])
+        .header(
+            Row::new(["Operation", "Path"]).style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶");
+    let mut state = TableState::default().with_offset(model.table_offset.get());
+    if !model.rows.is_empty() {
+        state.select(Some(model.selected));
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+    model.table_offset.set(state.offset());
 }
 
 fn draw_confirmation(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: &ReviewModel) {
@@ -2277,12 +2582,12 @@ fn draw_confirmation(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: 
                 "BLOCKED: {} included error row(s) must be excluded or fixed.",
                 totals.errors
             ),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             "Ready: press y to execute this reviewed subset.",
-            Style::default().fg(Color::Green),
+            fg(Color::Green),
         )));
     }
     if !model.notices.is_empty() {
@@ -2297,10 +2602,7 @@ fn draw_confirmation(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: 
     }
     if let Some(message) = &model.message {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            message.clone(),
-            Style::default().fg(Color::Red),
-        )));
+        lines.push(Line::from(Span::styled(message.clone(), fg(Color::Red))));
     }
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -2308,6 +2610,110 @@ fn draw_confirmation(frame: &mut Frame<'_>, area: ratatui::layout::Rect, model: 
                 .borders(Borders::ALL)
                 .title(" Review-first confirmation "),
         ),
+        area,
+    );
+}
+
+/// Whether `NO_COLOR` is set — checked live (not cached) so tests can set
+/// and unset the variable within a single process. When set, meaning must
+/// never depend on a colour that this function causes to be suppressed
+/// (ADR-0005's banner already goes plain under `NO_COLOR`; this extends the
+/// same rule to the rest of the interface).
+fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some()
+}
+
+/// A foreground colour that disappears under `NO_COLOR` — every place this
+/// is used must already carry its meaning in the accompanying text (an
+/// operation word, "BLOCKED"/"OK", "Ready"/error text), never in colour
+/// alone.
+fn fg(color: Color) -> Style {
+    if no_color() {
+        Style::default()
+    } else {
+        Style::default().fg(color)
+    }
+}
+
+/// Whether a keystroke can be typed right now that would help the user
+/// understand this stage — used only to build the `?` help hint; the help
+/// overlay itself is reachable from every interactive loop in this module.
+const HELP_HINT: &str = "? help";
+
+/// The full keyboard reference (criterion: "a help overlay ... exists"),
+/// shown over whatever screen is current until any key dismisses it. Every
+/// key documented here is also, per screen, surfaced as a context-sensitive
+/// hint in that screen's footer — this overlay is the exhaustive reference,
+/// the footer is the "valid right now" subset.
+const HELP_TEXT: &str = "\
+Global: ? help (this screen) · q/Esc cancel or back · Tab switch pane · \u{2191}/\u{2193} or j/k move · Enter/l descend · Backspace/h ascend
+
+Pair picker: Enter select · n new · e edit · x remove (confirm screen) · q cancel
+Create/edit form: m mode · s save (confirm screen) · q cancel
+Naming: type name · Enter save (confirm screen) · Esc back
+Pair-form confirm: y confirm · n/Esc back to form · q cancel
+Pair panes: Enter/c compare · r refresh (never runs) · q cancel
+Compare: Enter/c start scan · Esc/q abandon (destination and configuration stay untouched)
+Review: Space include/exclude · a/A all/none · u show/hide unchanged · Enter open confirm screen
+Confirm: y confirm and run (the only key that runs) · b/n/Esc back to review · q cancel
+Result: Enter/q dismiss (persists until dismissed)
+
+No single keystroke changes configuration or touches the destination. Removal and Run are both\n\
+reachable only through their own confirm screen, and refresh (r) is never the same key as run (y).";
+
+/// Draws the full-reference help overlay over whatever is already on
+/// screen — callers draw their normal frame first, then this, so the
+/// overlay never discards the underlying stage's state.
+fn draw_help_overlay(frame: &mut Frame<'_>) {
+    let area = frame.area();
+    frame.render_widget(
+        Paragraph::new(HELP_TEXT).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Help (any key closes) "),
+        ),
+        area,
+    );
+}
+
+/// Waits for a single keypress to dismiss the help overlay. The overlay is
+/// pure presentation over the caller's already-rendered frame — no state
+/// changes while it's open, so reopening the underlying screen afterward is
+/// simply redrawing it.
+fn show_help_overlay<B: Backend, E: Events>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    draw_background: impl Fn(&mut Frame<'_>),
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|frame| {
+            draw_background(frame);
+            draw_help_overlay(frame);
+        })?;
+        let Event::Key(key) = events.next()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+/// Below this width or height nothing degrades further — the interface says
+/// so rather than scrolling sideways or hiding which side an action affects.
+fn is_too_small(area: ratatui::layout::Rect) -> bool {
+    area.width < 60 || area.height < 15
+}
+
+fn draw_too_small(frame: &mut Frame<'_>) {
+    let area = frame.area();
+    frame.render_widget(
+        Paragraph::new(
+            "Terminal too small — resize to at least 60 columns and 15 rows to use vibesync.",
+        )
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL)),
         area,
     );
 }
@@ -2431,15 +2837,64 @@ mod tests {
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        buffer_text_sized(terminal, 140, 24)
+    }
+
+    /// Like `buffer_text`, but for a `TestBackend` built at a width/height
+    /// other than the 140x24 the rest of this suite assumes — needed to
+    /// exercise the responsive breakpoints, which are only reachable at an
+    /// explicit narrower width.
+    fn buffer_text_sized(terminal: &Terminal<TestBackend>, width: u16, height: u16) -> String {
         let buffer = terminal.backend().buffer();
         let mut output = String::new();
-        for y in 0..24 {
-            for x in 0..140 {
+        for y in 0..height {
+            for x in 0..width {
                 output.push_str(buffer.cell((x, y)).unwrap().symbol());
             }
             output.push('\n');
         }
         output
+    }
+
+    /// Restores an environment variable's prior value (or absence) on drop —
+    /// used so a `NO_COLOR` test never leaks a process-wide env change into
+    /// whichever other test happens to run concurrently.
+    /// Serializes every `EnvGuard` use process-wide: `cargo test` runs tests
+    /// on multiple threads by default, and an env var is process state, not
+    /// per-thread — without this, two NO_COLOR tests overlapping could see
+    /// one guard's `Drop` unset the variable while the other is still
+    /// mid-render, painting real colour into what should be a colourless
+    /// frame.
+    static ENV_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_GUARD_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     #[test]
@@ -3595,6 +4050,47 @@ mod tests {
         assert!(matches!(outcome, PaneOutcome::Proceed));
     }
 
+    #[test]
+    fn refresh_replaces_the_message_with_the_refreshed_outcome_rather_than_clearing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let restricted = dir.path().join("locked");
+        fs::create_dir(&restricted).unwrap();
+        let mut perms = fs::metadata(&restricted).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&restricted, perms.clone()).unwrap();
+
+        let mut cfg_pair = pair(Mode::Mirror);
+        cfg_pair.source = restricted.clone();
+        cfg_pair.source_volume_relative_path = Some(PathBuf::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events =
+            ScriptedEvents::keys([KeyCode::Enter, KeyCode::Char('r'), KeyCode::Char('q')]);
+
+        pane_gate(
+            &mut terminal,
+            &mut events,
+            "photos",
+            &cfg_pair,
+            None,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        perms.set_mode(0o700);
+        fs::set_permissions(&restricted, perms).unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("Refreshed"),
+            "a refresh must replace the message with what it found, not blank it: {screen}"
+        );
+        assert!(
+            !screen.contains("Compare disabled"),
+            "the stale pre-refresh message must not survive an explicit refresh: {screen}"
+        );
+    }
+
     // --- Issue #57: two-pane browsing and Folder pair management ---
 
     fn browse_tree() -> tempfile::TempDir {
@@ -3676,7 +4172,7 @@ mod tests {
             [KeyCode::Char('s')]
                 .into_iter()
                 .chain("photos".chars().map(KeyCode::Char))
-                .chain([KeyCode::Enter]),
+                .chain([KeyCode::Enter, KeyCode::Char('y')]),
         );
 
         let outcome = pair_form_loop(
@@ -3723,7 +4219,12 @@ mod tests {
             [KeyCode::Char('s')]
                 .into_iter()
                 .chain("Bad Name".chars().map(KeyCode::Char))
-                .chain([KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')]),
+                .chain([
+                    KeyCode::Enter,
+                    KeyCode::Char('y'),
+                    KeyCode::Esc,
+                    KeyCode::Char('q'),
+                ]),
         );
 
         let outcome = pair_form_loop(
@@ -3777,7 +4278,12 @@ mod tests {
             [KeyCode::Char('s')]
                 .into_iter()
                 .chain("photos".chars().map(KeyCode::Char))
-                .chain([KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')]),
+                .chain([
+                    KeyCode::Enter,
+                    KeyCode::Char('y'),
+                    KeyCode::Esc,
+                    KeyCode::Char('q'),
+                ]),
         );
 
         pair_form_loop(
@@ -3823,7 +4329,7 @@ mod tests {
         model.destination = BrowsePane::new(new_destination.path().to_path_buf());
         model.toggle_mode();
         let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
-        let mut events = ScriptedEvents::keys([KeyCode::Char('s')]);
+        let mut events = ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Char('y')]);
 
         let outcome = pair_form_loop(
             &mut terminal,
@@ -3861,12 +4367,174 @@ mod tests {
             mode: Mode::Update,
         };
         let mut model = PairFormModel::edit_pair("photos", &pair_value);
-        // The only key that could start a save ('s') goes straight to a save
-        // attempt for an editing model — `Naming` is only reachable when
-        // `editing` is `None`, so an edit can never present a name field.
+        // The only key that could start a save ('s') goes straight to the
+        // confirm gate for an editing model — `Naming` is only reachable
+        // when `editing` is `None`, so an edit can never present a name
+        // field, even by way of a rejected confirmation.
         assert_eq!(model.editing.as_deref(), Some("photos"));
         model.stage = FormStage::Browse;
         assert!(!matches!(model.stage, FormStage::Naming));
+        assert!(matches!(model.stage_before_confirm(), FormStage::Browse));
+    }
+
+    #[test]
+    fn editing_a_pair_does_not_write_until_the_confirm_screen_accepts() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let original_source = tempfile::tempdir().unwrap();
+        let original_destination = tempfile::tempdir().unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            original_source.path(),
+            original_destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+        let config_before = fs::read_to_string(&config_path).unwrap();
+
+        let cfg = config::load(&config_path).unwrap();
+        let cfg_pair = cfg.pairs.get("photos").unwrap().clone();
+        let mut model = PairFormModel::edit_pair("photos", &cfg_pair);
+        let new_destination = tempfile::tempdir().unwrap();
+        model.destination = BrowsePane::new(new_destination.path().to_path_buf());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        // 's' must only stage the pending edit; 'n' rejects it and returns to
+        // the form with the edit still pending rather than writing anything;
+        // 'q' then cancels the form outright.
+        let mut events =
+            ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Char('n'), KeyCode::Char('q')]);
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            config_before,
+            "a single 's' followed by rejection must never replace the pair's definition"
+        );
+        assert!(
+            matches!(model.stage, FormStage::Browse),
+            "rejecting the confirm screen must return to the form"
+        );
+        assert_eq!(
+            model.destination.current(),
+            new_destination.path(),
+            "the pending edit must survive a rejected confirmation, not be discarded"
+        );
+    }
+
+    #[test]
+    fn creating_a_pair_does_not_write_until_the_confirm_screen_accepts() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let mut model = PairFormModel::new_pair(source.path().to_path_buf());
+        model.destination = BrowsePane::new(destination.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        // Enter in Naming must only stage the new pair; rejecting the
+        // confirm screen returns to Naming with the typed name intact, and
+        // no config file is ever created.
+        let mut events = ScriptedEvents::keys(
+            [KeyCode::Char('s')]
+                .into_iter()
+                .chain("photos".chars().map(KeyCode::Char))
+                .chain([
+                    KeyCode::Enter,
+                    KeyCode::Char('n'),
+                    KeyCode::Esc,
+                    KeyCode::Char('q'),
+                ]),
+        );
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert!(
+            !config_path.exists(),
+            "Naming's Enter must stage the save behind a confirm screen, never write immediately"
+        );
+    }
+
+    #[test]
+    fn entering_naming_stage_preserves_an_existing_status_message() {
+        let root = browse_tree();
+        let mut model = PairFormModel::new_pair(root.path().to_path_buf());
+        model.message = Some("existing warning".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Esc, KeyCode::Esc]);
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            Path::new("/nonexistent/config.toml"),
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert_eq!(
+            model.message.as_deref(),
+            Some("existing warning"),
+            "a stage change must not clear a status message; only another message may replace it"
+        );
+    }
+
+    #[test]
+    fn q_at_the_pair_form_confirm_screen_cancels_outright_like_every_other_confirm_screen() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let original_source = tempfile::tempdir().unwrap();
+        let original_destination = tempfile::tempdir().unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            original_source.path(),
+            original_destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+        let config_before = fs::read_to_string(&config_path).unwrap();
+
+        let cfg = config::load(&config_path).unwrap();
+        let cfg_pair = cfg.pairs.get("photos").unwrap().clone();
+        let mut model = PairFormModel::edit_pair("photos", &cfg_pair);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        // 'q' at Confirm must cancel the whole form in one step, matching the
+        // removal and run confirm screens, rather than only backing up.
+        let mut events = ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Char('q')]);
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config_before);
     }
 
     #[test]
@@ -3969,5 +4637,433 @@ mod tests {
         let screen = buffer_text(&terminal);
         assert!(screen.contains("Press n to add one"), "{screen}");
         assert!(!screen.to_lowercase().contains("rename"), "{screen}");
+    }
+
+    // --- Issue #59: keyboard map, focus, help, responsive degradation ---
+
+    #[test]
+    fn below_60_columns_or_15_rows_reports_the_terminal_is_too_small() {
+        let model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), plan::Plan::default());
+
+        let mut narrow = Terminal::new(TestBackend::new(55, 24)).unwrap();
+        narrow
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let screen = buffer_text_sized(&narrow, 55, 24);
+        assert!(screen.contains("too small"), "{screen}");
+
+        let mut short = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        short
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let screen = buffer_text_sized(&short, 100, 10);
+        assert!(screen.contains("too small"), "{screen}");
+
+        // Just above both floors, the ordinary review screen renders instead.
+        let mut ok = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        ok.draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let screen = buffer_text_sized(&ok, 60, 15);
+        assert!(!screen.contains("too small"), "{screen}");
+    }
+
+    #[test]
+    fn at_100_columns_or_more_the_reason_column_renders_in_the_table() {
+        let dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "a distinctive reason phrase")],
+            ..plan::Plan::default()
+        };
+        let model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text_sized(&terminal, 100, 24);
+        assert!(screen.contains("Reason"), "{screen}");
+        assert!(screen.contains("a distinctive reason phrase"), "{screen}");
+    }
+
+    #[test]
+    fn between_80_and_99_columns_drops_the_reason_column_from_the_table_and_shows_it_on_the_status_line_for_the_cursor_row(
+    ) {
+        let dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "a distinctive reason phrase")],
+            ..plan::Plan::default()
+        };
+        let model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text_sized(&terminal, 90, 24);
+        // The reason text itself must appear exactly once — on the status
+        // line — not also duplicated inside a dropped table column.
+        assert_eq!(
+            screen.matches("a distinctive reason phrase").count(),
+            1,
+            "reason text must appear exactly once, on the status line: {screen}"
+        );
+        let table_header_line = screen
+            .lines()
+            .find(|line| line.contains("Operation") && line.contains("Source"))
+            .expect("table header line must be present");
+        assert!(
+            !table_header_line.contains("Reason"),
+            "the table header must not carry a Reason column at 80-99 columns: {table_header_line}"
+        );
+    }
+
+    #[test]
+    fn between_60_and_79_columns_collapses_to_a_single_path_column_that_still_names_the_affected_side(
+    ) {
+        let dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "new")],
+            deletes: vec![action("gone.txt", 3, "not in source")],
+            ..plan::Plan::default()
+        };
+        let model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        let screen = buffer_text_sized(&terminal, 70, 24);
+        // Never an aggregate (#54's ruling): both distinct paths still
+        // appear as their own row, not folded into a count.
+        assert!(screen.contains("new.txt"), "{screen}");
+        assert!(screen.contains("gone.txt"), "{screen}");
+        // The side an action affects is a word, not a position: a Copy row
+        // must say "source" and a Delete row must say "destination", so a
+        // 70-column terminal can never mistake which side is touched.
+        assert!(screen.contains("source: new.txt"), "{screen}");
+        assert!(screen.contains("destination: gone.txt"), "{screen}");
+    }
+
+    #[test]
+    fn no_color_suppresses_foreground_colour_on_operation_and_status_text_but_keeps_every_word() {
+        let _guard = EnvGuard::set("NO_COLOR", "1");
+        let dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "new")],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        // `HeaderMode::Suppressed` isolates this test to the body/footer
+        // colours this module controls via `fg()`; a live caller derives
+        // `HeaderMode` from `NO_COLOR` too (via `banner::header_mode`), but
+        // that switch is `banner`'s contract, not this one's.
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Suppressed))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("COPY"),
+            "operation word must survive: {screen}"
+        );
+        let buffer = terminal.backend().buffer();
+        let operation_cell = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol().contains('C') && cell.fg != Color::Reset);
+        assert!(
+            operation_cell.is_none(),
+            "no cell should carry a non-default foreground colour under NO_COLOR"
+        );
+
+        model.screen = Screen::Confirm;
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Suppressed))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("Ready:"), "{screen}");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().all(|cell| cell.fg == Color::Reset),
+            "the confirmation screen must render with no non-default foreground under NO_COLOR"
+        );
+    }
+
+    #[test]
+    fn help_overlay_opens_with_question_mark_over_the_current_screen_and_closes_on_any_key() {
+        let dry_run = plan::Plan {
+            copies: vec![action("new.txt", 5, "new")],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events =
+            ScriptedEvents::keys([KeyCode::Char('?'), KeyCode::Char('z'), KeyCode::Char('q')]);
+
+        let outcome =
+            review_loop(&mut terminal, &mut events, &mut model, HeaderMode::Full).unwrap();
+
+        assert!(matches!(outcome, ReviewOutcome::Cancelled));
+        // Opening and closing help must never touch review state.
+        assert_eq!(model.selected, 0);
+        assert_eq!(model.rows.len(), 1);
+    }
+
+    #[test]
+    fn help_overlay_renders_the_full_keyboard_reference() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(draw_help_overlay).unwrap();
+
+        let screen = buffer_text(&terminal);
+        for expected in ["Review:", "Confirm:", "y confirm and run", "r refresh"] {
+            assert!(screen.contains(expected), "missing {expected:?}: {screen}");
+        }
+    }
+
+    #[test]
+    fn select_all_and_select_none_include_or_exclude_every_row_except_mandatory_cleanup() {
+        let dry_run = plan::Plan {
+            copies: vec![action("a.txt", 1, "new")],
+            deletes: vec![action("b.txt", 1, "not in source")],
+            strays: vec![PathBuf::from(".old.vibesync-tmp-run")],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+
+        model.select_none();
+        assert_eq!(model.totals().excluded, 2, "cleanup must stay included");
+        assert_eq!(model.totals().cleanups, 1);
+
+        model.select_all();
+        assert_eq!(model.totals().excluded, 0);
+        assert_eq!(model.totals().copies, 1);
+        assert_eq!(model.totals().deletes, 1);
+        assert_eq!(model.totals().cleanups, 1);
+    }
+
+    #[test]
+    fn a_status_message_survives_unrelated_navigation_until_replaced() {
+        let dry_run = plan::Plan {
+            copies: vec![action("a.txt", 1, "new")],
+            strays: vec![PathBuf::from(".old.vibesync-tmp-run")],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        model.selected = model
+            .rows
+            .iter()
+            .position(|row| row.operation == Operation::Cleanup)
+            .expect("cleanup row must exist");
+
+        model.toggle();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence")
+        );
+
+        model.move_up();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence"),
+            "an unrelated navigation keypress must not clear a pending status message"
+        );
+
+        model.move_down();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence"),
+            "an unrelated navigation keypress must not clear a pending status message"
+        );
+
+        model.selected = 0;
+        model.toggle();
+        assert_eq!(
+            model.message.as_deref(),
+            Some("Cleanup is mandatory for convergence"),
+            "toggling a row without producing a new message must not silently clear the old one"
+        );
+    }
+
+    #[test]
+    fn resizing_preserves_review_selection_and_stage() {
+        let dry_run = plan::Plan {
+            copies: vec![action("a.txt", 1, "new"), action("b.txt", 1, "new")],
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents {
+            script: VecDeque::from(vec![
+                Event::Key(KeyCode::Down.into()),
+                Event::Resize(80, 24),
+                Event::Key(KeyCode::Char('q').into()),
+            ]),
+            buffered: VecDeque::new(),
+        };
+
+        let outcome =
+            review_loop(&mut terminal, &mut events, &mut model, HeaderMode::Full).unwrap();
+
+        assert!(matches!(outcome, ReviewOutcome::Cancelled));
+        assert_eq!(
+            model.selected, 1,
+            "selection must survive an intervening resize event"
+        );
+        assert_eq!(model.screen, Screen::Actions);
+    }
+
+    /// Reproduces `TableState`'s own scroll hysteresis: once the table has
+    /// scrolled to make a far-down row visible, moving the selection back up
+    /// *within that same visible window* must not snap the window back to
+    /// the top. That only holds if the offset from the previous draw feeds
+    /// into the next one — a fresh `TableState::default()` every frame (the
+    /// bug this test guards) recomputes the window purely from the current
+    /// selection, discarding the fact that the wider window was already
+    /// open, so it snaps to the top instead. Resize must not disturb that
+    /// carried-over offset either.
+    #[test]
+    fn resizing_preserves_review_scroll_offset() {
+        let copies = (0..30)
+            .map(|i| action(&format!("a{i:02}.txt"), 1, "new"))
+            .collect();
+        let dry_run = plan::Plan {
+            copies,
+            ..plan::Plan::default()
+        };
+        let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+        for _ in 0..25 {
+            model.move_down();
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let offset_before = model.table_offset.get();
+        assert!(
+            offset_before > 0,
+            "selecting a row far down a 30-row list must scroll the table: {offset_before}"
+        );
+
+        // Move the cursor up, but stay inside the window that scrolling
+        // down to row 25 already opened — a reset-to-zero offset would
+        // still keep row 20 visible (it's within the first 17 rows too),
+        // so this alone wouldn't tell the two implementations apart.
+        // Checking the top-of-window row, not just "is the cursor
+        // visible", is what actually distinguishes carried-over scroll
+        // state from a window recomputed from scratch.
+        for _ in 0..5 {
+            model.move_up();
+        }
+        assert_eq!(model.selected, 20);
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+        assert_eq!(
+            model.table_offset.get(),
+            offset_before,
+            "moving the cursor within an already-open window must not re-close it"
+        );
+        let screen_before_resize = buffer_text(&terminal);
+        assert!(
+            !screen_before_resize.contains("a00.txt"),
+            "the window must stay scrolled down, not snap back to the top: {screen_before_resize}"
+        );
+
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 100, 24))
+            .unwrap();
+        terminal
+            .draw(|frame| draw_review(frame, &model, HeaderMode::Full))
+            .unwrap();
+
+        assert_eq!(
+            model.table_offset.get(),
+            offset_before,
+            "resize must not reset the scroll offset when the visible height is unchanged"
+        );
+        let screen_after = buffer_text_sized(&terminal, 100, 24);
+        assert!(
+            !screen_after.contains("a00.txt"),
+            "resize must not snap the scrolled window back to the top: {screen_after}"
+        );
+        assert!(
+            screen_after.contains("a20.txt"),
+            "the selected row must stay visible after resize: {screen_after}"
+        );
+    }
+
+    #[test]
+    fn naming_stage_advertises_help_and_opens_it_instead_of_typing_a_question_mark() {
+        let root = browse_tree();
+        let mut model = PairFormModel::new_pair(root.path().to_path_buf());
+        model.stage = FormStage::Naming;
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+        terminal
+            .draw(|frame| draw_pair_form(frame, &model, HeaderMode::Full))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("? help"),
+            "Naming's footer must advertise the help key like every other stage: {screen}"
+        );
+
+        let mut events =
+            ScriptedEvents::keys([KeyCode::Char('?'), KeyCode::Esc, KeyCode::Esc, KeyCode::Esc]);
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            Path::new("/nonexistent/config.toml"),
+            HeaderMode::Full,
+        )
+        .unwrap();
+        assert_eq!(
+            model.name_input, "",
+            "'?' must open help, not be intercepted as a name character, even in free-text entry"
+        );
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+    }
+
+    #[test]
+    fn no_color_suppresses_the_pair_selector_and_pair_form_highlight_colour() {
+        let _guard = EnvGuard::set("NO_COLOR", "1");
+
+        let choices = vec![choice(
+            "photos",
+            Mode::Mirror,
+            "/photos",
+            "/Volumes/Backup/Photos",
+        )];
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_pair_selector(frame, &choices, 0, &[], HeaderMode::Suppressed))
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset),
+            "pair selector highlight must carry no foreground colour under NO_COLOR"
+        );
+
+        let root = browse_tree();
+        let model = PairFormModel::new_pair(root.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_pair_form(frame, &model, HeaderMode::Suppressed))
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset),
+            "the focused browse pane's highlight must carry no foreground colour under NO_COLOR"
+        );
     }
 }
