@@ -99,6 +99,7 @@ Domain and architecture:
 - `docs/adr/0007-journal-design.md:1` — retained NDJSON Journal and convergence role.
 - `docs/adr/0008-post-copy-verification.md:1` — verification gate and metadata degradation.
 - `docs/adr/0009-acceptance-test-harness.md:1` — crash/fault acceptance strategy and invariants.
+- `docs/adr/0011-scripted-tui-input-synchronisation.md:1` — how scripted-keystroke TUI tests rendezvous with the child.
 
 Agent operations:
 
