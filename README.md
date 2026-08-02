@@ -6,7 +6,7 @@
 
 `vibesync` is a crash-safe, one-way file-sync tool for macOS on Apple Silicon: a single pure-Rust binary that mirrors or updates folders onto external drives (APFS and exFAT) without ever silently losing a previous version.
 
-Every run is **review-first**: `plan` shows a comprehensible dry-run diff before anything mutates, `run` asks before executing, and agents get the same plan as an NDJSON stream.
+Every run is **review-first**: `plan` shows a comprehensible dry-run diff before anything mutates, `run` asks before executing, and agents get the same plan as an NDJSON stream. A `ratatui` TUI (`vibesync tui`) offers the same review over a staged, fully keyboard-operable interface. The CLI is the documented accessible path for screen-reader users.
 
 ## Safety is the product
 
@@ -18,6 +18,10 @@ Every run is **review-first**: `plan` shows a comprehensible dry-run diff before
 ## Built for scripts and agents
 
 `plan --json` and `run --json` stream versioned NDJSON events, every guard is deterministic and abort-by-default with explicit per-run overrides, and the exit-code taxonomy (0 clean · 1 partial · 2 precondition abort · 3 blocked plan · 4 interrupted · 64 usage) lets callers branch without parsing JSON.
+
+## Managing Folder pairs
+
+`pair list --source <PATH>` finds the pair for wherever you're standing, matched by directory identity rather than a stored path string. Add `--check` to see each pair's volume state at a glance — mounted, relocated, absent, or otherwise — without opening it. `pair add --replace` redefines an existing pair (new paths, re-pinned volumes) in one atomic save, keeping its name and run history intact.
 
 ## Status
 

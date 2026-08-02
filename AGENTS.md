@@ -30,7 +30,7 @@ Module map:
 - `src/journal.rs:41` — retained run record, pair lock, Status/History.
 - `tests/cli.rs:53` — CLI fixture; acceptance-style behavior tests start at `tests/cli.rs:146`.
 
-Current implementation: Pair CRUD, human/NDJSON Dry-run and Run, SafetyNet, convergence cleanup, Journal, Status/History, Prune. Only TUI remains stubbed (`src/main.rs:155`, `src/main.rs:196`, `src/main.rs:205`).
+Current implementation: Pair CRUD (including `pair add --replace` to redefine a pair in one atomic save), human/NDJSON Dry-run and Run, SafetyNet, convergence cleanup, Journal, Status/History, Prune, and a staged `ratatui` TUI (`src/tui.rs`) covering Select, Compare, Review, Confirm, Run, and Result. `pair list` additionally supports `--check` (per-pair volume-state classification) and `--source <PATH>` (filter by directory).
 
 ## WHY: product and constraints
 
