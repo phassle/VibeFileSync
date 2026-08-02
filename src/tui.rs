@@ -1276,7 +1276,15 @@ fn pane_gate<B: Backend, E: Events>(
                 let (source, destination) = preconditions::classify_pair(cfg_pair);
                 source_state = source;
                 destination_state = destination;
-                message = None;
+                let (refreshed_source, refreshed_destination) =
+                    side_views(cfg_pair, &source_state, &destination_state);
+                message = Some(
+                    if refreshed_source.blocked || refreshed_destination.blocked {
+                        "Refreshed — a side still needs attention above.".to_string()
+                    } else {
+                        "Refreshed — both sides are ready.".to_string()
+                    },
+                );
             }
             KeyCode::Enter | KeyCode::Char('c') => {
                 if blocked {
@@ -1763,11 +1771,15 @@ impl BrowsePane {
 
 /// Which screen a Folder pair form is showing. `Naming` only exists for
 /// creation — an edit keeps its `editing` name fixed and never visits it, so
-/// renaming stays unreachable from every path through this model.
+/// renaming stays unreachable from every path through this model. `Confirm`
+/// is the mandatory gate before any write: an edit stages there directly
+/// from `Browse`, a creation after `Naming`, so no single keystroke ever
+/// calls `pair::add` — the one rule governing this key map.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FormStage {
     Browse,
     Naming,
+    Confirm,
 }
 
 /// The create/edit form: both panes browse the filesystem, and `s` saves by
@@ -1836,6 +1848,23 @@ impl PairFormModel {
             Mode::Mirror => Mode::Update,
         };
     }
+
+    /// The name that would be written if the pending change is confirmed:
+    /// the fixed name being edited, or the one just typed in `Naming`.
+    fn pending_name(&self) -> &str {
+        self.editing.as_deref().unwrap_or(&self.name_input)
+    }
+
+    /// Where a rejected confirmation returns to: `Browse` for an edit —
+    /// there is no naming step to revisit — or `Naming` for a creation, so
+    /// the typed name survives the rejection.
+    fn stage_before_confirm(&self) -> FormStage {
+        if self.editing.is_some() {
+            FormStage::Browse
+        } else {
+            FormStage::Naming
+        }
+    }
 }
 
 enum PairFormOutcome {
@@ -1872,23 +1901,8 @@ fn pair_form_loop<B: Backend, E: Events>(
                 KeyCode::Backspace | KeyCode::Char('h') => model.active_pane_mut().ascend(),
                 KeyCode::Char('m') | KeyCode::Char('M') => model.toggle_mode(),
                 KeyCode::Char('s') | KeyCode::Char('S') => match &model.editing {
-                    Some(name) => {
-                        match pair::add(
-                            config_path,
-                            name,
-                            model.source.current(),
-                            model.destination.current(),
-                            model.mode,
-                            true,
-                        ) {
-                            Ok(()) => return Ok(PairFormOutcome::Saved(name.clone())),
-                            Err(error) => model.message = Some(error.to_string()),
-                        }
-                    }
-                    None => {
-                        model.stage = FormStage::Naming;
-                        model.message = None;
-                    }
+                    Some(_) => model.stage = FormStage::Confirm,
+                    None => model.stage = FormStage::Naming,
                 },
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(PairFormOutcome::Cancelled),
                 KeyCode::Char('?') => {
@@ -1900,18 +1914,7 @@ fn pair_form_loop<B: Backend, E: Events>(
             },
             FormStage::Naming => match key.code {
                 KeyCode::Enter => {
-                    let name = model.name_input.clone();
-                    match pair::add(
-                        config_path,
-                        &name,
-                        model.source.current(),
-                        model.destination.current(),
-                        model.mode,
-                        false,
-                    ) {
-                        Ok(()) => return Ok(PairFormOutcome::Saved(name)),
-                        Err(error) => model.message = Some(error.to_string()),
-                    }
+                    model.stage = FormStage::Confirm;
                 }
                 KeyCode::Esc => {
                     model.stage = FormStage::Browse;
@@ -1925,6 +1928,36 @@ fn pair_form_loop<B: Backend, E: Events>(
                     })?;
                 }
                 KeyCode::Char(c) => model.name_input.push(c),
+                _ => {}
+            },
+            FormStage::Confirm => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let name = model.pending_name().to_string();
+                    let replace = model.editing.is_some();
+                    match pair::add(
+                        config_path,
+                        &name,
+                        model.source.current(),
+                        model.destination.current(),
+                        model.mode,
+                        replace,
+                    ) {
+                        Ok(()) => return Ok(PairFormOutcome::Saved(name)),
+                        Err(error) => {
+                            model.message = Some(error.to_string());
+                            model.stage = model.stage_before_confirm();
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    model.stage = model.stage_before_confirm();
+                }
+                KeyCode::Char('q') => return Ok(PairFormOutcome::Cancelled),
+                KeyCode::Char('?') => {
+                    show_help_overlay(terminal, events, |frame| {
+                        draw_pair_form(frame, model, header_mode)
+                    })?;
+                }
                 _ => {}
             },
         }
@@ -2015,7 +2048,48 @@ fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: Hea
                 body,
             );
             frame.render_widget(
-                Paragraph::new("Type a name · Enter save · Esc back · ? help"),
+                Paragraph::new("Type a name · Enter save (confirm screen) · Esc back · ? help"),
+                footer,
+            );
+        }
+        FormStage::Confirm => {
+            let mut lines = vec![Line::from(Span::styled(
+                match &model.editing {
+                    Some(name) => format!("Replace pair '{name}'?"),
+                    None => format!("Create pair '{}'?", model.name_input),
+                },
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            lines.push(Line::from(""));
+            if model.editing.is_some() {
+                lines.push(Line::from(
+                    "This replaces the existing definition; its previous source and destination are discarded.",
+                ));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(format!(
+                "Source: {}",
+                model.source.current().display()
+            )));
+            lines.push(Line::from(format!(
+                "Destination: {}",
+                model.destination.current().display()
+            )));
+            lines.push(Line::from(format!("Mode: {}", model.mode)));
+            if let Some(message) = &model.message {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(message.clone(), fg(Color::Red))));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Confirm pair "),
+                ),
+                body,
+            );
+            frame.render_widget(
+                Paragraph::new("y confirm · n/Esc back · q cancel · ? help"),
                 footer,
             );
         }
@@ -2048,7 +2122,7 @@ fn draw_pair_form(frame: &mut Frame<'_>, model: &PairFormModel, header_mode: Hea
                 PaneFocus::Destination => "Destination",
             };
             let base_help = format!(
-                "{title} · Focus: {focus_name} · Tab switch pane · \u{2191}/\u{2193} or j/k move · Enter/l descend · Backspace/h ascend · m mode · s save · q cancel · {HELP_HINT}"
+                "{title} · Focus: {focus_name} · Tab switch pane · \u{2191}/\u{2193} or j/k move · Enter/l descend · Backspace/h ascend · m mode · s save (confirm screen) · q cancel · {HELP_HINT}"
             );
             let help = match &model.message {
                 Some(message) => format!("{message} ({base_help})"),
@@ -2575,6 +2649,9 @@ const HELP_TEXT: &str = "\
 Global: ? help (this screen) · q/Esc cancel or back · Tab switch pane · \u{2191}/\u{2193} or j/k move · Enter/l descend · Backspace/h ascend
 
 Pair picker: Enter select · n new · e edit · x remove (confirm screen) · q cancel
+Create/edit form: m mode · s save (confirm screen) · q cancel
+Naming: type name · Enter save (confirm screen) · Esc back
+Pair-form confirm: y confirm · n/Esc back to form · q cancel
 Pair panes: Enter/c compare · r refresh (never runs) · q cancel
 Compare: Enter/c start scan · Esc/q abandon (destination and configuration stay untouched)
 Review: Space include/exclude · a/A all/none · u show/hide unchanged · Enter open confirm screen
@@ -3973,6 +4050,47 @@ mod tests {
         assert!(matches!(outcome, PaneOutcome::Proceed));
     }
 
+    #[test]
+    fn refresh_replaces_the_message_with_the_refreshed_outcome_rather_than_clearing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let restricted = dir.path().join("locked");
+        fs::create_dir(&restricted).unwrap();
+        let mut perms = fs::metadata(&restricted).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&restricted, perms.clone()).unwrap();
+
+        let mut cfg_pair = pair(Mode::Mirror);
+        cfg_pair.source = restricted.clone();
+        cfg_pair.source_volume_relative_path = Some(PathBuf::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events =
+            ScriptedEvents::keys([KeyCode::Enter, KeyCode::Char('r'), KeyCode::Char('q')]);
+
+        pane_gate(
+            &mut terminal,
+            &mut events,
+            "photos",
+            &cfg_pair,
+            None,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        perms.set_mode(0o700);
+        fs::set_permissions(&restricted, perms).unwrap();
+
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("Refreshed"),
+            "a refresh must replace the message with what it found, not blank it: {screen}"
+        );
+        assert!(
+            !screen.contains("Compare disabled"),
+            "the stale pre-refresh message must not survive an explicit refresh: {screen}"
+        );
+    }
+
     // --- Issue #57: two-pane browsing and Folder pair management ---
 
     fn browse_tree() -> tempfile::TempDir {
@@ -4054,7 +4172,7 @@ mod tests {
             [KeyCode::Char('s')]
                 .into_iter()
                 .chain("photos".chars().map(KeyCode::Char))
-                .chain([KeyCode::Enter]),
+                .chain([KeyCode::Enter, KeyCode::Char('y')]),
         );
 
         let outcome = pair_form_loop(
@@ -4101,7 +4219,12 @@ mod tests {
             [KeyCode::Char('s')]
                 .into_iter()
                 .chain("Bad Name".chars().map(KeyCode::Char))
-                .chain([KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')]),
+                .chain([
+                    KeyCode::Enter,
+                    KeyCode::Char('y'),
+                    KeyCode::Esc,
+                    KeyCode::Char('q'),
+                ]),
         );
 
         let outcome = pair_form_loop(
@@ -4155,7 +4278,12 @@ mod tests {
             [KeyCode::Char('s')]
                 .into_iter()
                 .chain("photos".chars().map(KeyCode::Char))
-                .chain([KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')]),
+                .chain([
+                    KeyCode::Enter,
+                    KeyCode::Char('y'),
+                    KeyCode::Esc,
+                    KeyCode::Char('q'),
+                ]),
         );
 
         pair_form_loop(
@@ -4201,7 +4329,7 @@ mod tests {
         model.destination = BrowsePane::new(new_destination.path().to_path_buf());
         model.toggle_mode();
         let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
-        let mut events = ScriptedEvents::keys([KeyCode::Char('s')]);
+        let mut events = ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Char('y')]);
 
         let outcome = pair_form_loop(
             &mut terminal,
@@ -4239,12 +4367,174 @@ mod tests {
             mode: Mode::Update,
         };
         let mut model = PairFormModel::edit_pair("photos", &pair_value);
-        // The only key that could start a save ('s') goes straight to a save
-        // attempt for an editing model — `Naming` is only reachable when
-        // `editing` is `None`, so an edit can never present a name field.
+        // The only key that could start a save ('s') goes straight to the
+        // confirm gate for an editing model — `Naming` is only reachable
+        // when `editing` is `None`, so an edit can never present a name
+        // field, even by way of a rejected confirmation.
         assert_eq!(model.editing.as_deref(), Some("photos"));
         model.stage = FormStage::Browse;
         assert!(!matches!(model.stage, FormStage::Naming));
+        assert!(matches!(model.stage_before_confirm(), FormStage::Browse));
+    }
+
+    #[test]
+    fn editing_a_pair_does_not_write_until_the_confirm_screen_accepts() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let original_source = tempfile::tempdir().unwrap();
+        let original_destination = tempfile::tempdir().unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            original_source.path(),
+            original_destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+        let config_before = fs::read_to_string(&config_path).unwrap();
+
+        let cfg = config::load(&config_path).unwrap();
+        let cfg_pair = cfg.pairs.get("photos").unwrap().clone();
+        let mut model = PairFormModel::edit_pair("photos", &cfg_pair);
+        let new_destination = tempfile::tempdir().unwrap();
+        model.destination = BrowsePane::new(new_destination.path().to_path_buf());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        // 's' must only stage the pending edit; 'n' rejects it and returns to
+        // the form with the edit still pending rather than writing anything;
+        // 'q' then cancels the form outright.
+        let mut events =
+            ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Char('n'), KeyCode::Char('q')]);
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            config_before,
+            "a single 's' followed by rejection must never replace the pair's definition"
+        );
+        assert!(
+            matches!(model.stage, FormStage::Browse),
+            "rejecting the confirm screen must return to the form"
+        );
+        assert_eq!(
+            model.destination.current(),
+            new_destination.path(),
+            "the pending edit must survive a rejected confirmation, not be discarded"
+        );
+    }
+
+    #[test]
+    fn creating_a_pair_does_not_write_until_the_confirm_screen_accepts() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let mut model = PairFormModel::new_pair(source.path().to_path_buf());
+        model.destination = BrowsePane::new(destination.path().to_path_buf());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        // Enter in Naming must only stage the new pair; rejecting the
+        // confirm screen returns to Naming with the typed name intact, and
+        // no config file is ever created.
+        let mut events = ScriptedEvents::keys(
+            [KeyCode::Char('s')]
+                .into_iter()
+                .chain("photos".chars().map(KeyCode::Char))
+                .chain([
+                    KeyCode::Enter,
+                    KeyCode::Char('n'),
+                    KeyCode::Esc,
+                    KeyCode::Char('q'),
+                ]),
+        );
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert!(
+            !config_path.exists(),
+            "Naming's Enter must stage the save behind a confirm screen, never write immediately"
+        );
+    }
+
+    #[test]
+    fn entering_naming_stage_preserves_an_existing_status_message() {
+        let root = browse_tree();
+        let mut model = PairFormModel::new_pair(root.path().to_path_buf());
+        model.message = Some("existing warning".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        let mut events = ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Esc, KeyCode::Esc]);
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            Path::new("/nonexistent/config.toml"),
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert_eq!(
+            model.message.as_deref(),
+            Some("existing warning"),
+            "a stage change must not clear a status message; only another message may replace it"
+        );
+    }
+
+    #[test]
+    fn q_at_the_pair_form_confirm_screen_cancels_outright_like_every_other_confirm_screen() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let original_source = tempfile::tempdir().unwrap();
+        let original_destination = tempfile::tempdir().unwrap();
+        pair::add(
+            &config_path,
+            "photos",
+            original_source.path(),
+            original_destination.path(),
+            Mode::Update,
+            false,
+        )
+        .unwrap();
+        let config_before = fs::read_to_string(&config_path).unwrap();
+
+        let cfg = config::load(&config_path).unwrap();
+        let cfg_pair = cfg.pairs.get("photos").unwrap().clone();
+        let mut model = PairFormModel::edit_pair("photos", &cfg_pair);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        // 'q' at Confirm must cancel the whole form in one step, matching the
+        // removal and run confirm screens, rather than only backing up.
+        let mut events = ScriptedEvents::keys([KeyCode::Char('s'), KeyCode::Char('q')]);
+
+        let outcome = pair_form_loop(
+            &mut terminal,
+            &mut events,
+            &mut model,
+            &config_path,
+            HeaderMode::Full,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PairFormOutcome::Cancelled));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config_before);
     }
 
     #[test]
