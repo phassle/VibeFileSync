@@ -783,6 +783,264 @@ fn removing_an_unknown_pair_is_a_usage_error_exit_64() {
 }
 
 #[test]
+fn pair_add_refuses_an_identical_source_and_destination_exit_64() {
+    let fx = Fixture::new();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.source.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "error should explain the refusal: {stderr}"
+    );
+    assert!(!config_file(fx.xdg.path()).exists());
+}
+
+#[test]
+fn pair_add_refuses_an_identical_pair_even_through_a_case_difference() {
+    let fx = Fixture::new();
+    let uppercased = fx.source.path().to_str().unwrap().to_ascii_uppercase();
+    // Only meaningful on a case-insensitive volume (the macOS default); on a
+    // case-sensitive one the uppercased path simply won't resolve, so guard
+    // rather than assert a spurious failure.
+    if !Path::new(&uppercased).is_dir() {
+        return;
+    }
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            &uppercased,
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+}
+
+#[test]
+fn pair_add_refuses_an_identical_pair_through_a_symlink() {
+    let fx = Fixture::new();
+    let alias = fx.home.path().join("alias-to-source");
+    std::os::unix::fs::symlink(fx.source.path(), &alias).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            alias.to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "error should explain the refusal: {stderr}"
+    );
+}
+
+#[test]
+fn pair_add_refuses_a_destination_nested_inside_the_source_in_mirror_mode() {
+    let fx = Fixture::new();
+    let nested = fx.source.path().join("child");
+    fs::create_dir(&nested).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            nested.to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("nested"),
+        "error should say nested: {stderr}"
+    );
+}
+
+#[test]
+fn pair_add_refuses_a_source_nested_inside_the_destination_in_update_mode() {
+    let fx = Fixture::new();
+    let nested = fx.destination.path().join("child");
+    fs::create_dir(&nested).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            nested.to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("nested"),
+        "error should say nested: {stderr}"
+    );
+}
+
+#[test]
+fn pair_add_replace_refuses_redefining_a_pair_as_identical() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.source.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let contents = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(
+        contents.contains(fx.destination.path().to_str().unwrap()),
+        "a refused replace must not alter the config: {contents}"
+    );
+}
+
+#[test]
+fn pair_add_warns_when_the_new_destination_overlaps_another_pairs_destination() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let other_source = tempfile::tempdir().unwrap();
+    let nested_destination = fx.destination.path().join("videos-child");
+    fs::create_dir(&nested_destination).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "videos",
+            "--source",
+            other_source.path().to_str().unwrap(),
+            "--destination",
+            nested_destination.to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("photos"),
+        "warning should name the other pair: {stderr}"
+    );
+    let output = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["pairs"].as_array().unwrap().len(),
+        2,
+        "the warning must not block the add"
+    );
+}
+
+#[test]
+fn a_hand_edited_config_with_an_identical_pair_is_caught_at_compare() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    let source_str = fx.source.path().to_str().unwrap();
+    let destination_str = fx.destination.path().to_str().unwrap();
+    let edited = before.replace(destination_str, source_str);
+    fs::write(config_file(fx.xdg.path()), edited).unwrap();
+
+    let output = fx.cmd().args(["plan", "photos"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "compare should refuse the self-consuming pair: {stderr}"
+    );
+}
+
+#[test]
+fn a_hand_edited_config_with_an_identical_pair_is_caught_at_run() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    let source_str = fx.source.path().to_str().unwrap();
+    let destination_str = fx.destination.path().to_str().unwrap();
+    let edited = before.replace(destination_str, source_str);
+    fs::write(config_file(fx.xdg.path()), edited).unwrap();
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "run should refuse the self-consuming pair: {stderr}"
+    );
+}
+
+#[test]
 fn pair_add_with_a_nonexistent_source_is_a_usage_error_exit_64() {
     let fx = Fixture::new();
     let missing_source = fx.source.path().join("does-not-exist");
