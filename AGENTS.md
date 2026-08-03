@@ -13,22 +13,24 @@ At the end of each plan, list unresolved questions.
 ## WHAT: stack and layout
 
 - macOS Apple Silicon, single Rust 2021 binary named `vibesync`; no library crate (`Cargo.toml:1`, `Cargo.toml:6`).
-- Rust runtime: `clap`, `serde`, strict TOML, JSON, `tempfile`, `libc` (`Cargo.toml:13`).
-- macOS filesystem integration uses `getattrlist`, `statfs`, `copyfile`, xattrs, `F_FULLFSYNC` (`src/volume.rs:37`, `src/run.rs:31`).
-- Tests use Rust unit tests plus real-binary integration tests with `assert_cmd`, `predicates`, temp trees (`Cargo.toml:21`, `tests/cli.rs:24`).
+- Rust runtime: `clap`, `serde`, strict TOML, JSON, `tempfile`, `libc`, `ratatui`, `crossterm` (`Cargo.toml:18`).
+- macOS filesystem integration uses `getattrlist`, `statfs`, `copyfile`, xattrs, `F_FULLFSYNC` (`src/volume.rs:40`, `src/run.rs:23`, `src/run.rs:49`).
+- Tests use Rust unit tests plus real-binary integration tests with `assert_cmd`, `predicates`, temp trees (`Cargo.toml:29`, `tests/cli.rs:10`).
 - Node dependencies support Sandcastle agent orchestration only; not product runtime (`package.json:2`, `.sandcastle/main.mts:1`).
 
 Module map:
 
-- `src/main.rs:24` — Clap surface, strict config-first dispatch, exit boundary.
-- `src/config.rs:13` — versioned config types, strict load, atomic save.
-- `src/pair.rs:42` — Folder pair CRUD and volume pinning.
-- `src/volume.rs:47` — macOS volume identity/filesystem queries.
-- `src/preconditions.rs:14` — mount relocation and abort-before-mutation guards.
-- `src/plan.rs:105` — tree scan; `src/plan.rs:155` pure diff; `src/plan.rs:284` human rendering; `src/plan.rs:410` NDJSON streaming.
-- `src/run.rs:59` — human/JSON Run; `src/run.rs:107` review/reconcile/execute; `src/run.rs:550` verified Publish.
+- `src/main.rs:130` — Clap surface and exit boundary; config validated before command behaviour at `src/main.rs:172`.
+- `src/config.rs:13` — schema version; strict load and atomic save; path resolution honours `$XDG_CONFIG_HOME` at `src/config.rs:104`.
+- `src/pair.rs:43` — `add` is the single Folder-pair writer (also serves `--replace` and the TUI form); `remove` at `src/pair.rs:210`.
+- `src/volume.rs:93` — volume UUID is the sole identity; `filesystem_type` at `src/volume.rs:108`, expected degradations at `src/volume.rs:131`.
+- `src/preconditions.rs:14` — `resolve_pair` mount relocation and abort-before-mutation guards; six-state classifier `classify_pair` at `src/preconditions.rs:202`.
+- `src/plan.rs:170` — tree scan; `src/plan.rs:290` pure diff (`compute`); `src/plan.rs:493` human rendering; `src/plan.rs:614` NDJSON stream.
+- `src/run.rs:313` — human/JSON Run; `src/run.rs:369` review/reconcile/execute; verified Publish contract at `src/run.rs:1207`, SafetyNet rename at `src/run.rs:1265`.
+- `src/tui.rs:846` — TUI entry; staged lifecycle `run_pair_flow` at `src/tui.rs:1021`; pair selector at `src/tui.rs:1430`. Largest module: read the stage you are changing, not the file.
+- `src/event.rs:52` — NDJSON event constructors; the schema agents parse. Additive changes only.
 - `src/journal.rs:41` — retained run record, pair lock, Status/History.
-- `tests/cli.rs:53` — CLI fixture; acceptance-style behavior tests start at `tests/cli.rs:146`.
+- `tests/cli.rs:445` — CLI fixture; behaviour tests start at `tests/cli.rs:552`.
 
 Current implementation: Pair CRUD (including `pair add --replace` to redefine a pair in one atomic save), human/NDJSON Dry-run and Run, SafetyNet, convergence cleanup, Journal, Status/History, Prune, and a staged `ratatui` TUI (`src/tui.rs`) covering Select, Compare, Review, Confirm, Run, and Result. `pair list` additionally supports `--check` (per-pair volume-state classification) and `--source <PATH>` (filter by directory).
 
@@ -38,7 +40,7 @@ VibeFileSync mirrors or updates folders onto APFS/exFAT external drives without 
 
 - Review first: fresh plan precedes every Run; confirmation or explicit `--yes` gates mutation (`docs/adr/0003-dryrun-diff-and-review.md:8`).
 - SafetyNet: archive any replaced/removed destination object by same-volume rename (`docs/adr/0001-safetynet-archive-by-rename.md:3`).
-- Verified Publish: sibling temp → durability → verification → archive old → rename → parent sync (`src/run.rs:550`).
+- Verified Publish: sibling temp → durability → verification → archive old → rename → parent sync (`src/run.rs:1207`).
 - Convergence: rerun from a fresh scan after interruption; Journal never becomes copy authority (`docs/adr/0007-journal-design.md:5`).
 - Abort by default: volume, empty-source, and free-space guards need explicit per-run overrides (`docs/adr/0002-run-preconditions.md:3`).
 
@@ -78,10 +80,11 @@ Detailed procedure: `.agents/skills/release-vibesync/SKILL.md:1`.
 
 - Gitflow mandatory. Create `feature/<kebab-name>` from `develop` for every coherent code/docs/ADR change; PR targets `develop` (`docs/agents/git-workflow.md:5`).
 - `main` receives release/hotfix merges only. Prototype/research branch exemptions are throwaway and never merged (`docs/agents/git-workflow.md:9`).
-- Validate config before command-specific behavior (`src/main.rs:149`).
-- Keep `plan` read-only; mutation belongs behind Run review and preconditions (`src/plan.rs:397`, `src/run.rs:107`).
-- Preserve deterministic ordering and schema versions (`src/plan.rs:101`, `src/pair.rs:13`).
-- Exercise filesystem behavior through real temp trees; use the `fault-injection` feature for hard-to-force failures (`tests/cli.rs:53`, `src/run.rs:582`).
+- Validate config before command-specific behavior (`src/main.rs:172`).
+- Keep `plan` read-only; mutation belongs behind Run review and preconditions (`src/plan.rs:290`, `src/run.rs:369`).
+- Preserve deterministic ordering and schema versions (`src/plan.rs:167`, `src/config.rs:13`).
+- Exercise filesystem behavior through real temp trees; use the `fault-injection` feature for hard-to-force failures (`tests/cli.rs:445`, `src/run.rs:653`).
+- Scripted TUI tests rendezvous on the child's own output, never on elapsed time (`docs/adr/0011-scripted-tui-input-synchronisation.md:1`).
 - Let `rustfmt`/Clippy own style. Add no prose formatting rules.
 
 ## Progressive-disclosure index
