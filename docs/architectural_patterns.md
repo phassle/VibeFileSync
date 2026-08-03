@@ -103,8 +103,8 @@ A new mutating key needs a confirm stage before it needs a binding.
 
 Two seams, chosen by what is being asserted.
 
-- Rendered content and interaction go through `Terminal<TestBackend>` at an explicit width, which is what makes responsive breakpoints testable at all (`tests/cli.rs::Fixture`).
-- End-to-end behaviour drives the real binary in a pseudo-terminal with scripted keystrokes, and **rendezvouses on the child's own output rather than on elapsed time** — a sleep decides which stage a test actually exercises (`docs/adr/0011-scripted-tui-input-synchronisation.md`).
+- Rendered content and interaction go through `Terminal<TestBackend>` at an explicit width, which is what makes responsive breakpoints testable at all. The seam lives in `src/tui.rs`'s own test module — read the buffer through `src/tui.rs::buffer_text`, or `src/tui.rs::buffer_text_sized` when the assertion is about a specific width.
+- End-to-end behaviour drives the real binary in a pseudo-terminal with scripted keystrokes from `tests/cli.rs::Fixture`, and **rendezvouses on the child's own output rather than on elapsed time** — a sleep decides which stage a test actually exercises (`docs/adr/0011-scripted-tui-input-synchronisation.md`).
 - A panic path is exercised with `panic!`, never `abort()`: aborting skips unwinding, so it cannot prove a `Drop`-based guard ran.
 
 Reach for the pty only when the assertion needs a real terminal; prefer `TestBackend` for anything about what was drawn.

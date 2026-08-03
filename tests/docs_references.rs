@@ -9,6 +9,13 @@
 //! Guarding the convention itself matters as much as guarding the references. A single
 //! `path:line` reintroduced by hand would rot invisibly again, so this test rejects the
 //! notation outright.
+//!
+//! What it deliberately cannot check: whether a reference names the *right* symbol. An
+//! anchor pointing at a real function that has nothing to do with the sentence around it
+//! passes every check here — that happened on this very file, where the in-process render
+//! seam was anchored to the CLI fixture instead of to the `TestBackend` helpers that
+//! actually implement it. Existence is mechanical; aptness is a reading. Treat a green run
+//! as "no reference is dangling", never as "the docs are accurate".
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -136,7 +143,12 @@ fn docs_never_reference_code_by_line_number() {
             let Some((path, tail)) = span.rsplit_once(':') else {
                 continue;
             };
-            if !tail.chars().all(|c| c.is_ascii_digit()) || tail.is_empty() {
+            // Trailing punctuation must not smuggle the notation past the ban:
+            // `path:123.` and `path:123)` are line references too, and a check that
+            // only rejects the tidy spelling is a check the next author routes around
+            // without meaning to.
+            let tail = tail.trim_end_matches(|c: char| !c.is_ascii_digit());
+            if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
             if EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
