@@ -27,13 +27,13 @@ Compose safety as ordered gates. Earlier stages may inspect; only the final stag
 7. Clean strays, rescan, and retain only reviewed work (`src/run.rs::execute_reviewed_plan`, `src/run.rs::discovered_after_review`, `src/run.rs::retain_reviewed_actions`).
 8. Execute the reconciled reviewed actions (`src/run.rs::execute_reviewed_plan`).
 
-Place new abort-before-mutation checks before Journal creation at `src/journal.rs::Journal`. Keep Dry-run useful unless the check is required for safe enumeration.
+Place new abort-before-mutation checks before Journal creation at `src/run.rs::execute_reviewed_plan`. Keep Dry-run useful unless the check is required for safe enumeration.
 
 ## Verified atomic Publish
 
 Never write directly to a final path. Use a sibling temp so publication stays on one filesystem and in one parent directory.
 
-1. Allocate/copy sibling temp (`src/run.rs::copy_file`, `src/run.rs::copy_file`).
+1. Allocate/copy sibling temp (`src/run.rs::copy_file`).
 2. Flush data using `sync_all` and `F_FULLFSYNC` (`src/run.rs::F_FULLFSYNC`, `src/run.rs::copy_file`).
 3. Verify source stability and copied data/metadata (`src/run.rs::verify_temp`).
 4. Archive or deliberately remove the old final object (`src/run.rs::archive_by_rename`).
