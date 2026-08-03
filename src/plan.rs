@@ -272,39 +272,31 @@ fn sorted_entries(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
 
 /// Recursively visits every file and symlink under `root`, in the same order
 /// as [`scan`]/[`walk`], but collecting and sorting each directory's entries
-/// exactly once. Returns the number of files visited (both trees' entry
-/// counts flow from this). The visit closure sees the path relative to `root`.
-///
-/// `on_empty_dir` is called for every non-root directory that holds no
-/// non-machinery entry, in the same order [`walk_leaf_directories`] would
-/// report it — so the single source read yields both file rows and the
-/// empty-directory candidates, and the tree is enumerated once, not twice.
+/// exactly once per call. Returns the number of files visited (both trees'
+/// entry counts flow from this). The visit closure sees the path relative to
+/// `root`.
 fn walk_files_sorted(
     root: &Path,
     skip_apple_double: bool,
     mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
-    mut on_empty_dir: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<usize> {
     fn recurse(
         root: &Path,
         directory: &Path,
         skip_apple_double: bool,
         visit: &mut impl FnMut(&Path, &Entry) -> io::Result<()>,
-        on_empty_dir: &mut impl FnMut(&Path) -> io::Result<()>,
         count: &mut usize,
-    ) -> io::Result<bool> {
-        let mut has_content = false;
+    ) -> io::Result<()> {
         for entry in sorted_entries(directory)? {
             let name = entry.file_name();
             if is_machinery(&name) || (skip_apple_double && is_apple_double(&entry.path(), &name)) {
                 continue;
             }
-            has_content = true;
             let path = entry.path();
             let meta = fs::symlink_metadata(&path)?;
             let file_type = meta.file_type();
             if file_type.is_dir() {
-                recurse(root, &path, skip_apple_double, visit, on_empty_dir, count)?;
+                recurse(root, &path, skip_apple_double, visit, count)?;
             } else {
                 #[cfg(all(feature = "fault-injection", debug_assertions))]
                 if let Ok(delay) = std::env::var("VIBESYNC_TEST_PLAN_SCAN_DELAY_MS") {
@@ -324,8 +316,45 @@ fn walk_files_sorted(
                 *count += 1;
             }
         }
+        Ok(())
+    }
+
+    let mut count = 0;
+    recurse(root, root, skip_apple_double, &mut visit, &mut count)?;
+    Ok(count)
+}
+
+/// Streams every empty (leaf) source directory — a directory with no
+/// non-machinery descendants — to `visit`, in depth-first order. This is a
+/// deliberate second pass over the source tree, kept separate from
+/// [`walk_files_sorted`] so the streaming surface can emit these
+/// new-directory rows *after* every file row (the contract order the golden
+/// captures fix) without buffering their paths. Collapsing it into the file
+/// walk would force `traverse` to accumulate one path per empty directory
+/// before flushing them, growing memory O(empty directories) and breaking the
+/// constant-memory guarantee of ADR-0003 §2 on the `plan --json` path.
+fn walk_leaf_directories(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    fn recurse(
+        root: &Path,
+        directory: &Path,
+        visit: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let mut has_content = false;
+        for entry in sorted_entries(directory)? {
+            if is_machinery(&entry.file_name()) {
+                continue;
+            }
+            has_content = true;
+            let path = entry.path();
+            if fs::symlink_metadata(&path)?.file_type().is_dir() {
+                recurse(root, &path, visit)?;
+            }
+        }
         if directory != root && !has_content {
-            on_empty_dir(
+            visit(
                 directory
                     .strip_prefix(root)
                     .expect("walked directory is under root"),
@@ -334,16 +363,8 @@ fn walk_files_sorted(
         Ok(has_content)
     }
 
-    let mut count = 0;
-    recurse(
-        root,
-        root,
-        skip_apple_double,
-        &mut visit,
-        &mut on_empty_dir,
-        &mut count,
-    )?;
-    Ok(count)
+    recurse(root, root, &mut visit)?;
+    Ok(())
 }
 
 // Superseded by the single `traverse` pass (issue #70). Kept in place,
@@ -1031,80 +1052,68 @@ fn traverse(
     sink: &mut impl PlanSink,
 ) -> Result<(), AppError> {
     // Source pass: every source file is classified once, and a destination
-    // directory it must replace is resolved inline as a paired delete row. The
-    // same read reports empty source directories (leaf candidates) so the
-    // source tree is enumerated once, not twice; they are emitted after the
-    // file rows to preserve the contract's files-then-directories order.
-    let mut empty_source_dirs: Vec<PathBuf> = Vec::new();
-    let source_entries = walk_files_sorted(
-        source_root,
-        false,
-        |path, entry| {
-            let destination_path = destination_root.join(path);
-            let replaces_directory =
-                is_directory(&destination_path)? && !contains_machinery(&destination_path);
-            let old = entry_at(&destination_path)?;
-            let classification = classify_source_entry(
-                path,
-                entry,
-                old.as_ref(),
-                supports_symlinks,
-                mtime_tolerance,
-            );
-            match classification {
-                SourceClassification::Action(op, action) => {
-                    let kept = match op {
-                        PlanOperation::Copy => sink.copy(&action).map_err(io::Error::other)?,
-                        PlanOperation::Update => sink.update(&action).map_err(io::Error::other)?,
-                        _ => unreachable!("source rows are copy/update only"),
-                    };
-                    // The structural delete exists only to unblock this copy;
-                    // if an adapter excluded the copy, suppress the delete
-                    // entirely rather than archive destination content alone.
-                    if replaces_directory && kept {
-                        let replacement = destination_directory_replacement(path);
-                        sink.destination_directory_replacement(&replacement)
-                            .map_err(io::Error::other)?;
-                    }
-                }
-                SourceClassification::Error(error) => {
-                    sink.error(&error).map_err(io::Error::other)?
-                }
-                SourceClassification::Unchanged(path) => {
-                    sink.unchanged(&path).map_err(io::Error::other)?
-                }
-                SourceClassification::Excluded => {
-                    unreachable!("traversal applies no exclusions")
+    // directory it must replace is resolved inline as a paired delete row.
+    let source_entries = walk_files_sorted(source_root, false, |path, entry| {
+        let destination_path = destination_root.join(path);
+        let replaces_directory =
+            is_directory(&destination_path)? && !contains_machinery(&destination_path);
+        let old = entry_at(&destination_path)?;
+        let classification = classify_source_entry(
+            path,
+            entry,
+            old.as_ref(),
+            supports_symlinks,
+            mtime_tolerance,
+        );
+        match classification {
+            SourceClassification::Action(op, action) => {
+                let kept = match op {
+                    PlanOperation::Copy => sink.copy(&action).map_err(io::Error::other)?,
+                    PlanOperation::Update => sink.update(&action).map_err(io::Error::other)?,
+                    _ => unreachable!("source rows are copy/update only"),
+                };
+                // The structural delete exists only to unblock this copy; if an
+                // adapter excluded the copy, suppress the delete entirely rather
+                // than archive destination content on its own.
+                if replaces_directory && kept {
+                    let replacement = destination_directory_replacement(path);
+                    sink.destination_directory_replacement(&replacement)
+                        .map_err(io::Error::other)?;
                 }
             }
-            Ok(())
-        },
-        |directory| {
-            empty_source_dirs.push(directory.to_path_buf());
-            Ok(())
-        },
-    )
+            SourceClassification::Error(error) => sink.error(&error).map_err(io::Error::other)?,
+            SourceClassification::Unchanged(path) => {
+                sink.unchanged(&path).map_err(io::Error::other)?
+            }
+            SourceClassification::Excluded => unreachable!("traversal applies no exclusions"),
+        }
+        Ok(())
+    })
     .map_err(|error| scan_error(source_root, error))?;
     sink.source_entries(source_entries);
 
     // A source directory with no file descendants would otherwise leave no
     // row; emit it as a new-directory copy so an empty tree is reproduced.
-    for path in &empty_source_dirs {
+    // This is a separate, bounded-memory pass (see [`walk_leaf_directories`]):
+    // the row is streamed straight to the sink after all file rows, so the
+    // `plan --json` surface never buffers a path per empty directory.
+    walk_leaf_directories(source_root, |path| {
         if fs::symlink_metadata(destination_root.join(path))
             .is_ok_and(|metadata| metadata.file_type().is_dir())
         {
-            continue;
+            return Ok(());
         }
         let action = Action {
-            rel_path: path.clone(),
+            rel_path: path.to_path_buf(),
             bytes: 0,
             source_mtime: None,
             old_bytes: None,
             reason: "new directory".into(),
             structural_conflict: None,
         };
-        sink.new_directory(&action)?;
-    }
+        sink.new_directory(&action).map_err(io::Error::other)
+    })
+    .map_err(|error| scan_error(source_root, error))?;
 
     if destination_root.is_dir() {
         if mode == Mode::Mirror {
@@ -1121,10 +1130,8 @@ fn traverse(
             })
             .map_err(|error| scan_error(destination_root, error))?;
         }
-        let destination_entries = walk_files_sorted(
-            destination_root,
-            skip_apple_double,
-            |path, entry| {
+        let destination_entries =
+            walk_files_sorted(destination_root, skip_apple_double, |path, entry| {
                 let collapsed = mode == Mode::Mirror
                     && has_collapsed_destination_ancestor(source_root, destination_root, path)?;
                 if collapsed || has_file_ancestor(source_root, path)? {
@@ -1172,13 +1179,8 @@ fn traverse(
                         .map_err(io::Error::other),
                     None => sink.file_delete(&action).map_err(io::Error::other),
                 }
-            },
-            // Empty destination directories are handled by the dedicated
-            // destination-directory-delete pass above (their emit order
-            // differs), so the file walk ignores them here.
-            |_| Ok(()),
-        )
-        .map_err(|error| scan_error(destination_root, error))?;
+            })
+            .map_err(|error| scan_error(destination_root, error))?;
         sink.destination_entries(destination_entries);
     }
 
