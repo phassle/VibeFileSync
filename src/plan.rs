@@ -3,10 +3,11 @@
 //! no-FSEvents / no-rename-detection trade-off), then grouped by operation
 //! and printed summary-first.
 //!
-//! The seam is deliberately split: [`compute`] and [`render`] are pure over
-//! already-scanned trees, so mode semantics, machinery exclusion, and the
+//! The seam is deliberately split: [`traverse`] drives a single streaming
+//! pass over both trees, yielding rows to a [`PlanSink`]; [`render`] is pure
+//! over an assembled [`Plan`], so mode semantics, machinery exclusion, and the
 //! symlink→exFAT error row are testable without touching real volumes;
-//! [`scan`] and [`run`] hold the filesystem and CLI edges.
+//! [`run`] holds the CLI edge.
 //!
 //! Everything here is strictly read-only — `plan` never writes to the
 //! source or destination.
@@ -162,11 +163,10 @@ fn is_apple_double(path: &Path, name: &OsStr) -> bool {
         && magic == [0x00, 0x05, 0x16, 0x07]
 }
 
-/// Reads a directory once, sorts its entries by name, and returns them. This
-/// replaces [`for_each_sorted_entry`]'s re-read-per-entry scan for the single
-/// [`traverse`] pass: the emitted order is identical (a depth-first walk with
-/// name-sorted children is the same as component-lexicographic order), but a
-/// directory is read exactly once.
+/// Reads a directory once, sorts its entries by name, and returns them.
+/// Used by the single [`traverse`] pass: the emitted order is identical
+/// (a depth-first walk with name-sorted children is the same as
+/// component-lexicographic order), but a directory is read exactly once.
 fn sorted_entries(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
