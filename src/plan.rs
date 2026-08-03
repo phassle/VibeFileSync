@@ -358,7 +358,13 @@ pub(crate) fn report_unknown_excludes(plan: &Plan) {
     }
 }
 
-fn structural_dependency_satisfied(deletion: &Action, copies: &[Action]) -> bool {
+/// The one structural-dependency rule: a structural delete is justified only
+/// while at least one of `copies` is the dependent Publish it exists to
+/// unblock. A delete with no `structural_conflict` is unconditionally
+/// satisfied. Published on the Plan interface so both Run reconciliation
+/// ([`drop_orphan_structural_deletions`]) and TUI review consult this single
+/// decision over the planned-action type instead of restating it.
+pub(crate) fn structural_dependency_satisfied(deletion: &Action, copies: &[Action]) -> bool {
     match deletion.structural_conflict {
         Some(conflict) => copies
             .iter()
