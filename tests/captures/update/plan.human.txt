@@ -1,0 +1,22 @@
+Dry-run for 'sync' (update): 5 copy · 1 update · 2 delete · 0 error
+
+COPY (5)
+  dir-to-file                 16 B  new
+  file-to-dir/inner.txt        6 B  new
+  link                        11 B  new
+  new-dir                      0 B  new directory
+  new.txt                     19 B  new
+
+UPDATE (1) → _SafetyNet/<run-id>/
+  changed.txt                 25 B  size differs
+
+DELETE (2) → _SafetyNet/<run-id>/
+  dir-to-file                  0 B  replaced by source file
+  file-to-dir                 11 B  replaced by source directory
+
+ERRORS (0)
+
+Stray temps (1)
+  .other.txt.vibesync-tmp-dst01
+
+Scanned 8 · unchanged 1 · excluded 0
