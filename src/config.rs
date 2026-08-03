@@ -33,10 +33,19 @@ impl fmt::Display for Mode {
 pub struct Pair {
     pub source: PathBuf,
     pub source_volume_uuid: String,
+    /// Cosmetic display name of the source volume, written by `pair add`.
+    /// Never used for identity, matching, or resolution — the UUID above
+    /// remains the sole authority; a stale value is a display defect only.
+    #[serde(default)]
+    pub source_volume_name: Option<String>,
     #[serde(default)]
     pub source_volume_relative_path: Option<PathBuf>,
     pub destination: PathBuf,
     pub destination_volume_uuid: String,
+    /// Cosmetic display name of the destination volume. See
+    /// `source_volume_name`.
+    #[serde(default)]
+    pub destination_volume_name: Option<String>,
     #[serde(default)]
     pub destination_volume_relative_path: Option<PathBuf>,
     pub mode: Mode,
@@ -213,9 +222,11 @@ mod tests {
             Pair {
                 source: PathBuf::from("/Users/per/Photos"),
                 source_volume_uuid: "A1B2".to_string(),
+                source_volume_name: Some("Macintosh HD".to_string()),
                 source_volume_relative_path: Some(PathBuf::from("Users/per/Photos")),
                 destination: PathBuf::from("/Volumes/Backup/Photos"),
                 destination_volume_uuid: "C3D4".to_string(),
+                destination_volume_name: Some("Backup".to_string()),
                 destination_volume_relative_path: Some(PathBuf::from("Photos")),
                 mode: Mode::Mirror,
             },
@@ -228,6 +239,32 @@ mod tests {
         let pair = &loaded.pairs["photos"];
         assert_eq!(pair.source, PathBuf::from("/Users/per/Photos"));
         assert_eq!(pair.mode, Mode::Mirror);
+        assert_eq!(pair.destination_volume_name.as_deref(), Some("Backup"));
+    }
+
+    #[test]
+    fn volume_name_fields_are_optional_on_load() {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[pairs.photos]
+source = "/a"
+source_volume_uuid = "u1"
+destination = "/b"
+destination_volume_uuid = "u2"
+mode = "mirror"
+"#,
+        )
+        .unwrap();
+
+        let config = load(&path).expect("volume name fields are optional");
+        let pair = &config.pairs["photos"];
+        assert_eq!(pair.source_volume_name, None);
+        assert_eq!(pair.destination_volume_name, None);
     }
 
     #[test]

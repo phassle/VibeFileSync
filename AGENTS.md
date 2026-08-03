@@ -30,7 +30,7 @@ Module map:
 - `src/journal.rs:41` — retained run record, pair lock, Status/History.
 - `tests/cli.rs:53` — CLI fixture; acceptance-style behavior tests start at `tests/cli.rs:146`.
 
-Current implementation: Pair CRUD, human/NDJSON Dry-run and Run, SafetyNet, convergence cleanup, Journal, Status/History, Prune. Only TUI remains stubbed (`src/main.rs:155`, `src/main.rs:196`, `src/main.rs:205`).
+Current implementation: Pair CRUD (including `pair add --replace` to redefine a pair in one atomic save), human/NDJSON Dry-run and Run, SafetyNet, convergence cleanup, Journal, Status/History, Prune, and a staged `ratatui` TUI (`src/tui.rs`) covering Select, Compare, Review, Confirm, Run, and Result. `pair list` additionally supports `--check` (per-pair volume-state classification) and `--source <PATH>` (filter by directory).
 
 ## WHY: product and constraints
 
@@ -101,6 +101,7 @@ Domain and architecture:
 - `docs/adr/0009-acceptance-test-harness.md:1` — crash/fault acceptance strategy and invariants.
 - `docs/adr/0010-commander-two-sided-review.md:1` — two-sided action table for TUI review; supersedes ADR-0003 §3.
 - `docs/adr/0011-scripted-tui-input-synchronisation.md:1` — how scripted-keystroke TUI tests rendezvous with the child.
+- `docs/adr/0012-run-record-resolved-paths.md:1` — `run_start` also records the resolved source and destination.
 
 Agent operations:
 

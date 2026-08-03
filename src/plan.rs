@@ -98,11 +98,11 @@ enum SourceClassification {
     Action(PlanOperation, Action),
     Error(PlanError),
     Excluded,
-    Unchanged,
+    Unchanged(PathBuf),
 }
 
 /// The computed Dry-run diff for one Folder pair.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Plan {
     pub copies: Vec<Action>,
     pub updates: Vec<Action>,
@@ -112,6 +112,11 @@ pub struct Plan {
     pub scanned: usize,
     /// Files identical on both sides (same size and mtime).
     pub unchanged: usize,
+    /// The relative paths counted in `unchanged`, in source-scan order.
+    /// Presentation-only (Review's `u` key, ADR-0010 §2): the reviewed
+    /// action subset never derives from this list, only from
+    /// `copies`/`updates`/`deletes`/`errors`.
+    pub unchanged_paths: Vec<PathBuf>,
     /// Rows removed by `--exclude`.
     pub excluded: usize,
     /// Requested exclusions that did not name an action row in this plan.
@@ -410,7 +415,7 @@ fn classify_source_entry(
                     structural_conflict: None,
                 },
             ),
-            None => SourceClassification::Unchanged,
+            None => SourceClassification::Unchanged(rel.to_path_buf()),
         },
     }
 }
@@ -419,7 +424,7 @@ fn actionable_path(classification: &SourceClassification) -> Option<&Path> {
     match classification {
         SourceClassification::Action(_, action) => Some(&action.rel_path),
         SourceClassification::Error(error) => Some(&error.rel_path),
-        SourceClassification::Excluded | SourceClassification::Unchanged => None,
+        SourceClassification::Excluded | SourceClassification::Unchanged(_) => None,
     }
 }
 
@@ -447,7 +452,10 @@ fn record_classification(plan: &mut Plan, classification: SourceClassification) 
         SourceClassification::Action(_, _) => unreachable!("source rows are copy/update only"),
         SourceClassification::Error(error) => plan.errors.push(error),
         SourceClassification::Excluded => plan.excluded += 1,
-        SourceClassification::Unchanged => plan.unchanged += 1,
+        SourceClassification::Unchanged(path) => {
+            plan.unchanged += 1;
+            plan.unchanged_paths.push(path);
+        }
     }
 }
 
@@ -647,7 +655,7 @@ pub fn run_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError> {
                 stats.errors += 1;
                 serde_json::json!({"schema":"vibefilesync.plan/v1","type":"action","plan_id":plan_id,"op":PlanOperation::Error,"path":error.rel_path.to_string_lossy(),"reason":error.message})
             }
-            SourceClassification::Unchanged => {
+            SourceClassification::Unchanged(_) => {
                 stats.unchanged += 1;
                 return Ok(());
             }

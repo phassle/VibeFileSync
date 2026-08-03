@@ -76,6 +76,19 @@ fn vibesync_in_tty_with_input_and_env(
     vibesync_in_tty_with_input_after_start(config_home, home, args, input, extra_env, || {})
 }
 
+/// Like `vibesync_in_tty_with_input`, but also sets the child's working
+/// directory — the seam startup-matching scenarios need, since they are
+/// entirely about where the tool is launched from.
+fn vibesync_in_tty_with_input_and_cwd(
+    config_home: &Path,
+    home: &Path,
+    cwd: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> std::process::Output {
+    vibesync_in_tty_with_input_after_start_in(config_home, home, Some(cwd), args, input, &[], || {})
+}
+
 /// Bytes crossterm writes when the TUI takes the terminal over. Raw mode is
 /// enabled before this is sent (`src/tui.rs:138`), so observing it proves the
 /// line discipline can no longer echo or reinterpret a scripted key press.
@@ -86,6 +99,11 @@ const TUI_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
 /// `script` hands the child has no window size, so the frame itself paints no
 /// glyphs to match on.
 const TUI_FRAME_FLUSHED: &[u8] = b"\x1b[0m";
+/// What ratatui emits for `Terminal::clear`. `run_pair_flow` clears exactly
+/// once on entering a stage, so past the startup gate this is the only
+/// byte-level marker of a stage boundary available: the frames themselves are
+/// indistinguishable, since the window-less pseudo-terminal paints no glyphs.
+const TUI_SCREEN_CLEARED: &[u8] = b"\x1b[2J";
 /// Deliberately generous: startup normally takes single-digit milliseconds, so
 /// only a genuinely wedged child should ever reach this ceiling.
 const TUI_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -211,6 +229,26 @@ fn vibesync_in_tty_with_input_after_start(
     extra_env: &[(&str, &str)],
     before_input: impl FnOnce(),
 ) -> std::process::Output {
+    vibesync_in_tty_with_input_after_start_in(
+        config_home,
+        home,
+        None,
+        args,
+        input,
+        extra_env,
+        before_input,
+    )
+}
+
+fn vibesync_in_tty_with_input_after_start_in(
+    config_home: &Path,
+    home: &Path,
+    cwd: Option<&Path>,
+    args: &[&str],
+    input: &[u8],
+    extra_env: &[(&str, &str)],
+    before_input: impl FnOnce(),
+) -> std::process::Output {
     let binary = Command::cargo_bin("vibesync").expect("binary builds");
     let mut command = ProcessCommand::new("script");
     command
@@ -223,6 +261,9 @@ fn vibesync_in_tty_with_input_after_start(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     for (name, value) in extra_env {
         command.env(name, value);
     }
@@ -276,8 +317,129 @@ fn vibesync_in_tty_with_input_after_start(
     panic!("TUI did not exit within five seconds for {args:?}");
 }
 
+/// Like `vibesync_in_tty_with_input_after_start`, but `between` runs once
+/// `first` has driven the TUI through a completed Compare scan and into
+/// Review, and before `second` is written — used to land a filesystem change
+/// inside a specific stage rather than only before the TUI ever opens.
+fn vibesync_in_tty_with_staged_input(
+    config_home: &Path,
+    home: &Path,
+    args: &[&str],
+    first: &[u8],
+    second: &[u8],
+    between: impl FnOnce(),
+) -> std::process::Output {
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let mut command = ProcessCommand::new("script");
+    command
+        .args(["-q", "/dev/null"])
+        .arg(binary.get_program())
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().expect("script starts a pseudo-terminal");
+    let pty = PipeDrain::spawn(child.stdout.take().expect("script stdout is piped"));
+    let errors = PipeDrain::spawn(child.stderr.take().expect("script stderr is piped"));
+
+    // ADR-0011: the same rendezvous the single-input driver uses. Startup is
+    // never guessed at here either — a first key press written before the PTY
+    // is raw is echoed and reshaped rather than delivered.
+    let taken_over = pty.wait_for(TUI_ALTERNATE_SCREEN, 0, TUI_READY_TIMEOUT);
+    let rendered =
+        taken_over.and_then(|from| pty.wait_for(TUI_FRAME_FLUSHED, from, TUI_READY_TIMEOUT));
+    if rendered.is_none() {
+        let stage = if taken_over.is_some() {
+            "render its first frame"
+        } else {
+            "take the terminal"
+        };
+        terminate_process_group(&mut child);
+        panic!(
+            "TUI never managed to {stage} for {args:?}: pty {:?}, stderr {:?}",
+            pty.snapshot(),
+            errors.snapshot()
+        );
+    }
+
+    // The startup gate above returns or panics, so this is always `Some`.
+    let started = rendered.expect("startup gate yields the first frame's offset");
+
+    let mut stdin = child.stdin.take().expect("script stdin is piped");
+    stdin.write_all(first).expect("first input is written");
+
+    // The staging rendezvous the helper exists for, and ADR-0011 §1 applies
+    // here too: `between` must land after Compare captured its plan, not
+    // merely a while after `first` was written, or the test silently exercises
+    // a different stage than the one it is named for. `run_pair_flow` clears
+    // the screen once per stage entry, so past the startup gate the clears are
+    // the boundaries: the pane gate proceeding into Compare (`src/tui.rs:1057`),
+    // then the finished scan handing its plan to Review (`src/tui.rs:1081`).
+    // The next frame flush would not do — Compare draws on entry, before it has
+    // even read the key that starts the scan, and again every 50 ms while the
+    // scan runs (`src/tui.rs:441`), so a flush proves nothing about progress.
+    let comparing = pty.wait_for(TUI_SCREEN_CLEARED, started, TUI_READY_TIMEOUT);
+    let reviewing =
+        comparing.and_then(|from| pty.wait_for(TUI_SCREEN_CLEARED, from, TUI_READY_TIMEOUT));
+    let parked =
+        reviewing.and_then(|from| pty.wait_for(TUI_FRAME_FLUSHED, from, TUI_READY_TIMEOUT));
+    if parked.is_none() {
+        let stage = match (comparing, reviewing) {
+            (None, _) => "leave the pane gate",
+            (_, None) => "finish comparing",
+            _ => "render the review it compared",
+        };
+        terminate_process_group(&mut child);
+        panic!(
+            "TUI never managed to {stage} for {args:?}: pty {:?}, stderr {:?}",
+            pty.snapshot(),
+            errors.snapshot()
+        );
+    }
+
+    between();
+    stdin.write_all(second).expect("second input is written");
+    drop(stdin);
+
+    for _ in 0..100 {
+        if let Some(status) = child.try_wait().expect("TUI status can be polled") {
+            return std::process::Output {
+                status,
+                stdout: pty.collect(),
+                stderr: errors.collect(),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Bound a bad key sequence without leaving a child PTY behind.
+    terminate_process_group(&mut child);
+    panic!("TUI did not exit within five seconds for {args:?}");
+}
+
 fn config_file(config_home: &Path) -> std::path::PathBuf {
     config_home.join("vibesync").join("config.toml")
+}
+
+/// Wraps `value` in single quotes for a POSIX shell, escaping any embedded
+/// single quotes.
+#[cfg(feature = "fault-injection")]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `stty -a` prints disabled flags with a leading `-` (e.g. `-icanon`,
+/// `-echo`); an enabled flag appears as the bare token. Tokenizing avoids
+/// false positives from related flags that share a prefix, like `echoe` or
+/// `echok`.
+#[cfg(feature = "fault-injection")]
+fn stty_flag_is_enabled(stty_output: &str, flag: &str) -> bool {
+    stty_output
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .any(|token| token == flag)
 }
 
 struct Fixture {
@@ -455,6 +617,340 @@ fn pair_add_pins_both_volume_uuids_into_the_config_file() {
 }
 
 #[test]
+fn pair_add_writes_cosmetic_volume_names_into_the_config_file() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let contents = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(
+        contents.contains("source_volume_name"),
+        "config should record a cosmetic source volume name: {contents}"
+    );
+    assert!(
+        contents.contains("destination_volume_name"),
+        "config should record a cosmetic destination volume name: {contents}"
+    );
+}
+
+#[test]
+fn pair_list_without_check_does_no_volume_io_and_is_byte_identical_to_plain_list() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let baseline = fx.cmd().args(["pair", "list"]).output().unwrap();
+    let repeated = fx.cmd().args(["pair", "list"]).output().unwrap();
+    assert_eq!(baseline.stdout, repeated.stdout);
+
+    let baseline_json = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    let repeated_json = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    assert_eq!(baseline_json.stdout, repeated_json.stdout);
+    let value: serde_json::Value = serde_json::from_slice(&baseline_json.stdout).unwrap();
+    assert!(value["pairs"][0].get("status").is_none());
+}
+
+#[test]
+fn pair_list_check_reports_ready_state_for_both_sides_in_json() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"][0]["status"]["source"]["state"], "ready");
+    assert_eq!(value["pairs"][0]["status"]["destination"]["state"], "ready");
+    assert!(value["pairs"][0]["status"]["source"]["volume"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn pair_list_check_reports_state_in_the_human_table() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx.cmd().args(["pair", "list", "--check"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("STATUS"), "{stdout}");
+    assert!(stdout.contains("source"), "{stdout}");
+    assert!(stdout.contains("ready"), "{stdout}");
+}
+
+#[test]
+fn pair_list_check_reports_volume_absent_for_an_unmounted_uuid() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let path = config_file(fx.xdg.path());
+    let contents = fs::read_to_string(&path).unwrap();
+    let rewritten = contents
+        .replacen(
+            "destination_volume_uuid = \"",
+            "destination_volume_uuid = \"00000000-0000-0000-0000-000000000000#",
+            1,
+        )
+        .replacen(
+            &format!("destination = \"{}\"", fx.destination.path().display()),
+            "destination = \"/no/such/path/vibesync-volume-absent-test\"",
+            1,
+        );
+    fs::write(&path, rewritten).unwrap();
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["pairs"][0]["status"]["destination"]["state"],
+        "volume_absent"
+    );
+}
+
+#[test]
+fn pair_list_check_matching_nothing_is_still_an_empty_list_exit_0() {
+    let fx = Fixture::new();
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--check", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn pair_list_source_narrows_to_the_matching_pair_in_json() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0]["name"], "photos");
+}
+
+#[test]
+fn pair_list_source_narrows_to_the_matching_pair_in_the_human_table() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("photos"), "{stdout}");
+}
+
+#[test]
+fn pair_list_source_excludes_a_pair_when_given_its_destination() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.destination.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn pair_list_source_matching_nothing_is_an_empty_list_exit_0() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            elsewhere.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn pair_list_source_matches_even_when_the_recorded_source_path_has_gone_stale() {
+    // Mirrors `run_against_a_relocated_volume_records_the_path_it_actually_used`
+    // (issue #49): rewrite the stored `source` display path to a stale
+    // string while leaving `source_volume_uuid` and
+    // `source_volume_relative_path` untouched, since those two fields
+    // (not the display path) are what matching is derived from — this is
+    // exactly the shape of "the volume got mounted somewhere else".
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let path = config_file(fx.xdg.path());
+    let original_source = fx.source.path().display().to_string();
+    let stale_source = "/Volumes/VibeFileSync-Stale/Photos";
+    let config = fs::read_to_string(&path).unwrap().replace(
+        &format!("source = \"{original_source}\""),
+        &format!("source = \"{stale_source}\""),
+    );
+    assert_ne!(
+        config,
+        fs::read_to_string(&path).unwrap(),
+        "replacement must have matched"
+    );
+    fs::write(&path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{value}");
+    assert_eq!(pairs[0]["name"], "photos");
+}
+
+#[test]
+fn pair_list_source_matches_a_case_different_spelling_of_the_same_directory() {
+    // Identity is decided by (device, inode) from filesystem metadata, not
+    // by string comparison, so a case-insensitive volume resolves a
+    // case-flipped spelling of the path to the same directory. This is
+    // only meaningful on a case-insensitive volume (macOS's default, and
+    // the volume backing the system temp dir these fixtures live on); the
+    // canary below skips (rather than falsely passing) if that assumption
+    // doesn't hold.
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let original = fx.source.path().to_str().unwrap().to_string();
+    let flipped: String = original
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    assert_ne!(original, flipped, "fixture path must contain letters");
+
+    if fs::metadata(&flipped).is_err() {
+        eprintln!(
+            "skipping: {flipped} does not resolve, so the backing volume is not \
+             case-insensitive here"
+        );
+        return;
+    }
+
+    let output = fx
+        .cmd()
+        .args(["pair", "list", "--json", "--source", &flipped])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{value}");
+    assert_eq!(pairs[0]["name"], "photos");
+}
+
+#[test]
+fn pair_list_source_silently_skips_a_pair_pinned_to_an_unmounted_volume() {
+    // A pair whose pinned `source_volume_uuid` matches no currently
+    // mounted volume must simply not appear — no error, no warning, exit
+    // 0. `matching_source_names` never enumerates mounted volumes; it
+    // only compares the pinned UUID against the query target's UUID, so a
+    // UUID belonging to nothing mounted is filtered out by that same
+    // equality check, with the same silence as a genuinely unmounted
+    // volume would produce.
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let path = config_file(fx.xdg.path());
+    let contents = fs::read_to_string(&path).unwrap();
+    let real_uuid = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("source_volume_uuid = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("source_volume_uuid present in config")
+        .to_string();
+    let unmounted_uuid = "00000000-0000-0000-0000-000000000000";
+    assert_ne!(real_uuid, unmounted_uuid);
+    let config = contents.replace(
+        &format!("source_volume_uuid = \"{real_uuid}\""),
+        &format!("source_volume_uuid = \"{unmounted_uuid}\""),
+    );
+    fs::write(&path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "list",
+            "--json",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.is_empty(), "{stderr}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["pairs"].as_array().unwrap().len(), 0, "{value}");
+}
+
+#[test]
 fn config_rewrite_is_atomic_no_stray_temp_files_survive() {
     let fx = Fixture::new();
     fx.add_photos_pair();
@@ -516,6 +1012,264 @@ fn removing_an_unknown_pair_is_a_usage_error_exit_64() {
 }
 
 #[test]
+fn pair_add_refuses_an_identical_source_and_destination_exit_64() {
+    let fx = Fixture::new();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.source.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "error should explain the refusal: {stderr}"
+    );
+    assert!(!config_file(fx.xdg.path()).exists());
+}
+
+#[test]
+fn pair_add_refuses_an_identical_pair_even_through_a_case_difference() {
+    let fx = Fixture::new();
+    let uppercased = fx.source.path().to_str().unwrap().to_ascii_uppercase();
+    // Only meaningful on a case-insensitive volume (the macOS default); on a
+    // case-sensitive one the uppercased path simply won't resolve, so guard
+    // rather than assert a spurious failure.
+    if !Path::new(&uppercased).is_dir() {
+        return;
+    }
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            &uppercased,
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+}
+
+#[test]
+fn pair_add_refuses_an_identical_pair_through_a_symlink() {
+    let fx = Fixture::new();
+    let alias = fx.home.path().join("alias-to-source");
+    std::os::unix::fs::symlink(fx.source.path(), &alias).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            alias.to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "error should explain the refusal: {stderr}"
+    );
+}
+
+#[test]
+fn pair_add_refuses_a_destination_nested_inside_the_source_in_mirror_mode() {
+    let fx = Fixture::new();
+    let nested = fx.source.path().join("child");
+    fs::create_dir(&nested).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            nested.to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("nested"),
+        "error should say nested: {stderr}"
+    );
+}
+
+#[test]
+fn pair_add_refuses_a_source_nested_inside_the_destination_in_update_mode() {
+    let fx = Fixture::new();
+    let nested = fx.destination.path().join("child");
+    fs::create_dir(&nested).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            nested.to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("nested"),
+        "error should say nested: {stderr}"
+    );
+}
+
+#[test]
+fn pair_add_replace_refuses_redefining_a_pair_as_identical() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.source.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let contents = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(
+        contents.contains(fx.destination.path().to_str().unwrap()),
+        "a refused replace must not alter the config: {contents}"
+    );
+}
+
+#[test]
+fn pair_add_warns_when_the_new_destination_overlaps_another_pairs_destination() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let other_source = tempfile::tempdir().unwrap();
+    let nested_destination = fx.destination.path().join("videos-child");
+    fs::create_dir(&nested_destination).unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "videos",
+            "--source",
+            other_source.path().to_str().unwrap(),
+            "--destination",
+            nested_destination.to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("photos"),
+        "warning should name the other pair: {stderr}"
+    );
+    let output = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["pairs"].as_array().unwrap().len(),
+        2,
+        "the warning must not block the add"
+    );
+}
+
+#[test]
+fn a_hand_edited_config_with_an_identical_pair_is_caught_at_compare() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    let source_str = fx.source.path().to_str().unwrap();
+    let destination_str = fx.destination.path().to_str().unwrap();
+    let edited = before.replace(destination_str, source_str);
+    fs::write(config_file(fx.xdg.path()), edited).unwrap();
+
+    let output = fx.cmd().args(["plan", "photos"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "compare should refuse the self-consuming pair: {stderr}"
+    );
+}
+
+#[test]
+fn a_hand_edited_config_with_an_identical_pair_is_caught_at_run() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    let source_str = fx.source.path().to_str().unwrap();
+    let destination_str = fx.destination.path().to_str().unwrap();
+    let edited = before.replace(destination_str, source_str);
+    fs::write(config_file(fx.xdg.path()), edited).unwrap();
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("same directory"),
+        "run should refuse the self-consuming pair: {stderr}"
+    );
+}
+
+#[test]
 fn pair_add_with_a_nonexistent_source_is_a_usage_error_exit_64() {
     let fx = Fixture::new();
     let missing_source = fx.source.path().join("does-not-exist");
@@ -537,6 +1291,214 @@ fn pair_add_with_a_nonexistent_source_is_a_usage_error_exit_64() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(EXIT_USAGE));
+}
+
+#[test]
+fn pair_add_without_replace_is_still_a_duplicate_error_when_a_new_destination_is_also_given() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let other_destination = tempfile::tempdir().unwrap();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            other_destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("photos"),
+        "error should name the pair: {stderr}"
+    );
+    let contents = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(
+        contents.contains(fx.destination.path().to_str().unwrap()),
+        "the original destination must survive the rejected add: {contents}"
+    );
+}
+
+#[test]
+fn pair_add_replace_redefines_the_pair_in_one_atomic_save() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let new_destination = tempfile::tempdir().unwrap();
+
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            new_destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .assert()
+        .success();
+
+    let output = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pairs = value["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "replace must not create a second pair");
+    assert_eq!(pairs[0]["name"], "photos");
+    assert_eq!(pairs[0]["mode"], "update");
+    assert_eq!(
+        pairs[0]["destination"],
+        new_destination.path().to_str().unwrap()
+    );
+}
+
+#[test]
+fn pair_add_replace_with_unchanged_paths_repins_uuids_and_refreshes_volume_names() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+
+    let after = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert!(after.contains("source_volume_uuid"));
+    assert!(after.contains("destination_volume_uuid"));
+    assert!(after.contains("source_volume_name"));
+    assert!(after.contains("destination_volume_name"));
+    // The pair's identity (name) and both paths are unchanged.
+    assert!(after.contains("[pairs.photos]"));
+    assert_eq!(
+        before.contains(fx.source.path().to_str().unwrap()),
+        after.contains(fx.source.path().to_str().unwrap())
+    );
+}
+
+#[test]
+fn pair_add_replace_keeps_the_pair_name_and_therefore_its_run_history() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    fx.write_source("a.txt", "hello");
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let history_before = fx
+        .cmd()
+        .args(["history", "photos", "--json"])
+        .output()
+        .unwrap();
+    let value_before: serde_json::Value = serde_json::from_slice(&history_before.stdout).unwrap();
+    assert!(!value_before["runs"].as_array().unwrap().is_empty());
+
+    let new_destination = tempfile::tempdir().unwrap();
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            new_destination.path().to_str().unwrap(),
+            "--mode",
+            "update",
+        ])
+        .assert()
+        .success();
+
+    let history_after = fx
+        .cmd()
+        .args(["history", "photos", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(history_after.status.code(), Some(EXIT_OK));
+    let value_after: serde_json::Value = serde_json::from_slice(&history_after.stdout).unwrap();
+    assert_eq!(
+        value_before["runs"].as_array().unwrap().len(),
+        value_after["runs"].as_array().unwrap().len(),
+        "history for the pair name must survive the replace: {value_after}"
+    );
+}
+
+#[test]
+fn pair_add_replace_on_an_unknown_pair_is_a_usage_error_exit_64() {
+    let fx = Fixture::new();
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("photos"),
+        "error should name the pair: {stderr}"
+    );
+}
+
+#[test]
+fn a_failed_replace_leaves_the_previous_definition_intact() {
+    let fx = Fixture::new();
+    fx.add_photos_pair();
+    let before = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    let missing_source = fx.source.path().join("does-not-exist");
+
+    let output = fx
+        .cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--replace",
+            "--source",
+            missing_source.to_str().unwrap(),
+            "--destination",
+            fx.destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    let after = fs::read_to_string(config_file(fx.xdg.path())).unwrap();
+    assert_eq!(before, after, "a failed replace must not alter the config");
 }
 
 #[test]
@@ -825,6 +1787,73 @@ fn relocated_json_plan_reports_notice_on_stderr_and_keeps_stdout_ndjson_only() {
         .unwrap()
         .lines()
         .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
+}
+
+#[test]
+fn run_against_a_relocated_volume_records_the_path_it_actually_used() {
+    let fx = Fixture::new();
+    let source = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let destination = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    fs::write(source.path().join("photo.txt"), "photo").unwrap();
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "photos",
+            "--source",
+            source.path().to_str().unwrap(),
+            "--destination",
+            destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+    let path = config_file(fx.xdg.path());
+    let original_source = source.path().display().to_string();
+    let original_destination = destination.path().display().to_string();
+    let stale_source = "/Volumes/VibeFileSync-Stale/Photos";
+    let stale_destination = "/Volumes/VibeFileSync-Stale/PhotosBackup";
+    let config = fs::read_to_string(&path)
+        .unwrap()
+        .replace(
+            &format!("source = \"{original_source}\""),
+            &format!("source = \"{stale_source}\""),
+        )
+        .replace(
+            &format!("destination = \"{original_destination}\""),
+            &format!("destination = \"{stale_destination}\""),
+        );
+    fs::write(&path, config).unwrap();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(stale_source), "{stderr}");
+    assert!(stderr.contains(stale_destination), "{stderr}");
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(rows.first().unwrap()["type"], "run_start");
+    let recorded_source = rows[0]["source"].as_str().unwrap();
+    assert!(
+        recorded_source.ends_with(&original_source),
+        "{recorded_source}"
+    );
+    assert_ne!(recorded_source, stale_source);
+    let recorded_destination = rows[0]["destination"].as_str().unwrap();
+    assert!(
+        recorded_destination.ends_with(&original_destination),
+        "{recorded_destination}"
+    );
+    assert_ne!(recorded_destination, stale_destination);
 }
 
 #[test]
@@ -1308,6 +2337,14 @@ fn run_json_stream_reports_execution_order_verification_and_safetynet() {
     assert_eq!(rows.first().unwrap()["type"], "run_start");
     assert_eq!(rows.last().unwrap()["type"], "summary");
     assert!(rows[0]["degradations"].is_array());
+    assert_eq!(
+        rows[0]["source"],
+        fx.source.path().to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        rows[0]["destination"],
+        fx.destination.path().to_string_lossy().into_owned()
+    );
     let planned = rows[0]["planned_actions"]
         .as_array()
         .expect("run_start declares the reviewed action set");
@@ -1569,6 +2606,42 @@ fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
             Some(EXIT_BLOCKED_PLAN)
         );
     }
+}
+
+/// Lock contention at execute must still exit 2, per ADR-0010's lifecycle:
+/// the TUI now returns to Review instead of tearing down the session on
+/// contention (see `tui::is_lock_contention`), so the CLI's own exit code on
+/// the same contention is a regression guard the TUI change could otherwise
+/// silently break. Contention is made genuine by holding the pair's `.lock`
+/// file's flock from this test process before invoking the binary, exactly
+/// as `journal::PairLock::acquire` would from a concurrent run.
+#[test]
+fn lock_contention_at_run_exits_two() {
+    let fx = Fixture::new();
+    fx.write_source("photo.jpg", "contents");
+    fx.add_photos_pair();
+
+    let lock_dir = fx.journal_dir("photos");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_dir.join(".lock"))
+        .unwrap();
+    let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(locked, 0, "test process must hold the pair lock first");
+
+    let output = fx.cmd().args(["run", "photos", "--yes"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_PRECONDITION));
+    assert!(
+        !fx.destination.path().join("photo.jpg").exists(),
+        "a run refused for lock contention must not touch the destination"
+    );
+
+    drop(lock_file);
 }
 
 #[cfg(feature = "fault-injection")]
@@ -2031,6 +3104,41 @@ fn crash_at_archived_keeps_the_old_version_in_safetynet() {
     assert_eq!(fs::read_to_string(&archived[0]).unwrap(), "old content");
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn run_json_reports_a_file_that_appeared_after_review_as_discovered_after_review() {
+    let fx = Fixture::new();
+    fx.write_source("reviewed.txt", "reviewed before the run started");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "cleanup_complete:echo -n 'appeared during reconciliation' > \"$VIBESYNC_TEST_SOURCE/unreviewed.txt\"",
+        )
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+    assert!(fx.destination.path().join("reviewed.txt").is_file());
+    assert!(
+        !fx.destination.path().join("unreviewed.txt").exists(),
+        "an action absent from the reviewed plan must wait for another run"
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary = rows
+        .iter()
+        .find(|row| row["type"] == "summary")
+        .expect("a summary event is always emitted");
+    assert_eq!(summary["discovered_after_review"], 1);
+}
+
 #[cfg(not(feature = "fault-injection"))]
 #[test]
 fn fault_injection_environment_is_absent_without_the_feature() {
@@ -2212,9 +3320,15 @@ fn tui_confirmation_executes_the_reviewed_plan_through_the_run_engine() {
     fx.write_dest("changed.txt", "old destination version");
     fx.add_photos_pair();
 
-    // Enter advances from action review to confirmation; y confirms.
-    let output =
-        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\ry");
+    // Enter passes the volume-state pane gate; Enter starts Compare; Enter
+    // advances from action review to confirmation; y confirms; Enter
+    // dismisses the persisted Result stage.
+    let output = vibesync_in_tty_with_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r\r\ry\r",
+    );
 
     assert!(
         output.status.success(),
@@ -2262,11 +3376,20 @@ fn tui_shows_preflight_warnings_before_final_confirmation() {
     fx.write_dest("_SafetyNet/old-run/old.txt", "archived bytes");
     fx.add_photos_pair();
 
-    // Enter reaches final confirmation; q cancels without mutation.
-    let output =
-        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b"\rq");
-    let transcript = String::from_utf8_lossy(&output.stdout);
-    assert!(transcript.contains("_SafetyNet/ uses"), "{transcript}");
+    // Enter passes the volume-state pane gate; Enter starts Compare; Enter
+    // reaches final confirmation; q cancels without mutation. The preflight
+    // warning's rendered text is asserted through the `Terminal<TestBackend>`
+    // seam (`tui::tests:: confirm_screen_renders_compare_s_notices`) — a real
+    // pty's reported size is not guaranteed in this harness, so text
+    // assertions belong to the rendered-content seam, not this end-to-end
+    // one.
+    let output = vibesync_in_tty_with_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r\r\rq",
+    );
+    assert!(output.status.success());
     assert!(!fx.destination.path().join("new.txt").exists());
 }
 
@@ -2276,9 +3399,15 @@ fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
     fx.write_source("later.txt", "still needs copying");
     fx.add_photos_pair();
 
-    // Space excludes the selected row, Enter advances, y confirms.
-    let output =
-        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "photos"], b" \ry");
+    // Enter passes the volume-state pane gate; Enter starts Compare; Space
+    // excludes the selected row, Enter advances, y confirms, Enter dismisses
+    // the Result stage.
+    let output = vibesync_in_tty_with_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r\r \ry\r",
+    );
     assert!(output.status.success());
     assert!(!fx.destination.path().join("later.txt").exists());
 
@@ -2303,9 +3432,11 @@ fn tui_exclusion_applies_to_one_run_and_is_not_persisted() {
 #[should_panic(expected = "TUI never managed to take the terminal")]
 fn scripted_input_fails_fast_when_the_child_never_takes_the_terminal() {
     let fx = Fixture::new();
-    // No Folder pair configured, so `tui` reports and exits before it starts a
-    // terminal session — the driver has no first frame to wait for.
-    vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"q");
+    // A named pair that does not exist is a usage error, so `tui` reports and
+    // exits before it starts a terminal session — the driver has no first
+    // frame to wait for. (An empty config no longer works as the arrangement:
+    // issue #55 made a pairless `tui` open the seeded pane rather than abort.)
+    vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui", "missing"], b"q");
 }
 
 #[test]
@@ -2314,12 +3445,16 @@ fn tui_does_not_execute_an_action_that_appears_after_review_started() {
     fx.write_source("reviewed.txt", "reviewed before the TUI opened");
     fx.add_photos_pair();
 
-    let output = vibesync_in_tty_with_input_after_start(
+    // First "\r" passes the volume-state pane gate, the second starts
+    // Compare and lets its scan capture the plan; the extra file then lands
+    // after that scan, during Review, before the rest of the input (Enter
+    // to Confirm, y to run, Enter to dismiss).
+    let output = vibesync_in_tty_with_staged_input(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\ry",
-        &[],
+        b"\r\r",
+        b"\ry\r",
         || fx.write_source("unreviewed.txt", "appeared during review"),
     );
 
@@ -2328,6 +3463,57 @@ fn tui_does_not_execute_an_action_that_appears_after_review_started() {
     assert!(
         !fx.destination.path().join("unreviewed.txt").exists(),
         "an action absent from the displayed plan must wait for another run"
+    );
+}
+
+#[test]
+fn tui_recompares_instead_of_crashing_when_the_pair_definition_changes_during_review() {
+    let fx = Fixture::new();
+    fx.write_source("reviewed.txt", "reviewed before the pair was redefined");
+    fx.add_photos_pair();
+    let redefined_destination = tempfile::tempdir().unwrap();
+
+    // First "\r\r" passes the volume-state pane gate and starts Compare,
+    // whose scan captures a plan against the original destination. Another
+    // process then redefines the pair (`pair add --replace`) before the
+    // first execute attempt: "\r" opens Confirm, "y" attempts to run and
+    // must be refused instead of crashing the session, discarding the
+    // stale plan and returning to Compare. The rest re-compares against the
+    // now-current definition and completes normally: "\r" starts the
+    // second scan, "\ry" confirms and runs, "\r" dismisses Result.
+    let output = vibesync_in_tty_with_staged_input(
+        fx.xdg.path(),
+        fx.home.path(),
+        &["tui", "photos"],
+        b"\r\r",
+        b"\ry\r\ry\r",
+        || {
+            fx.cmd()
+                .args([
+                    "pair",
+                    "add",
+                    "photos",
+                    "--source",
+                    fx.source.path().to_str().unwrap(),
+                    "--destination",
+                    redefined_destination.path().to_str().unwrap(),
+                    "--mode",
+                    "mirror",
+                    "--replace",
+                ])
+                .assert()
+                .success();
+        },
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !fx.destination.path().join("reviewed.txt").exists(),
+        "the stale plan must never reach a run against the original destination"
+    );
+    assert!(
+        redefined_destination.path().join("reviewed.txt").is_file(),
+        "the re-compared plan must run against the pair's current definition"
     );
 }
 
@@ -2361,8 +3547,11 @@ fn tui_without_a_pair_selects_from_configured_folder_pairs() {
     fx.add_pair("photos", "mirror");
     fx.add_pair("documents", "mirror");
 
-    // BTreeMap order puts documents first: select it, review, then confirm.
-    let output = vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"\r\ry");
+    // BTreeMap order puts documents first: select it, pass the volume-state
+    // pane gate, start Compare, review, confirm, then dismiss the persisted
+    // Result stage.
+    let output =
+        vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), &["tui"], b"\r\r\r\ry\r");
     assert!(
         output.status.success(),
         "pair selection failed: {}",
@@ -2373,6 +3562,297 @@ fn tui_without_a_pair_selects_from_configured_folder_pairs() {
     assert!(!fx.journal_dir("photos").exists());
 }
 
+// --- Slice 15: startup seeds from the working directory (issue #55) ---
+
+#[test]
+fn tui_started_from_a_pair_source_preselects_it_and_discloses_the_match() {
+    let fx = Fixture::new();
+    fx.write_source("selected.txt", "from the matched pair");
+    fx.add_photos_pair();
+
+    // No pair name and no picker: launching from the pair's source directory
+    // preselects it, so the input sequence is identical to `tui photos`
+    // (pane gate, Compare, Confirm, run, dismiss Result).
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.source.path(),
+        &["tui"],
+        b"\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "startup match failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("selected.txt").is_file());
+    assert!(fx.journal_dir("photos").is_dir());
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tui_startup_with_a_single_match_never_enumerates_pair_choices() {
+    let fx = Fixture::new();
+    fx.write_source("selected.txt", "from the matched pair");
+    fx.add_photos_pair();
+
+    // A single working-directory match must preselect without ever
+    // building the full picker list, which is what classifies every
+    // configured pair's destination (issue #55: "no destination-side I/O").
+    // `VIBESYNC_TEST_CRASH_AT=startup_pair_choices` aborts the process if
+    // `pair_choices` runs at all, so this only stays green while the
+    // preselect branch never reaches it.
+    let output = vibesync_in_tty_with_input_after_start_in(
+        fx.xdg.path(),
+        fx.home.path(),
+        Some(fx.source.path()),
+        &["tui"],
+        b"\r\r\ry\r",
+        &[("VIBESYNC_TEST_CRASH_AT", "startup_pair_choices")],
+        || {},
+    );
+
+    assert!(
+        output.status.success(),
+        "single-match startup must not enumerate pair choices: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("selected.txt").is_file());
+}
+
+/// Issue #46 acceptance criterion 67: a crash must restore the terminal.
+/// `TerminalSession::start` is the single guarded entry point and its `Drop`
+/// restores raw mode, the alternate screen, and the cursor during unwinding
+/// (the crate unwinds by default). `VIBESYNC_TEST_CRASH_AT=panic`, unlike
+/// `startup_pair_choices`'s `abort()`, panics rather than aborting, so the
+/// unwind actually runs and this test can observe the restoration rather
+/// than merely proving a path is unreached.
+///
+/// The child runs under a shell inside the same `script`-supplied
+/// pseudo-terminal, so `stty -a` — run immediately after the panicking
+/// process exits — observes whether `disable_raw_mode()` actually ran
+/// during unwind, not just whether the process happened to exit.
+///
+/// Verified by deleting each line of `TerminalSession::drop` in turn:
+/// removing `disable_raw_mode()` turns the raw-mode assertions red, and
+/// removing `execute!(Show, LeaveAlternateScreen)` turns the alternate-screen
+/// assertion red — both independently caught.
+///
+/// The cursor-show assertion is *not* independently isolated to one line:
+/// `execute!(..., Show, LeaveAlternateScreen)` and the standalone
+/// `self.terminal.show_cursor()` each emit their own `Show` sequence, so
+/// either line alone still satisfies the assertion when the other runs.
+/// Deleting `execute!` alone leaves `\x1b[?25h` intact (from
+/// `show_cursor()`) and only the alternate-screen assertion goes red;
+/// deleting `show_cursor()` alone leaves `\x1b[?25h` intact (from
+/// `execute!`'s `Show`) and nothing goes red. The assertion is real — it
+/// would fail if cursor restoration were removed entirely — but this
+/// double redundancy in production code means no single-line deletion is
+/// caught by it. Acknowledged limitation, not silently counted as covered.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tui_panic_after_terminal_takeover_still_restores_the_terminal() {
+    let fx = Fixture::new();
+
+    // The fault fires from inside the seeded-pane loop, right after its
+    // first `terminal.draw`, so no scripted key press is needed: the child
+    // panics on its own once it has provably taken the terminal over.
+    let binary = Command::cargo_bin("vibesync").expect("binary builds");
+    let binary_path = binary.get_program().to_str().expect("binary path is utf-8");
+    let shell_command = format!(
+        "{} tui; echo VIBESYNC_TUI_EXIT=$?; stty -a",
+        shell_single_quote(binary_path)
+    );
+    let output = ProcessCommand::new("script")
+        .args(["-q", "/dev/null", "sh", "-c", &shell_command])
+        .env("XDG_CONFIG_HOME", fx.xdg.path())
+        .env("HOME", fx.home.path())
+        .env("VIBESYNC_TEST_CRASH_AT", "terminal_session_started")
+        .output()
+        .expect("script starts a pseudo-terminal");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The restore escape sequences land on the same terminal line as this
+    // marker (no newline separates the panicking child's last output from
+    // the shell's `echo`), so the marker is found by substring, not by
+    // scanning whole lines.
+    let exit_code: i32 = {
+        const MARKER: &str = "VIBESYNC_TUI_EXIT=";
+        let start = stdout.find(MARKER).expect("shell echoes the tui exit code") + MARKER.len();
+        let digits: String = stdout[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().expect("exit code is an integer")
+    };
+    assert_ne!(
+        exit_code, 0,
+        "fault injection should panic, not exit cleanly: {stdout}"
+    );
+
+    // `TUI_ALTERNATE_SCREEN` (`\x1b[?1049h`) is its counterpart: this proves
+    // the session guard's `Drop` ran during the panic's unwind rather than
+    // being skipped, which is exactly the property criterion 67 protects.
+    assert!(
+        stdout.contains("\x1b[?1049l"),
+        "panic must still leave the alternate screen: {stdout}"
+    );
+    assert!(
+        stdout.contains("\x1b[?25h"),
+        "panic must still show the cursor: {stdout}"
+    );
+
+    assert!(
+        stty_flag_is_enabled(&stdout, "icanon"),
+        "panic must still restore canonical (non-raw) mode: {stdout}"
+    );
+    assert!(
+        stty_flag_is_enabled(&stdout, "echo"),
+        "panic must still restore terminal echo: {stdout}"
+    );
+}
+
+#[test]
+fn tui_with_no_pairs_configured_opens_the_seeded_pane_instead_of_aborting() {
+    let fx = Fixture::new();
+
+    // No pairs exist at all: startup must not abort. `q` dismisses the
+    // seeded pane.
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.source.path(),
+        &["tui"],
+        b"q",
+    );
+
+    assert!(
+        output.status.success(),
+        "empty-config startup must not abort: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tui_started_from_a_shared_source_opens_the_picker_with_both_matches() {
+    let fx = Fixture::new();
+    fx.write_source("shared.txt", "from whichever pair is picked");
+    let other_destination = tempfile::tempdir().expect("other destination tempdir");
+    fx.add_pair("photos", "mirror");
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "vault",
+            "--source",
+            fx.source.path().to_str().unwrap(),
+            "--destination",
+            other_destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+
+    // Both pairs share this source; the picker still opens (nothing
+    // auto-selected). Alphabetically "photos" < "vault", so Enter on the
+    // first row picks "photos": pane gate, Compare, Confirm, run, dismiss.
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.source.path(),
+        &["tui"],
+        b"\r\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "shared-source picker failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("shared.txt").is_file());
+    assert!(!other_destination.path().join("shared.txt").exists());
+}
+
+#[test]
+fn tui_with_a_named_pair_never_reads_the_working_directory() {
+    let fx = Fixture::new();
+    fx.write_source("named.txt", "reached by name, not by directory");
+    fx.add_photos_pair();
+    let other_source = tempfile::tempdir().expect("unrelated cwd tempdir");
+    let other_destination = tempfile::tempdir().expect("unrelated destination tempdir");
+    fx.cmd()
+        .args([
+            "pair",
+            "add",
+            "vault",
+            "--source",
+            other_source.path().to_str().unwrap(),
+            "--destination",
+            other_destination.path().to_str().unwrap(),
+            "--mode",
+            "mirror",
+        ])
+        .assert()
+        .success();
+
+    // Launched from "vault"'s source directory but naming "photos": the
+    // working directory must never be consulted, so this opens "photos"
+    // directly rather than preselecting or picking "vault".
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        other_source.path(),
+        &["tui", "photos"],
+        b"\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "named pair launch failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.destination.path().join("named.txt").is_file());
+    assert!(!other_destination.path().join("named.txt").exists());
+}
+
+#[test]
+fn tui_started_from_a_pairs_destination_does_not_preselect_it() {
+    let fx = Fixture::new();
+    fx.write_source("standing_in_destination.txt", "destination is not a match");
+    fx.add_photos_pair();
+
+    // Standing in the one configured pair's destination is not a source
+    // match (AC6), so this behaves like the no-match, single-choice case:
+    // the picker still opens rather than auto-selecting, per AC8.
+    let output = vibesync_in_tty_with_input_and_cwd(
+        fx.xdg.path(),
+        fx.home.path(),
+        fx.destination.path(),
+        &["tui"],
+        b"\r\r\r\ry\r",
+    );
+
+    assert!(
+        output.status.success(),
+        "destination cwd should still reach the picker: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx
+        .destination
+        .path()
+        .join("standing_in_destination.txt")
+        .is_file());
+    assert!(fx.journal_dir("photos").is_dir());
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn tui_included_error_blocks_until_the_row_is_excluded() {
@@ -2380,13 +3860,15 @@ fn tui_included_error_blocks_until_the_row_is_excluded() {
     std::os::unix::fs::symlink("target", fx.source.path().join("link")).unwrap();
     fx.add_photos_pair();
 
-    // Enter confirm; y is blocked; b returns; Space excludes the only row;
-    // Enter and y then run the now-valid reviewed subset.
+    // Enter passes the volume-state pane gate; Enter starts Compare; Enter
+    // confirm; y is blocked; b returns; Space excludes the only row; Enter
+    // and y then run the now-valid reviewed subset; Enter dismisses the
+    // persisted Result stage.
     let output = vibesync_in_tty_with_input_and_env(
         fx.xdg.path(),
         fx.home.path(),
         &["tui", "photos"],
-        b"\ryb \ry",
+        b"\r\r\ryb \ry\r",
         &[("VIBESYNC_TEST_FILESYSTEM_TYPE", "exfat")],
     );
 
@@ -2405,7 +3887,14 @@ fn banner_renders_on_bare_help_and_tui_tty_surfaces() {
     let fx = Fixture::new();
 
     for args in [&[][..], &["--help"][..], &["tui"][..]] {
-        let output = vibesync_in_tty(fx.xdg.path(), args, false);
+        // `tui` with zero pairs configured opens the seeded pane rather
+        // than exiting immediately (issue #55, AC8), so it needs a `q` to
+        // dismiss; the other two surfaces exit on their own.
+        let output = if args == &["tui"][..] {
+            vibesync_in_tty_with_input(fx.xdg.path(), fx.home.path(), args, b"q")
+        } else {
+            vibesync_in_tty(fx.xdg.path(), args, false)
+        };
         let output = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.contains('◢') && output.contains('█') && output.contains('◣'),
@@ -3281,6 +4770,42 @@ fn completed_run_journal_correlates_every_event_and_safetynet_folder() {
         fs::read_to_string(fx.destination.path().join("report.txt")).unwrap(),
         "new version",
         "action_done describes content already Published at the process boundary"
+    );
+}
+
+#[test]
+fn retained_journal_run_start_records_resolved_source_and_destination() {
+    let fx = Fixture::new();
+    fx.write_source("photo.txt", "photo");
+    fx.add_photos_pair();
+
+    fx.cmd().args(["run", "photos", "--yes"]).assert().success();
+
+    let journal_path = fs::read_dir(fx.journal_dir("photos"))
+        .expect("run creates the per-pair Journal directory")
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension().and_then(|value| value.to_str()) == Some("ndjson")).then_some(path)
+        })
+        .next()
+        .expect("one retained Journal exists");
+    let events: Vec<serde_json::Value> = fs::read_to_string(&journal_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every Journal line is JSON"))
+        .collect();
+
+    let run_start = events
+        .first()
+        .expect("Journal records at least the run_start event");
+    assert_eq!(run_start["type"], "run_start");
+    assert_eq!(
+        run_start["source"],
+        fx.source.path().to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        run_start["destination"],
+        fx.destination.path().to_string_lossy().into_owned()
     );
 }
 

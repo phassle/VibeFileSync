@@ -52,12 +52,15 @@ impl MetadataWarning {
 pub fn run_start(
     context: Context<'_>,
     pair: &str,
+    source: &Path,
+    destination: &Path,
     warnings: &[String],
     degradations: &[&str],
 ) -> Value {
     json!({
         "schema": context.schema, "type": "run_start", "run_id": context.run_id,
-        "pair": pair, "warnings": warnings, "degradations": degradations,
+        "pair": pair, "source": path_text(source), "destination": path_text(destination),
+        "warnings": warnings, "degradations": degradations,
     })
 }
 
@@ -152,6 +155,7 @@ pub fn summary(context: Context<'_>, stats: &RunStats) -> Value {
         "schema": context.schema, "type": "summary", "run_id": context.run_id,
         "result": if stats.counts.failed == 0 { "success" } else { "partial" },
         "counts": stats.counts, "bytes": stats.bytes, "warnings": stats.warnings,
+        "discovered_after_review": stats.discovered_after_review,
     })
 }
 
@@ -180,6 +184,21 @@ mod tests {
             schema: "vibefilesync.journal/v1",
             run_id: "20260801T120000Z",
         }
+    }
+
+    #[test]
+    fn run_start_records_resolved_source_and_destination() {
+        let event = run_start(
+            journal_context(),
+            "photos",
+            Path::new("/Volumes/Camera/DCIM"),
+            Path::new("/Volumes/Backup/photos"),
+            &[],
+            &[],
+        );
+
+        assert_eq!(event["source"], "/Volumes/Camera/DCIM");
+        assert_eq!(event["destination"], "/Volumes/Backup/photos");
     }
 
     #[test]

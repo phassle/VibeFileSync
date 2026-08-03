@@ -81,6 +81,8 @@ impl Journal {
     pub fn run_start(
         &mut self,
         pair_name: &str,
+        source: &Path,
+        destination: &Path,
         plan: &Plan,
         run_warnings: &[String],
         degradations: &[&str],
@@ -92,6 +94,8 @@ impl Journal {
                 run_id: &self.run_id,
             },
             pair_name,
+            source,
+            destination,
             run_warnings,
             degradations,
         );
@@ -249,6 +253,11 @@ pub struct RunStats {
     pub counts: Counts,
     pub bytes: u64,
     pub warnings: usize,
+    /// Reconciliation actions the fresh post-review scan found that were not
+    /// in the reviewed plan (e.g. a file added to the source during review).
+    /// The reconciliation scan already drops this work for safety; this
+    /// count is what makes that drop visible instead of silent.
+    pub discovered_after_review: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,6 +267,7 @@ pub struct RunRecord {
     pub counts: Counts,
     pub bytes: u64,
     pub warnings: usize,
+    pub discovered_after_review: usize,
 }
 
 pub fn pair_directory(pair_name: &str) -> PathBuf {
@@ -330,7 +340,7 @@ pub fn history_json(config_path: &Path, pair_name: &str) -> Result<i32, AppError
     Ok(EXIT_OK)
 }
 
-fn latest_record(pair_name: &str) -> io::Result<Option<RunRecord>> {
+pub(crate) fn latest_record(pair_name: &str) -> io::Result<Option<RunRecord>> {
     Ok(records(pair_name)?.into_iter().next())
 }
 
@@ -380,6 +390,7 @@ fn read_record(path: &Path, run_id: String) -> io::Result<RunRecord> {
         counts: Counts::default(),
         bytes: 0,
         warnings: 0,
+        discovered_after_review: 0,
     };
     for (index, line) in lines.iter().enumerate() {
         let event: Value = match serde_json::from_str(line) {
@@ -432,6 +443,7 @@ fn apply_summary(record: &mut RunRecord, event: &Value) {
     }
     record.bytes = event.get("bytes").and_then(Value::as_u64).unwrap_or(0);
     record.warnings = json_usize(event, "warnings");
+    record.discovered_after_review = json_usize(event, "discovered_after_review");
 }
 
 fn json_usize(value: &Value, field: &str) -> usize {

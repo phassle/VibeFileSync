@@ -1,7 +1,9 @@
 //! `vibesync`: hot-path verbs top-level, management namespaced, per
 //! ADR-0004. Implemented so far: Folder-pair management, the human Dry-run,
 //! safe `run`/`prune`, Journal-backed `status`/`history`, and streaming
-//! NDJSON plan/run surfaces, and the thin action-list TUI.
+//! NDJSON plan/run surfaces, and a staged `ratatui` TUI covering Select,
+//! Compare, Review, Confirm, Run, and Result, with two-pane Folder pair
+//! management (ADR-0010).
 
 mod banner;
 mod config;
@@ -103,11 +105,23 @@ enum PairCommand {
         destination: PathBuf,
         #[arg(long)]
         mode: Mode,
+        /// Redefine an existing pair in one atomic save, re-pinning both
+        /// volume UUIDs and refreshing the volume names. The pair keeps its
+        /// name and its run history.
+        #[arg(long)]
+        replace: bool,
     },
     /// List configured Folder pairs.
     List {
         #[arg(long)]
         json: bool,
+        /// Classify each side's volume state (advisory; does volume I/O).
+        #[arg(long)]
+        check: bool,
+        /// Narrow the listing to the pair whose source is this directory,
+        /// matched by macOS directory identity (device and inode).
+        #[arg(long)]
+        source: Option<PathBuf>,
     },
     /// Remove a Folder pair.
     Remove { name: String },
@@ -207,15 +221,20 @@ fn run_pair(action: &PairCommand, config_path: &std::path::Path) -> Result<i32, 
             source,
             destination,
             mode,
+            replace,
         } => {
-            pair::add(config_path, name, source, destination, *mode)?;
+            pair::add(config_path, name, source, destination, *mode, *replace)?;
             Ok(error::EXIT_OK)
         }
-        PairCommand::List { json } => {
+        PairCommand::List {
+            json,
+            check,
+            source,
+        } => {
             let output = if *json {
-                pair::list_json(config_path)?
+                pair::list_json(config_path, *check, source.as_deref())?
             } else {
-                pair::list_table(config_path)?
+                pair::list_table(config_path, *check, source.as_deref())?
             };
             print!("{output}");
             Ok(error::EXIT_OK)

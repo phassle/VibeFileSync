@@ -24,6 +24,7 @@ pub fn resolve_pair(pair: &Pair) -> Result<(Pair, Vec<String>), AppError> {
         pair.destination_volume_relative_path.as_deref(),
         "destination",
     )?;
+    refuse_self_overlap(&source, &destination)?;
     let mut resolved = pair.clone();
     resolved.source = source;
     resolved.destination = destination;
@@ -98,6 +99,169 @@ fn relocated_folder(
         )));
     }
     Ok(folder)
+}
+
+/// A Folder pair whose source and destination name the same directory, or
+/// where one is nested inside the other. Neither configuration has a
+/// legitimate meaning: an identical pair has no plan, and a nested pair
+/// either makes the plan incoherent (destination inside source) or means a
+/// Mirror deletes everything around its own source (source inside
+/// destination).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfOverlap {
+    Identical,
+    DestinationInsideSource,
+    SourceInsideDestination,
+}
+
+/// Detects [`SelfOverlap`] between a pair's two *resolved, existing*
+/// directories. Identity uses the same device-and-inode rule as pair
+/// matching (`volume::directory_identity`), so a case difference or a
+/// symlink cannot defeat it; nesting uses canonicalized-path containment,
+/// which resolves the same way.
+pub fn check_self_overlap(source: &Path, destination: &Path) -> io::Result<Option<SelfOverlap>> {
+    let source_identity = volume::directory_identity(source)?;
+    let destination_identity = volume::directory_identity(destination)?;
+    if source_identity == destination_identity {
+        return Ok(Some(SelfOverlap::Identical));
+    }
+    let source_canonical = source.canonicalize()?;
+    let destination_canonical = destination.canonicalize()?;
+    if destination_canonical.starts_with(&source_canonical) {
+        return Ok(Some(SelfOverlap::DestinationInsideSource));
+    }
+    if source_canonical.starts_with(&destination_canonical) {
+        return Ok(Some(SelfOverlap::SourceInsideDestination));
+    }
+    Ok(None)
+}
+
+pub fn self_overlap_message(overlap: SelfOverlap, source: &Path, destination: &Path) -> String {
+    match overlap {
+        SelfOverlap::Identical => format!(
+            "source and destination are the same directory ({} and {})",
+            source.display(),
+            destination.display()
+        ),
+        SelfOverlap::DestinationInsideSource => format!(
+            "destination {} is nested inside source {}",
+            destination.display(),
+            source.display()
+        ),
+        SelfOverlap::SourceInsideDestination => format!(
+            "source {} is nested inside destination {}; a Mirror would delete everything around it",
+            source.display(),
+            destination.display()
+        ),
+    }
+}
+
+fn refuse_self_overlap(source: &Path, destination: &Path) -> Result<(), AppError> {
+    refuse_self_overlap_as(source, destination, AppError::Precondition)
+}
+
+/// Shared by both call sites — `pair::add`'s usage-time check and this
+/// module's run-time re-check — which differ only in which `AppError`
+/// variant (and therefore exit code) the refusal should surface as.
+pub fn refuse_self_overlap_as(
+    source: &Path,
+    destination: &Path,
+    to_error: impl Fn(String) -> AppError,
+) -> Result<(), AppError> {
+    match check_self_overlap(source, destination) {
+        Ok(Some(overlap)) => Err(to_error(self_overlap_message(overlap, source, destination))),
+        Ok(None) => Ok(()),
+        Err(error) => Err(to_error(format!(
+            "could not compare source and destination: {error}"
+        ))),
+    }
+}
+
+/// A non-fatal, advisory report of one Folder-pair side's volume state.
+/// This never aborts and never re-implements the binding gate `check_run`
+/// enforces before a run: it exists purely so an agent or the TUI can ask
+/// "why isn't this ready?" without parsing prose out of a precondition
+/// error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeState {
+    /// The stored path resolves directly and its volume UUID matches.
+    Ready,
+    /// The pinned volume is mounted elsewhere; resolves by UUID plus the
+    /// recorded volume-relative path.
+    Relocated { at: PathBuf },
+    /// The pinned UUID is not mounted anywhere.
+    VolumeAbsent,
+    /// The volume is mounted, but the configured folder is gone.
+    FolderMissing { at: PathBuf },
+    /// A different volume is mounted at the stored path.
+    ForeignVolume { at: PathBuf },
+    /// The path is present but unreadable (e.g. TCC).
+    Inaccessible,
+}
+
+pub fn classify_pair(pair: &Pair) -> (VolumeState, VolumeState) {
+    (
+        classify_side(
+            &pair.source,
+            &pair.source_volume_uuid,
+            pair.source_volume_relative_path.as_deref(),
+        ),
+        classify_side(
+            &pair.destination,
+            &pair.destination_volume_uuid,
+            pair.destination_volume_relative_path.as_deref(),
+        ),
+    )
+}
+
+fn classify_side(path: &Path, expected_uuid: &str, relative_path: Option<&Path>) -> VolumeState {
+    classify_side_with_lookup(
+        path,
+        expected_uuid,
+        relative_path,
+        volume::mounted_path_for_uuid,
+    )
+}
+
+fn classify_side_with_lookup<F>(
+    path: &Path,
+    expected_uuid: &str,
+    relative_path: Option<&Path>,
+    find_mounted_volume: F,
+) -> VolumeState
+where
+    F: FnOnce(&str) -> io::Result<Option<PathBuf>>,
+{
+    // `read_dir`, not `metadata`, is the presence probe: listing a
+    // directory's own entries requires its execute/search bit, so a
+    // TCC-style denial (or a plain chmod 000 in tests) surfaces here as
+    // `PermissionDenied`, whereas `metadata`/`stat` would silently succeed.
+    match fs::read_dir(path) {
+        Ok(_) => match volume::volume_uuid(path) {
+            Ok(uuid) if uuid == expected_uuid => VolumeState::Ready,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                VolumeState::Inaccessible
+            }
+            _ => VolumeState::ForeignVolume {
+                at: path.to_path_buf(),
+            },
+        },
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => VolumeState::Inaccessible,
+        _ => match find_mounted_volume(expected_uuid) {
+            Ok(Some(mount)) => {
+                let folder = match relative_path {
+                    Some(relative_path) => mount.join(relative_path),
+                    None => mount,
+                };
+                if folder.is_dir() {
+                    VolumeState::Relocated { at: folder }
+                } else {
+                    VolumeState::FolderMissing { at: folder }
+                }
+            }
+            _ => VolumeState::VolumeAbsent,
+        },
+    }
 }
 
 pub fn check_run(
@@ -212,15 +376,82 @@ fn tree_size(root: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn check_self_overlap_flags_identical_directories_even_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+
+        let overlap = check_self_overlap(dir.path(), &alias).unwrap();
+
+        assert_eq!(overlap, Some(SelfOverlap::Identical));
+    }
+
+    #[test]
+    fn check_self_overlap_flags_destination_nested_inside_source() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = source.path().join("child");
+        fs::create_dir(&destination).unwrap();
+
+        let overlap = check_self_overlap(source.path(), &destination).unwrap();
+
+        assert_eq!(overlap, Some(SelfOverlap::DestinationInsideSource));
+    }
+
+    #[test]
+    fn check_self_overlap_flags_source_nested_inside_destination() {
+        let destination = tempfile::tempdir().unwrap();
+        let source = destination.path().join("child");
+        fs::create_dir(&source).unwrap();
+
+        let overlap = check_self_overlap(&source, destination.path()).unwrap();
+
+        assert_eq!(overlap, Some(SelfOverlap::SourceInsideDestination));
+    }
+
+    #[test]
+    fn check_self_overlap_is_none_for_unrelated_directories() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let overlap = check_self_overlap(source.path(), destination.path()).unwrap();
+
+        assert_eq!(overlap, None);
+    }
+
+    #[test]
+    fn resolve_pair_refuses_an_identical_hand_edited_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = volume::volume_uuid(dir.path()).unwrap();
+        let pair = Pair {
+            source: dir.path().to_path_buf(),
+            source_volume_uuid: uuid.clone(),
+            source_volume_name: None,
+            source_volume_relative_path: Some(PathBuf::new()),
+            destination: dir.path().to_path_buf(),
+            destination_volume_uuid: uuid,
+            destination_volume_name: None,
+            destination_volume_relative_path: Some(PathBuf::new()),
+            mode: Mode::Mirror,
+        };
+
+        let error = resolve_pair(&pair).unwrap_err();
+
+        assert!(error.to_string().contains("same directory"));
+    }
 
     #[test]
     fn mirror_empty_source_requires_its_one_run_override() {
         let pair = Pair {
             source: PathBuf::from("/"),
             source_volume_uuid: String::new(),
+            source_volume_name: None,
             source_volume_relative_path: Some(PathBuf::new()),
             destination: PathBuf::from("/"),
             destination_volume_uuid: String::new(),
+            destination_volume_name: None,
             destination_volume_relative_path: Some(PathBuf::new()),
             mode: Mode::Mirror,
         };
@@ -305,6 +536,91 @@ mod tests {
         assert!(notice.contains("/Volumes/Backup/Photos"));
         assert!(notice.contains("/Volumes/Backup 1/Photos"));
         assert!(notice.contains("A1B2"));
+    }
+
+    #[test]
+    fn classifier_reports_ready_when_stored_path_resolves_and_uuid_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = volume::volume_uuid(dir.path()).unwrap();
+        assert_eq!(
+            classify_side_with_lookup(dir.path(), &uuid, Some(Path::new("")), |_| Ok(None)),
+            VolumeState::Ready
+        );
+    }
+
+    #[test]
+    fn classifier_reports_foreign_volume_when_a_different_volume_is_mounted_at_the_stored_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            classify_side_with_lookup(
+                dir.path(),
+                "not-the-real-uuid",
+                Some(Path::new("")),
+                |_| Ok(None)
+            ),
+            VolumeState::ForeignVolume {
+                at: dir.path().to_path_buf()
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_reports_folder_missing_when_the_volume_is_mounted_but_the_folder_is_gone() {
+        let mount = tempfile::tempdir().unwrap();
+        let missing_source = Path::new("/no/such/path/vibesync-classifier-test");
+        let mount_path = mount.path().to_path_buf();
+        assert_eq!(
+            classify_side_with_lookup(
+                missing_source,
+                "uuid",
+                Some(Path::new("Photos")),
+                move |_| Ok(Some(mount_path.clone()))
+            ),
+            VolumeState::FolderMissing {
+                at: mount.path().join("Photos")
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_reports_inaccessible_for_a_present_but_unreadable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let restricted = dir.path().join("locked");
+        fs::create_dir(&restricted).unwrap();
+        let mut perms = fs::metadata(&restricted).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&restricted, perms.clone()).unwrap();
+
+        let state =
+            classify_side_with_lookup(&restricted, "uuid", Some(Path::new("")), |_| Ok(None));
+
+        perms.set_mode(0o700);
+        fs::set_permissions(&restricted, perms).unwrap();
+
+        assert_eq!(state, VolumeState::Inaccessible);
+    }
+
+    #[test]
+    fn classify_pair_reports_both_sides() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_uuid = volume::volume_uuid(source.path()).unwrap();
+        let destination_uuid = volume::volume_uuid(destination.path()).unwrap();
+        let pair = Pair {
+            source: source.path().to_path_buf(),
+            source_volume_uuid: source_uuid,
+            source_volume_name: None,
+            source_volume_relative_path: Some(PathBuf::new()),
+            destination: destination.path().to_path_buf(),
+            destination_volume_uuid: destination_uuid,
+            destination_volume_name: None,
+            destination_volume_relative_path: Some(PathBuf::new()),
+            mode: Mode::Update,
+        };
+
+        let (source_state, destination_state) = classify_pair(&pair);
+        assert_eq!(source_state, VolumeState::Ready);
+        assert_eq!(destination_state, VolumeState::Ready);
     }
 
     #[test]

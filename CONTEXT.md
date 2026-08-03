@@ -44,6 +44,10 @@ _Avoid_: run timestamp, session id
 A run that produces the diff of planned actions without mutating the destination; the reviewable plan a real run executes.
 _Avoid_: preview, simulation
 
+**Compare**:
+The action that initiates a Dry-run. Compare is what the user or agent does; Dry-run is the artifact it produces.
+_Avoid_: preview (as a verb), simulate
+
 **Publish**:
 The atomic step that makes a verified temp file appear under its final destination name (rename + parent-directory sync), after any SafetyNet archiving of what it replaces.
 _Avoid_: commit (reserved for the Journal state), finalize

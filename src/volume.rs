@@ -28,6 +28,7 @@ struct AttrList {
 const ATTR_BIT_MAP_COUNT: u16 = 5;
 const ATTR_VOL_INFO: u32 = 0x8000_0000;
 const ATTR_VOL_UUID: u32 = 0x0004_0000;
+const ATTR_VOL_NAME: u32 = 0x0000_2000;
 
 #[repr(C)]
 struct VolAttrBuf {
@@ -45,6 +46,43 @@ extern "C" {
     ) -> c_int;
 }
 
+fn path_to_cstring(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains an interior NUL byte: {}", path.display()),
+        )
+    })
+}
+
+/// Calls `getattrlist(2)` for `path`, requesting `volattr` bits, into a
+/// caller-provided attribute buffer. Shared by every volume-attribute query
+/// below so the raw-pointer FFI dance exists in exactly one place.
+///
+/// # Safety
+/// `T` must be `#[repr(C)]` and match the buffer layout `getattrlist`
+/// writes for the requested `volattr` bits — the same contract the caller's
+/// buffer type already encodes.
+unsafe fn get_vol_attr<T>(path: &Path, volattr: u32, buf: &mut T) -> io::Result<()> {
+    let c_path = path_to_cstring(path)?;
+    let mut attr_list = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        volattr: ATTR_VOL_INFO | volattr,
+        ..Default::default()
+    };
+    let ret = getattrlist(
+        c_path.as_ptr(),
+        &mut attr_list,
+        buf as *mut T as *mut c_void,
+        std::mem::size_of::<T>(),
+        0,
+    );
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Reads the volume UUID (`ATTR_VOL_UUID`) of the volume containing `path`,
 /// formatted as a standard hyphenated UUID string (e.g.
 /// `A1B2C3D4-E5F6-...`).
@@ -53,37 +91,11 @@ extern "C" {
 /// it, so a directory is enough — the object itself need not be the mount
 /// point.
 pub fn volume_uuid(path: &Path) -> io::Result<String> {
-    let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path contains an interior NUL byte: {}", path.display()),
-        )
-    })?;
-
-    let mut attr_list = AttrList {
-        bitmapcount: ATTR_BIT_MAP_COUNT,
-        volattr: ATTR_VOL_INFO | ATTR_VOL_UUID,
-        ..Default::default()
-    };
     let mut buf = VolAttrBuf {
         length: 0,
         uuid: [0u8; 16],
     };
-
-    let ret = unsafe {
-        getattrlist(
-            c_path.as_ptr(),
-            &mut attr_list,
-            &mut buf as *mut VolAttrBuf as *mut c_void,
-            std::mem::size_of::<VolAttrBuf>(),
-            0,
-        )
-    };
-
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
+    unsafe { get_vol_attr(path, ATTR_VOL_UUID, &mut buf) }?;
     Ok(format_uuid(&buf.uuid))
 }
 
@@ -100,12 +112,7 @@ pub fn filesystem_type(path: &Path) -> io::Result<String> {
     if let Ok(kind) = std::env::var("VIBESYNC_TEST_FILESYSTEM_TYPE") {
         return Ok(kind);
     }
-    let c_path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path contains an interior NUL byte: {}", path.display()),
-        )
-    })?;
+    let c_path = path_to_cstring(path)?;
 
     let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
@@ -154,6 +161,58 @@ pub fn timestamp_granularity_for(kind: &str) -> io::Result<Duration> {
     }
 }
 
+#[repr(C)]
+struct AttrReference {
+    attr_dataoffset: i32,
+    attr_length: u32,
+}
+
+#[repr(C)]
+struct VolNameAttrBuf {
+    length: u32,
+    name_ref: AttrReference,
+    name_data: [u8; 256],
+}
+
+/// Reads the cosmetic display name (`ATTR_VOL_NAME`) of the volume
+/// containing `path` — e.g. `"Backup"` for a volume mounted at
+/// `/Volumes/Backup`. Purely cosmetic: callers must never use this for
+/// identity or matching, only for display when the pinned UUID's volume
+/// has no better label available.
+pub fn volume_name(path: &Path) -> io::Result<String> {
+    let mut buf = VolNameAttrBuf {
+        length: 0,
+        name_ref: AttrReference {
+            attr_dataoffset: 0,
+            attr_length: 0,
+        },
+        name_data: [0u8; 256],
+    };
+    unsafe { get_vol_attr(path, ATTR_VOL_NAME, &mut buf) }?;
+
+    // `attr_dataoffset` is relative to the address of the attrreference
+    // structure itself, per `getattrlist(2)`.
+    let base = &buf.name_ref as *const AttrReference as *const u8;
+    let data = unsafe { base.offset(buf.name_ref.attr_dataoffset as isize) };
+    let len = (buf.name_ref.attr_length as usize)
+        .saturating_sub(1) // exclude the NUL terminator
+        .min(buf.name_data.len());
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Reads a directory's macOS identity — device and inode — the pair used to
+/// answer "is this the same directory?" regardless of the path string used
+/// to reach it: a differently-cased path, a symlink, or a volume remounted
+/// elsewhere all resolve to the same (device, inode) if they name the same
+/// directory. `fs::metadata` follows symlinks, so a symlinked path resolves
+/// to the identity of what it points at.
+pub fn directory_identity(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 /// Finds the root of a currently mounted volume by its pinned UUID. This is
 /// deliberately a mount-table scan rather than a pathname heuristic: a
 /// remount at `/Volumes/Backup 1` must not be mistaken for the old path.
@@ -168,9 +227,16 @@ pub fn mounted_path_for_uuid(expected: &str) -> io::Result<Option<PathBuf>> {
 
 /// Returns the mount point containing a path, selecting the longest match.
 pub fn mount_point_for_path(path: &Path) -> io::Result<PathBuf> {
+    // The mount table (`getfsstat`'s `f_mntonname`) reports canonical paths
+    // — e.g. `/private/var/...`, not the `/var/...` symlink macOS also
+    // accepts — so an uncanonicalized `path` can fail to match its own
+    // mount and silently fall back to `/`, corrupting the recorded
+    // volume-relative path. Canonicalize first; fall back to the original
+    // for a path that can't be resolved (e.g. it doesn't exist yet).
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     mounted_paths()?
         .into_iter()
-        .filter(|mount| path.starts_with(mount))
+        .filter(|mount| canonical.starts_with(mount))
         .max_by_key(|mount| mount.as_os_str().len())
         .ok_or_else(|| {
             io::Error::new(
@@ -222,6 +288,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directory_identity_matches_the_same_directory_reached_two_different_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let symlink = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &symlink).unwrap();
+        assert_eq!(
+            directory_identity(dir.path()).unwrap(),
+            directory_identity(&symlink).unwrap()
+        );
+    }
+
+    #[test]
+    fn directory_identity_distinguishes_a_directory_from_its_own_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert_ne!(
+            directory_identity(dir.path()).unwrap(),
+            directory_identity(&child).unwrap()
+        );
+    }
+
+    #[test]
     fn formats_uuid_bytes_as_hyphenated_uppercase() {
         let bytes: [u8; 16] = [
             0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E,
@@ -243,6 +331,12 @@ mod tests {
     fn errors_for_a_nonexistent_path() {
         let err = volume_uuid(Path::new("/no/such/path/vibesync-test")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn reads_a_nonempty_volume_name_for_the_root_volume() {
+        let name = volume_name(Path::new("/")).expect("root volume has a name");
+        assert!(!name.is_empty());
     }
 
     #[test]
