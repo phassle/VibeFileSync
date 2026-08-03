@@ -1,0 +1,13 @@
+{"dry_run":true,"mode":"mirror","pair":"sync","plan_id":"<plan-id>","schema":"vibefilesync.plan/v1","type":"plan_start"}
+{"bytes":25,"old_bytes":4,"op":"update","path":"changed.txt","plan_id":"<plan-id>","reason":"size differs","safety_net":"_SafetyNet/<run-id>/changed.txt","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":16,"op":"copy","path":"dir-to-file","plan_id":"<plan-id>","reason":"new","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":0,"old_bytes":0,"op":"delete","path":"dir-to-file","plan_id":"<plan-id>","reason":"replaced by source file","safety_net":"_SafetyNet/<run-id>/dir-to-file","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":6,"op":"copy","path":"file-to-dir/inner.txt","plan_id":"<plan-id>","reason":"new","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":11,"op":"copy","path":"link","plan_id":"<plan-id>","reason":"new","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":19,"op":"copy","path":"new.txt","plan_id":"<plan-id>","reason":"new","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":0,"op":"copy","path":"new-dir","plan_id":"<plan-id>","reason":"new directory","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":0,"old_bytes":0,"op":"delete","path":"destination-only-dir","plan_id":"<plan-id>","reason":"directory not in source","safety_net":"_SafetyNet/<run-id>/destination-only-dir","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":24,"old_bytes":24,"op":"delete","path":"destination-only.txt","plan_id":"<plan-id>","reason":"not in source","safety_net":"_SafetyNet/<run-id>/destination-only.txt","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":11,"old_bytes":11,"op":"delete","path":"file-to-dir","plan_id":"<plan-id>","reason":"replaced by source directory","safety_net":"_SafetyNet/<run-id>/file-to-dir","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":13,"op":"cleanup","path":".other.txt.vibesync-tmp-dst01","plan_id":"<plan-id>","reason":"abandoned temp","schema":"vibefilesync.plan/v1","type":"action"}
+{"counts":{"cleanup":1,"copy":5,"delete":4,"error":0,"excluded":0,"scanned":12,"unchanged":1,"update":1},"plan_id":"<plan-id>","schema":"vibefilesync.plan/v1","type":"summary"}

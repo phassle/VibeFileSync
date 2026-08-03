@@ -63,6 +63,7 @@ Detailed procedure: `.agents/skills/build-vibesync/SKILL.md`.
 2. Run linter gate: `cargo clippy --locked --all-targets --all-features -- -D warnings`.
 3. Run default suite: `cargo test --locked`.
 4. Run injected ENOSPC/space-check paths: `cargo test --locked --features fault-injection`.
+5. Dry-run output is pinned by golden captures under `tests/captures/` (`tests/plan_captures.rs`). These are never hand-edited; one command regenerates every one of them, after which the diff under `tests/captures/` is reviewed before committing: `REGEN_CAPTURES=1 cargo test --locked --test plan_captures --features fault-injection`.
 
 Detailed procedure: `.agents/skills/test-vibesync/SKILL.md`. Test architecture: `docs/adr/0009-acceptance-test-harness.md`.
 
