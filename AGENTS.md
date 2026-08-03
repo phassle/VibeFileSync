@@ -25,7 +25,7 @@ Module map:
 - `src/pair.rs::add` — the single Folder-pair writer (also serves `--replace` and the TUI form); `src/pair.rs::remove`.
 - `src/volume.rs::volume_uuid` — volume UUID is the sole identity; `src/volume.rs::filesystem_type`, `src/volume.rs::expected_degradations`.
 - `src/preconditions.rs::resolve_pair` — mount relocation and abort-before-mutation guards; six-state classifier `src/preconditions.rs::classify_pair`; run-only gates `src/preconditions.rs::check_run`.
-- `src/plan.rs::scan` — tree scan; pure diff `src/plan.rs::compute`; human rendering `src/plan.rs::render`; NDJSON stream `src/plan.rs::run_json`.
+- `src/plan.rs::traverse` — single tree walk; per-entry diff `src/plan.rs::classify_source_entry`; human rendering `src/plan.rs::render`; NDJSON stream `src/plan.rs::run_json`.
 - `src/run.rs::run` — human/JSON Run; review/reconcile/execute `src/run.rs::execute_reviewed_plan`; verification gate `src/run.rs::verify_temp`; SafetyNet rename `src/run.rs::archive_by_rename`.
 - `src/tui.rs::run` — TUI entry; staged lifecycle `src/tui.rs::run_pair_flow`; pair selector `src/tui.rs::select_pair`. Largest module: read the stage you are changing, not the file.
 - `src/event.rs::run_start` — NDJSON event constructors; the schema agents parse. Additive changes only.
@@ -82,8 +82,8 @@ Detailed procedure: `.agents/skills/release-vibesync/SKILL.md`.
 - Gitflow mandatory. Create `feature/<kebab-name>` from `develop` for every coherent code/docs/ADR change; PR targets `develop` (`docs/agents/git-workflow.md`).
 - `main` receives release/hotfix merges only. Prototype/research branch exemptions are throwaway and never merged (`docs/agents/git-workflow.md`).
 - Validate config before command-specific behavior (`src/main.rs::run`).
-- Keep `plan` read-only; mutation belongs behind Run review and preconditions (`src/plan.rs::compute`, `src/run.rs::execute_reviewed_plan`).
-- Preserve deterministic ordering and schema versions (`src/plan.rs::scan`, `src/config.rs::CURRENT_VERSION`).
+- Keep `plan` read-only; mutation belongs behind Run review and preconditions (`src/plan.rs::traverse`, `src/run.rs::execute_reviewed_plan`).
+- Preserve deterministic ordering and schema versions (`src/plan.rs::traverse`, `src/config.rs::CURRENT_VERSION`).
 - Exercise filesystem behavior through real temp trees; use the `fault-injection` feature for hard-to-force failures (`tests/cli.rs::Fixture`, `Cargo.toml [features]`).
 - Scripted TUI tests rendezvous on the child's own output, never on elapsed time (`docs/adr/0011-scripted-tui-input-synchronisation.md`).
 - Let `rustfmt`/Clippy own style. Add no prose formatting rules.
