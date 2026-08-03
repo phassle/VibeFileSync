@@ -225,6 +225,39 @@ fn every_documented_path_exists() {
 /// `Cargo.toml [dependencies]` and `package.json "devDependencies"` name a place
 /// inside a file. Checking only that the file exists leaves the half that actually
 /// moves — the section, the key — unguarded, which is the same rot as a line number.
+/// A reference list that names the same thing twice says nothing the second time.
+///
+/// These appear when positional references are converted to symbols: two distinct line
+/// numbers inside one function collapse to one name, and the duplicate survives as noise.
+/// Repeats *across* lists are fine and often correct — several sub-steps of Publish really
+/// do live in `copy_file`, which is the honest cost of naming over positioning. Only a
+/// repeat within a single reference list is meaningless.
+#[test]
+fn no_reference_list_names_the_same_thing_twice() {
+    let mut repeats = BTreeSet::new();
+    for doc in DOCS {
+        for (number, line) in read(doc).lines().enumerate() {
+            let refs: Vec<String> = backticked(line)
+                .into_iter()
+                .filter(|span| {
+                    let head = span.split(&[' ', ':'][..]).next().unwrap_or(span);
+                    EXTENSIONS.iter().any(|ext| head.ends_with(ext))
+                })
+                .collect();
+            for span in &refs {
+                if refs.iter().filter(|other| *other == span).count() > 1 {
+                    repeats.insert(format!("{doc}:{}: `{span}` appears twice", number + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        repeats.is_empty(),
+        "a reference list names the same thing twice:\n  {}",
+        repeats.iter().cloned().collect::<Vec<_>>().join("\n  ")
+    );
+}
+
 #[test]
 fn every_documented_section_exists() {
     let mut missing = BTreeSet::new();

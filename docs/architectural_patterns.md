@@ -44,7 +44,7 @@ Config rewrites reuse the same temp → sync → rename → parent-sync idiom (`
 
 ## SafetyNet is the removal boundary
 
-Route every replacement/deletion through one helper. Default behavior renames the prior destination into `_SafetyNet/<run-id>/<relative-path>` on the same volume (`src/run.rs::archive_by_rename`, `src/run.rs::archive_by_rename`). A permanent delete is an explicit per-run branch, never stored config (`src/main.rs::Command`, `src/config.rs::Config`).
+Route every replacement/deletion through one helper. Default behavior renames the prior destination into `_SafetyNet/<run-id>/<relative-path>` on the same volume (`src/run.rs::archive_by_rename`). A permanent delete is an explicit per-run branch, never stored config (`src/main.rs::Command`, `src/config.rs::Config`).
 
 Protect tool-owned objects at both ends:
 
@@ -54,7 +54,7 @@ Protect tool-owned objects at both ends:
 
 ## Journal records; scans decide
 
-Keep the append-only Journal as forensic/history output, never planning authority (`src/journal.rs::Journal`, `src/journal.rs::acquire`). Persist the reviewed action set, then rescan after cleanup and intersect fresh work with that set (`src/journal.rs::Journal`, `src/run.rs::retain_reviewed_actions`, `src/run.rs::missing_reviewed_actions`). Status and History read records without changing sync decisions (`src/journal.rs::status`, `src/journal.rs::history_human`, `src/journal.rs::history_json`).
+Keep the append-only Journal as forensic/history output, never planning authority (`src/journal.rs::Journal`, `src/journal.rs::acquire`). Persist the reviewed action set, then rescan after cleanup and intersect fresh work with that set (`src/run.rs::retain_reviewed_actions`, `src/run.rs::missing_reviewed_actions`). Status and History read records without changing sync decisions (`src/journal.rs::status`, `src/journal.rs::history_human`, `src/journal.rs::history_json`).
 
 ## Deterministic, versioned boundaries
 
