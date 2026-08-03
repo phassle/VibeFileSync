@@ -3,16 +3,17 @@
 //! no-FSEvents / no-rename-detection trade-off), then grouped by operation
 //! and printed summary-first.
 //!
-//! The seam is deliberately split: [`compute`] and [`render`] are pure over
-//! already-scanned trees, so mode semantics, machinery exclusion, and the
+//! The seam is deliberately split: [`traverse`] drives a single streaming
+//! pass over both trees, yielding rows to a [`PlanSink`]; [`render`] is pure
+//! over an assembled [`Plan`], so mode semantics, machinery exclusion, and the
 //! symlink→exFAT error row are testable without touching real volumes;
-//! [`scan`] and [`run`] hold the filesystem and CLI edges.
+//! [`run`] holds the CLI edge.
 //!
 //! Everything here is strictly read-only — `plan` never writes to the
 //! source or destination.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -102,7 +103,6 @@ enum PlanOperation {
 enum SourceClassification {
     Action(PlanOperation, Action),
     Error(PlanError),
-    Excluded,
     Unchanged(PathBuf),
 }
 
@@ -163,107 +163,10 @@ fn is_apple_double(path: &Path, name: &OsStr) -> bool {
         && magic == [0x00, 0x05, 0x16, 0x07]
 }
 
-/// Recursively collects every file and symlink under `root`, keyed by path
-/// relative to `root`, skipping machinery. `BTreeMap` keeps the output
-/// deterministically sorted. Symlinks are recorded via `symlink_metadata`
-/// (never followed), so a symlinked directory is one entry, not a subtree.
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn scan(root: &Path, skip_apple_double: bool) -> io::Result<BTreeMap<PathBuf, Entry>> {
-    let mut entries = BTreeMap::new();
-    walk(root, skip_apple_double, |path, entry| {
-        entries.insert(path.to_path_buf(), entry.clone());
-        Ok(())
-    })?;
-    Ok(entries)
-}
-
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn scan_directories(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
-    let mut directories = BTreeSet::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        let mut entries: Vec<_> = fs::read_dir(&directory)?.collect::<Result<_, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries.into_iter().rev() {
-            if is_machinery(&entry.file_name()) {
-                continue;
-            }
-            let path = entry.path();
-            if fs::symlink_metadata(&path)?.file_type().is_dir() {
-                directories.insert(
-                    path.strip_prefix(root)
-                        .expect("read_dir path is under root")
-                        .to_path_buf(),
-                );
-                stack.push(path);
-            }
-        }
-    }
-    Ok(directories)
-}
-
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn walk(
-    root: &Path,
-    skip_apple_double: bool,
-    mut visit: impl FnMut(&Path, &Entry) -> io::Result<()>,
-) -> io::Result<usize> {
-    fn recurse(
-        root: &Path,
-        directory: &Path,
-        skip_apple_double: bool,
-        visit: &mut impl FnMut(&Path, &Entry) -> io::Result<()>,
-        count: &mut usize,
-    ) -> io::Result<()> {
-        for_each_sorted_entry(directory, |entry| {
-            if is_machinery(&entry.file_name())
-                || (skip_apple_double && is_apple_double(&entry.path(), &entry.file_name()))
-            {
-                return Ok(());
-            }
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path)?;
-            let file_type = meta.file_type();
-            if file_type.is_dir() {
-                recurse(root, &path, skip_apple_double, visit, count)?;
-            } else {
-                #[cfg(all(feature = "fault-injection", debug_assertions))]
-                if let Ok(delay) = std::env::var("VIBESYNC_TEST_PLAN_SCAN_DELAY_MS") {
-                    std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
-                }
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("read_dir path is under root");
-                visit(
-                    rel,
-                    &Entry {
-                        size: meta.len(),
-                        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                        is_symlink: file_type.is_symlink(),
-                    },
-                )?;
-                *count += 1;
-            }
-            Ok(())
-        })
-    }
-
-    let mut count = 0;
-    recurse(root, root, skip_apple_double, &mut visit, &mut count)?;
-    Ok(count)
-}
-
-/// Reads a directory once, sorts its entries by name, and returns them. This
-/// replaces [`for_each_sorted_entry`]'s re-read-per-entry scan for the single
-/// [`traverse`] pass: the emitted order is identical (a depth-first walk with
-/// name-sorted children is the same as component-lexicographic order), but a
-/// directory is read exactly once.
+/// Reads a directory once, sorts its entries by name, and returns them.
+/// Used by the single [`traverse`] pass: the emitted order is identical
+/// (a depth-first walk with name-sorted children is the same as
+/// component-lexicographic order), but a directory is read exactly once.
 fn sorted_entries(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -367,112 +270,6 @@ fn walk_leaf_directories(
     Ok(())
 }
 
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn for_each_sorted_entry(
-    directory: &Path,
-    mut visit: impl FnMut(fs::DirEntry) -> io::Result<()>,
-) -> io::Result<()> {
-    let mut previous: Option<OsString> = None;
-    loop {
-        let mut next: Option<fs::DirEntry> = None;
-        for candidate in fs::read_dir(directory)? {
-            let candidate = candidate?;
-            let name = candidate.file_name();
-            if previous.as_ref().is_some_and(|previous| name <= *previous)
-                || next.as_ref().is_some_and(|next| name >= next.file_name())
-            {
-                continue;
-            }
-            next = Some(candidate);
-        }
-        let Some(next) = next else { break };
-        previous = Some(next.file_name());
-        visit(next)?;
-    }
-    Ok(())
-}
-
-/// Computes the Dry-run diff. Pure over the two scanned trees:
-///
-/// - source-only file → COPY;
-/// - present on both, differing by type/size/mtime → UPDATE;
-/// - present on both and identical → unchanged (counted, not listed);
-/// - destination-only file → DELETE in Mirror, nothing in Update (Update
-///   never plans a removal, per CONTEXT.md);
-/// - a symlink whose destination can't store it (`!supports_symlinks`) →
-///   an ERRORS row instead of a COPY/UPDATE.
-///
-/// `excludes` are exact relative-path strings (as the diff prints them,
-/// ADR-0004); a matching unfiltered action/error row is dropped and counted
-/// in `excluded`.
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-pub fn compute(
-    source: &BTreeMap<PathBuf, Entry>,
-    dest: &BTreeMap<PathBuf, Entry>,
-    mode: Mode,
-    supports_symlinks: bool,
-    mtime_tolerance: Duration,
-    excludes: &[String],
-) -> Plan {
-    // `scanned` is the count of files the plan actually reasons about, so
-    // the closing totals reconcile. Every source file lands in exactly one
-    // outcome (copy / update / unchanged / excluded / error). Destination-
-    // only files are additional outcomes in Mirror (delete / excluded) but
-    // are outside Update's consideration entirely, so they're only counted
-    // in Mirror mode.
-    let dest_only = || dest.keys().filter(|p| !source.contains_key(*p)).count();
-    let mut plan = Plan {
-        scanned: if mode == Mode::Mirror { dest_only() } else { 0 },
-        source_entries: source.len(),
-        destination_entries: dest.len(),
-        ..Plan::default()
-    };
-    let mut actionable_paths = BTreeSet::new();
-    for (rel, src) in source {
-        let classification =
-            classify_source_entry(rel, src, dest.get(rel), supports_symlinks, mtime_tolerance);
-        if let Some(path) = actionable_path(&classification) {
-            actionable_paths.insert(path.to_path_buf());
-        }
-        record_classification(&mut plan, apply_excludes(classification, excludes));
-    }
-
-    // Removals are Mirror-only. In Update nothing at the destination is
-    // ever planned for removal, so the DELETE pass is skipped entirely.
-    if mode == Mode::Mirror {
-        for (rel, dst) in dest {
-            if source.contains_key(rel) {
-                continue;
-            }
-            actionable_paths.insert(rel.clone());
-            if excludes.iter().any(|excluded| Path::new(excluded) == rel) {
-                plan.excluded += 1;
-                continue;
-            }
-            plan.deletes.push(Action {
-                rel_path: rel.clone(),
-                bytes: dst.size,
-                source_mtime: None,
-                old_bytes: Some(dst.size),
-                reason: "not in source".to_string(),
-                structural_conflict: None,
-            });
-        }
-    }
-
-    plan.unknown_excludes = excludes
-        .iter()
-        .filter(|excluded| !actionable_paths.contains(Path::new(excluded)))
-        .cloned()
-        .collect();
-
-    plan
-}
-
 /// Reports exclusions which did not match an exact action path. Keep this on
 /// stderr so NDJSON stdout remains a machine-readable event stream.
 pub(crate) fn report_unknown_excludes(plan: &Plan) {
@@ -551,54 +348,6 @@ fn classify_source_entry(
             ),
             None => SourceClassification::Unchanged(rel.to_path_buf()),
         },
-    }
-}
-
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn actionable_path(classification: &SourceClassification) -> Option<&Path> {
-    match classification {
-        SourceClassification::Action(_, action) => Some(&action.rel_path),
-        SourceClassification::Error(error) => Some(&error.rel_path),
-        SourceClassification::Excluded | SourceClassification::Unchanged(_) => None,
-    }
-}
-
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn apply_excludes(
-    classification: SourceClassification,
-    excludes: &[String],
-) -> SourceClassification {
-    let excluded = actionable_path(&classification).is_some_and(|path| {
-        excludes
-            .iter()
-            .any(|candidate| Path::new(candidate) == path)
-    });
-    if excluded {
-        SourceClassification::Excluded
-    } else {
-        classification
-    }
-}
-
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn record_classification(plan: &mut Plan, classification: SourceClassification) {
-    plan.scanned += 1;
-    match classification {
-        SourceClassification::Action(PlanOperation::Copy, action) => plan.copies.push(action),
-        SourceClassification::Action(PlanOperation::Update, action) => plan.updates.push(action),
-        SourceClassification::Action(_, _) => unreachable!("source rows are copy/update only"),
-        SourceClassification::Error(error) => plan.errors.push(error),
-        SourceClassification::Excluded => plan.excluded += 1,
-        SourceClassification::Unchanged(path) => {
-            plan.unchanged += 1;
-            plan.unchanged_paths.push(path);
-        }
     }
 }
 
@@ -1085,7 +834,6 @@ fn traverse(
             SourceClassification::Unchanged(path) => {
                 sink.unchanged(&path).map_err(io::Error::other)?
             }
-            SourceClassification::Excluded => unreachable!("traversal applies no exclusions"),
         }
         Ok(())
     })
@@ -1228,15 +976,24 @@ impl<'a> BufferingSink<'a> {
             .any(|excluded| Path::new(excluded) == path)
     }
 
+    /// Insert a delete row at its sorted position. Delete rows arrive from
+    /// three interleaving passes (source-side directory replacements, Mirror
+    /// directory deletes, and the destination-file pass), so the assembled
+    /// list is kept ordered here rather than re-sorted after construction.
+    fn push_delete(&mut self, action: &Action) {
+        let index = self
+            .plan
+            .deletes
+            .partition_point(|existing| existing.rel_path < action.rel_path);
+        self.plan.deletes.insert(index, action.clone());
+    }
+
     fn finish(mut self) -> Plan {
         self.plan
             .copies
             .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
         self.plan
             .updates
-            .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        self.plan
-            .deletes
             .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
         self.plan.strays.sort();
         self.plan.unknown_excludes = self
@@ -1303,7 +1060,7 @@ impl PlanSink for BufferingSink<'_> {
         if self.is_excluded(&action.rel_path) {
             self.plan.excluded += 1;
         } else {
-            self.plan.deletes.push(action.clone());
+            self.push_delete(action);
         }
         Ok(())
     }
@@ -1325,7 +1082,7 @@ impl PlanSink for BufferingSink<'_> {
             return Ok(());
         }
         self.plan.scanned += 1;
-        self.plan.deletes.push(action.clone());
+        self.push_delete(action);
         self.plan.directory_deletes.insert(action.rel_path.clone());
         Ok(())
     }
@@ -1336,7 +1093,7 @@ impl PlanSink for BufferingSink<'_> {
         if self.is_excluded(&action.rel_path) {
             self.plan.excluded += 1;
         } else {
-            self.plan.deletes.push(action.clone());
+            self.push_delete(action);
         }
         Ok(())
     }
@@ -1347,7 +1104,7 @@ impl PlanSink for BufferingSink<'_> {
         if self.is_excluded(&action.rel_path) {
             self.plan.excluded += 1;
         } else {
-            self.plan.deletes.push(action.clone());
+            self.push_delete(action);
         }
         Ok(())
     }
@@ -1373,6 +1130,14 @@ impl PlanSink for BufferingSink<'_> {
 /// Writes the NDJSON action stream row-by-row from the single [`traverse`]
 /// pass, holding memory constant. It reproduces the streaming surface's stats
 /// arithmetic exactly, so the closing summary matches the golden captures.
+///
+/// Its `stats` counters are a second counter set distinct from
+/// [`BufferingSink`]'s `plan`, and legitimately so: both are driven by the one
+/// traversal, but they tally different populations. The buffering plan applies
+/// exclusions (dropping and counting matched rows) and reports Mirror's
+/// destination-only entries, while the streaming summary carries none of that.
+/// Totals are therefore never double-counted across the two sets — each sink
+/// owns exactly one, fed by the same decision stream.
 struct StreamingSink<'a> {
     plan_id: &'a str,
     stats: StreamStats,
@@ -1491,74 +1256,6 @@ pub(crate) fn build(
     Ok((pair, sink.finish()))
 }
 
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn add_directory_actions(
-    plan: &mut Plan,
-    source_entries: &BTreeMap<PathBuf, Entry>,
-    source: &BTreeSet<PathBuf>,
-    destination: &BTreeSet<PathBuf>,
-    destination_root: &Path,
-    mode: Mode,
-    excludes: &[String],
-) {
-    for path in source.difference(destination) {
-        if source_entries.keys().any(|entry| entry.starts_with(path))
-            || source
-                .iter()
-                .any(|directory| directory != path && directory.starts_with(path))
-        {
-            continue;
-        }
-        if excludes.iter().any(|excluded| Path::new(excluded) == path) {
-            plan.excluded += 1;
-            continue;
-        }
-        plan.copies.push(Action {
-            rel_path: path.clone(),
-            bytes: 0,
-            source_mtime: None,
-            old_bytes: None,
-            reason: "new directory".into(),
-            structural_conflict: None,
-        });
-        plan.scanned += 1;
-        plan.directory_copies.insert(path.clone());
-    }
-    if mode == Mode::Mirror {
-        for path in destination.difference(source) {
-            if destination
-                .difference(source)
-                .any(|ancestor| ancestor != path && path.starts_with(ancestor))
-                || contains_machinery(&destination_root.join(path))
-            {
-                continue;
-            }
-            if excludes.iter().any(|excluded| Path::new(excluded) == path) {
-                plan.excluded += 1;
-                continue;
-            }
-            plan.deletes
-                .retain(|action| !action.rel_path.starts_with(path));
-            plan.deletes.push(Action {
-                rel_path: path.clone(),
-                bytes: 0,
-                source_mtime: None,
-                old_bytes: Some(0),
-                reason: "directory not in source".into(),
-                structural_conflict: None,
-            });
-            plan.scanned += 1;
-            plan.directory_deletes.insert(path.clone());
-        }
-    }
-    plan.copies
-        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    plan.deletes
-        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-}
-
 fn contains_machinery(root: &Path) -> bool {
     let Ok(entries) = fs::read_dir(root) else {
         return false;
@@ -1572,102 +1269,6 @@ fn contains_machinery(root: &Path) -> bool {
         }
     }
     false
-}
-
-// Superseded by the single `traverse` pass (issue #70). Kept in place,
-// unused, until removal in issue #71 proves the equivalence stands.
-#[allow(dead_code)]
-fn add_structural_replacements(
-    plan: &mut Plan,
-    source: &BTreeMap<PathBuf, Entry>,
-    destination: &BTreeMap<PathBuf, Entry>,
-    destination_root: &Path,
-    mode: Mode,
-    excludes: &[String],
-) -> io::Result<()> {
-    let mut structural = Vec::new();
-
-    // A destination file blocks creation of a source directory. Mirror
-    // already classifies it as destination-only, so tag that existing row;
-    // Update needs a new replacement row even though unrelated content stays.
-    for (path, entry) in destination {
-        if source
-            .keys()
-            .any(|source_path| source_path != path && source_path.starts_with(path))
-            || plan
-                .directory_copies
-                .iter()
-                .any(|source_path| source_path.starts_with(path))
-        {
-            if mode == Mode::Mirror {
-                if let Some(existing) = plan
-                    .deletes
-                    .iter_mut()
-                    .find(|action| action.rel_path == *path)
-                {
-                    existing.reason = "replaced by source directory".into();
-                    existing.structural_conflict = Some(StructuralConflict::DestinationFile);
-                }
-            } else {
-                structural.push(Action {
-                    rel_path: path.clone(),
-                    bytes: entry.size,
-                    source_mtime: None,
-                    old_bytes: Some(entry.size),
-                    reason: "replaced by source directory".into(),
-                    structural_conflict: Some(StructuralConflict::DestinationFile),
-                });
-                plan.scanned += 1;
-            }
-        }
-    }
-
-    // A reviewed destination directory at a source-file path is archived as
-    // one object after the dependent file passes its gate. An excluded
-    // descendant keeps the directory outside the structural replacement.
-    for copy in &plan.copies {
-        if plan.directory_copies.contains(&copy.rel_path)
-            || !fs::symlink_metadata(destination_root.join(&copy.rel_path))
-                .is_ok_and(|metadata| metadata.file_type().is_dir())
-            || excludes
-                .iter()
-                .any(|excluded| Path::new(excluded).starts_with(&copy.rel_path))
-            || contains_machinery(&destination_root.join(&copy.rel_path))
-        {
-            continue;
-        }
-        if let Some(existing) = plan
-            .deletes
-            .iter_mut()
-            .find(|action| action.rel_path == copy.rel_path)
-        {
-            existing.reason = "replaced by source file".into();
-            existing.structural_conflict = Some(StructuralConflict::DestinationDirectory);
-        } else {
-            structural.push(destination_directory_replacement(&copy.rel_path));
-        }
-        plan.directory_deletes.insert(copy.rel_path.clone());
-    }
-
-    for action in structural {
-        plan.unknown_excludes
-            .retain(|excluded| Path::new(excluded) != action.rel_path);
-        if excludes
-            .iter()
-            .any(|excluded| Path::new(excluded) == action.rel_path)
-        {
-            plan.excluded += 1;
-        } else if !plan
-            .deletes
-            .iter()
-            .any(|existing| existing.rel_path == action.rel_path)
-        {
-            plan.deletes.push(action);
-        }
-    }
-    plan.deletes
-        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    Ok(())
 }
 
 /// Lists abandoned sibling Publish temps without treating them as sync
@@ -1738,221 +1339,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn at(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
-    fn file(size: u64, mtime_secs: u64) -> Entry {
-        Entry {
-            size,
-            mtime: at(mtime_secs),
-            is_symlink: false,
-        }
-    }
-
-    fn link(size: u64) -> Entry {
-        Entry {
-            size,
-            mtime: at(0),
-            is_symlink: true,
-        }
-    }
-
-    fn tree(entries: &[(&str, Entry)]) -> BTreeMap<PathBuf, Entry> {
-        entries
-            .iter()
-            .map(|(p, e)| (PathBuf::from(p), e.clone()))
-            .collect()
-    }
-
-    #[test]
-    fn mirror_classifies_copy_update_delete_and_unchanged() {
-        let source = tree(&[
-            ("new.txt", file(10, 100)),
-            ("same.txt", file(20, 200)),
-            ("bigger.txt", file(40, 300)),
-        ]);
-        let dest = tree(&[
-            ("same.txt", file(20, 200)),
-            ("bigger.txt", file(30, 300)), // size differs -> update
-            ("gone.txt", file(5, 50)),     // dest-only -> delete
-        ]);
-
-        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
-
-        assert_eq!(plan.copies.len(), 1);
-        assert_eq!(plan.copies[0].rel_path, PathBuf::from("new.txt"));
-        assert_eq!(plan.updates.len(), 1);
-        assert_eq!(plan.updates[0].rel_path, PathBuf::from("bigger.txt"));
-        assert_eq!(plan.updates[0].reason, "size differs");
-        assert_eq!(plan.deletes.len(), 1);
-        assert_eq!(plan.deletes[0].rel_path, PathBuf::from("gone.txt"));
-        assert_eq!(plan.unchanged, 1);
-        assert!(plan.errors.is_empty());
-    }
-
-    #[test]
-    fn same_size_different_mtime_is_an_update() {
-        let source = tree(&[("edited.txt", file(20, 500))]);
-        let dest = tree(&[("edited.txt", file(20, 200))]);
-
-        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
-        assert_eq!(plan.updates.len(), 1);
-        assert_eq!(plan.updates[0].reason, "modified");
-        assert_eq!(plan.unchanged, 0);
-    }
-
-    #[test]
-    fn timestamp_granularity_does_not_replan_a_published_file() {
-        let source = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 11))]);
-        let destination = BTreeMap::from([(PathBuf::from("photo.jpg"), file(4, 10))]);
-
-        let plan = compute(
-            &source,
-            &destination,
-            Mode::Mirror,
-            false,
-            Duration::from_secs(2),
-            &[],
-        );
-
-        assert!(plan.updates.is_empty());
-        assert_eq!(plan.unchanged, 1);
-    }
-
-    #[test]
-    fn update_mode_never_plans_a_deletion() {
-        let source = tree(&[("new.txt", file(10, 100))]);
-        let dest = tree(&[("gone.txt", file(5, 50)), ("also-gone.txt", file(6, 60))]);
-
-        let plan = compute(&source, &dest, Mode::Update, true, Duration::ZERO, &[]);
-
-        assert_eq!(plan.copies.len(), 1);
-        assert!(
-            plan.deletes.is_empty(),
-            "Update must never plan a removal: {:?}",
-            plan.deletes
-        );
-    }
-
-    #[test]
-    fn symlink_to_exfat_destination_is_an_error_row_not_a_copy() {
-        let source = tree(&[("link", link(12)), ("regular.txt", file(10, 100))]);
-        let dest = BTreeMap::new();
-
-        let plan = compute(
-            &source,
-            &dest,
-            Mode::Mirror,
-            /* supports_symlinks */ false,
-            Duration::ZERO,
-            &[],
-        );
-
-        assert_eq!(plan.errors.len(), 1);
-        assert_eq!(plan.errors[0].rel_path, PathBuf::from("link"));
-        assert!(plan.errors[0].message.contains("exFAT"));
-        // The symlink is NOT planned as a copy; the regular file still is.
-        assert_eq!(plan.copies.len(), 1);
-        assert_eq!(plan.copies[0].rel_path, PathBuf::from("regular.txt"));
-    }
-
-    #[test]
-    fn symlink_to_capable_destination_is_planned_normally() {
-        let source = tree(&[("link", link(12))]);
-        let dest = BTreeMap::new();
-
-        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
-        assert!(plan.errors.is_empty());
-        assert_eq!(plan.copies.len(), 1);
-    }
-
-    #[test]
-    fn exclude_drops_a_row_and_counts_it() {
-        let source = tree(&[("keep.txt", file(10, 100)), ("skip.txt", file(10, 100))]);
-        let dest = BTreeMap::new();
-
-        let plan = compute(
-            &source,
-            &dest,
-            Mode::Mirror,
-            true,
-            Duration::ZERO,
-            &["skip.txt".to_string()],
-        );
-
-        assert_eq!(plan.copies.len(), 1);
-        assert_eq!(plan.copies[0].rel_path, PathBuf::from("keep.txt"));
-        assert_eq!(plan.excluded, 1);
-    }
-
-    #[test]
-    fn exclude_can_drop_a_deletion() {
-        let source = BTreeMap::new();
-        let dest = tree(&[("gone.txt", file(5, 50))]);
-
-        let plan = compute(
-            &source,
-            &dest,
-            Mode::Mirror,
-            true,
-            Duration::ZERO,
-            &["gone.txt".to_string()],
-        );
-        assert!(plan.deletes.is_empty());
-        assert_eq!(plan.excluded, 1);
-    }
-
-    #[test]
-    fn render_totals_and_safetynet_notes_for_mirror() {
-        let source = tree(&[("new.txt", file(10, 100)), ("chg.txt", file(40, 300))]);
-        let dest = tree(&[("chg.txt", file(30, 300)), ("gone.txt", file(5, 50))]);
-        let plan = compute(&source, &dest, Mode::Mirror, true, Duration::ZERO, &[]);
-
-        let out = render(&plan, "photos", Mode::Mirror);
-
-        assert!(out
-            .starts_with("Dry-run for 'photos' (mirror): 1 copy · 1 update · 1 delete · 0 error"));
-        assert!(out.contains("COPY (1)"));
-        // SafetyNet note appears on the UPDATE and DELETE section headers.
-        assert!(out.contains(&format!("UPDATE (1) {SAFETYNET_NOTE}")));
-        assert!(out.contains(&format!("DELETE (1) {SAFETYNET_NOTE}")));
-        assert!(out.contains("ERRORS (0)"));
-        assert!(out.contains("Scanned 3 · unchanged 0 · excluded 0"));
-    }
-
-    #[test]
-    fn render_shows_an_empty_delete_section_in_update_mode() {
-        // ADR-0003's header is fixed at four parts and lists all four
-        // sections; Update proves its "never removes" guarantee by always
-        // reporting DELETE (0), not by hiding the section.
-        let source = tree(&[("new.txt", file(10, 100))]);
-        let dest = tree(&[("gone.txt", file(5, 50))]);
-        let plan = compute(&source, &dest, Mode::Update, true, Duration::ZERO, &[]);
-
-        let out = render(&plan, "docs", Mode::Update);
-
-        assert!(
-            out.contains("0 delete"),
-            "totals keep the fixed four parts: {out}"
-        );
-        assert!(
-            out.contains("DELETE (0)"),
-            "DELETE section still prints, empty: {out}"
-        );
-        assert!(
-            !out.contains("gone.txt"),
-            "no dest-only file is ever a delete row: {out}"
-        );
-        assert!(out.contains("COPY (1)"));
-        // Update considers only the source side, so scanned excludes the
-        // destination-only file and the totals still reconcile.
-        assert!(
-            out.contains("Scanned 1 · unchanged 0 · excluded 0"),
-            "{out}"
-        );
-    }
-
     #[test]
     fn human_size_formats_bytes_and_scaled_units() {
         assert_eq!(human_size(0), "0 B");
@@ -1971,37 +1357,6 @@ mod tests {
         assert!(!is_machinery(OsStr::new("_SafetyNetworkNotes")));
         assert!(!is_machinery(OsStr::new("vibesync-tmp-visible")));
         assert!(!is_machinery(OsStr::new("regular.txt")));
-    }
-
-    #[test]
-    fn apple_double_filter_is_content_and_destination_context_sensitive() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(
-            root.path().join("._photo.jpg"),
-            [0x00, 0x05, 0x16, 0x07, 0x01],
-        )
-        .unwrap();
-        fs::write(root.path().join("._notes"), b"legitimate user content").unwrap();
-
-        let mut source_paths = Vec::new();
-        walk(root.path(), false, |path, _| {
-            source_paths.push(path.to_path_buf());
-            Ok(())
-        })
-        .unwrap();
-        source_paths.sort();
-        assert_eq!(
-            source_paths,
-            [PathBuf::from("._notes"), PathBuf::from("._photo.jpg")]
-        );
-
-        let mut exfat_destination_paths = Vec::new();
-        walk(root.path(), true, |path, _| {
-            exfat_destination_paths.push(path.to_path_buf());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(exfat_destination_paths, [PathBuf::from("._notes")]);
     }
 
     /// A sink that records the ordered sequence of decisions `traverse` yields,
