@@ -976,15 +976,24 @@ impl<'a> BufferingSink<'a> {
             .any(|excluded| Path::new(excluded) == path)
     }
 
+    /// Insert a delete row at its sorted position. Delete rows arrive from
+    /// three interleaving passes (source-side directory replacements, Mirror
+    /// directory deletes, and the destination-file pass), so the assembled
+    /// list is kept ordered here rather than re-sorted after construction.
+    fn push_delete(&mut self, action: &Action) {
+        let index = self
+            .plan
+            .deletes
+            .partition_point(|existing| existing.rel_path < action.rel_path);
+        self.plan.deletes.insert(index, action.clone());
+    }
+
     fn finish(mut self) -> Plan {
         self.plan
             .copies
             .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
         self.plan
             .updates
-            .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        self.plan
-            .deletes
             .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
         self.plan.strays.sort();
         self.plan.unknown_excludes = self
@@ -1051,7 +1060,7 @@ impl PlanSink for BufferingSink<'_> {
         if self.is_excluded(&action.rel_path) {
             self.plan.excluded += 1;
         } else {
-            self.plan.deletes.push(action.clone());
+            self.push_delete(action);
         }
         Ok(())
     }
@@ -1073,7 +1082,7 @@ impl PlanSink for BufferingSink<'_> {
             return Ok(());
         }
         self.plan.scanned += 1;
-        self.plan.deletes.push(action.clone());
+        self.push_delete(action);
         self.plan.directory_deletes.insert(action.rel_path.clone());
         Ok(())
     }
@@ -1084,7 +1093,7 @@ impl PlanSink for BufferingSink<'_> {
         if self.is_excluded(&action.rel_path) {
             self.plan.excluded += 1;
         } else {
-            self.plan.deletes.push(action.clone());
+            self.push_delete(action);
         }
         Ok(())
     }
@@ -1095,7 +1104,7 @@ impl PlanSink for BufferingSink<'_> {
         if self.is_excluded(&action.rel_path) {
             self.plan.excluded += 1;
         } else {
-            self.plan.deletes.push(action.clone());
+            self.push_delete(action);
         }
         Ok(())
     }
