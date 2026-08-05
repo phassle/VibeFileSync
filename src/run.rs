@@ -383,20 +383,99 @@ fn execute_reviewed_plan(
         full_verify,
         excludes,
     } = options;
+
+    let (mut journal, reporter, mut stats) = match review_plan(
+        pair_name,
+        &pair,
+        &mut initial_plan,
+        render_plan,
+        allow_empty_source,
+        ignore_space_check,
+        yes,
+        json_output,
+    )? {
+        ReviewOutcome::ExitEarly(code) => return Ok(code),
+        ReviewOutcome::Proceed {
+            journal,
+            reporter,
+            stats,
+        } => (journal, reporter, stats),
+    };
+
+    if let CleanupOutcome::Abort = cleanup_stray_temps(
+        &pair.source,
+        &pair.destination,
+        &initial_plan.strays,
+        &mut journal,
+        &reporter,
+        &mut stats,
+    )? {
+        return finalize(&mut journal, &reporter, &stats);
+    }
+    let (pair, plan) = reconcile_plan(
+        config_path,
+        pair_name,
+        excludes,
+        &initial_plan,
+        &mut journal,
+        &reporter,
+        &mut stats,
+    )?;
+
+    dispatch(
+        &pair,
+        &plan,
+        permanent_delete,
+        full_verify,
+        &mut journal,
+        &reporter,
+        &mut stats,
+    )?;
+
+    finalize(&mut journal, &reporter, &stats)
+}
+
+/// Whether review cleared the plan for execution, or the run must stop
+/// before a journal exists (blocked plan, or the user declined to confirm).
+enum ReviewOutcome {
+    Proceed {
+        journal: Journal,
+        reporter: RunReporter,
+        stats: RunStats,
+    },
+    ExitEarly(i32),
+}
+
+/// Normalizes and (optionally) renders the plan, validates it against
+/// preconditions, gets user confirmation, and opens the journal that every
+/// later lifecycle writes through. Runs before cleanup because a blocked
+/// plan or a declined confirmation must never create a journal or touch the
+/// destination.
+#[allow(clippy::too_many_arguments)]
+fn review_plan(
+    pair_name: &str,
+    pair: &crate::config::Pair,
+    initial_plan: &mut plan::Plan,
+    render_plan: bool,
+    allow_empty_source: bool,
+    ignore_space_check: bool,
+    yes: bool,
+    json_output: bool,
+) -> Result<ReviewOutcome, AppError> {
     let reporter = RunReporter::new(json_output);
-    plan::drop_orphan_structural_deletions(&mut initial_plan);
-    plan::report_unknown_excludes(&initial_plan);
+    plan::drop_orphan_structural_deletions(initial_plan);
+    plan::report_unknown_excludes(initial_plan);
     if render_plan {
-        reporter.plan(&initial_plan, pair_name, pair.mode);
+        reporter.plan(initial_plan, pair_name, pair.mode);
     }
 
     if !initial_plan.errors.is_empty() {
         reporter.blocked(initial_plan.errors.len());
-        return Ok(EXIT_BLOCKED_PLAN);
+        return Ok(ReviewOutcome::ExitEarly(EXIT_BLOCKED_PLAN));
     }
     let run_warnings = crate::preconditions::check_run(
-        &pair,
-        &initial_plan,
+        pair,
+        initial_plan,
         allow_empty_source,
         ignore_space_check,
     )?;
@@ -406,7 +485,7 @@ fn execute_reviewed_plan(
 
     if !yes && !reporter.confirm()? {
         reporter.cancelled();
-        return Ok(EXIT_OK);
+        return Ok(ReviewOutcome::ExitEarly(EXIT_OK));
     }
 
     let blocked_signals = crate::interrupt::block().map_err(|error| {
@@ -418,7 +497,7 @@ fn execute_reviewed_plan(
             pair_name,
             &pair.source,
             &pair.destination,
-            &initial_plan,
+            initial_plan,
             &run_warnings,
             &degradations,
         )
@@ -426,16 +505,16 @@ fn execute_reviewed_plan(
     reporter.run_start(
         journal.run_id(),
         pair_name,
-        &pair,
+        pair,
         &run_warnings,
-        &initial_plan,
+        initial_plan,
     )?;
     install_interrupt_handler()?;
     blocked_signals.restore().map_err(|error| {
         AppError::Interrupted(format!("could not restore interruption signals: {error}"))
     })?;
     crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
-    let mut stats = RunStats {
+    let stats = RunStats {
         counts: Counts {
             planned: initial_plan.copies.len()
                 + initial_plan.updates.len()
@@ -445,27 +524,43 @@ fn execute_reviewed_plan(
         },
         ..RunStats::default()
     };
-    if let CleanupOutcome::Abort = cleanup_stray_temps(
-        &pair.source,
-        &pair.destination,
-        &initial_plan.strays,
-        &mut journal,
-        &reporter,
-        &mut stats,
-    )? {
-        journal.summary(&stats).map_err(journal_runtime_error)?;
-        reporter.summary(journal.run_id(), &stats)?;
-        return Ok(1);
+    Ok(ReviewOutcome::Proceed {
+        journal,
+        reporter,
+        stats,
+    })
+}
+
+/// Aggregates the run summary and computes the process exit code from the
+/// final counts. Called exactly once, after dispatch (or after an early
+/// cleanup abort), so every path shares one place that writes the summary.
+fn finalize(
+    journal: &mut Journal,
+    reporter: &RunReporter,
+    stats: &RunStats,
+) -> Result<i32, AppError> {
+    journal.summary(stats).map_err(journal_runtime_error)?;
+    reporter.summary(journal.run_id(), stats)?;
+    if stats.counts.failed == 0 {
+        Ok(EXIT_OK)
+    } else {
+        Ok(1)
     }
-    let (pair, plan) = reconcile_plan(
-        config_path,
-        pair_name,
-        excludes,
-        &initial_plan,
-        &mut journal,
-        &reporter,
-        &mut stats,
-    )?;
+}
+
+/// Executes the reconciled plan's copies, updates, and deletes against the
+/// destination. Structural-conflict state (which delete a copy is waiting
+/// on) is local to this lifecycle, per ADR-0003's reviewed-set-never-broadens
+/// rule and ADR-0001's archive-before-publish ordering.
+fn dispatch(
+    pair: &crate::config::Pair,
+    plan: &plan::Plan,
+    permanent_delete: bool,
+    full_verify: bool,
+    journal: &mut Journal,
+    reporter: &RunReporter,
+    stats: &mut RunStats,
+) -> Result<(), AppError> {
     let mut completed_structural_deletes = std::collections::BTreeSet::new();
     let mut started_structural_deletes = std::collections::BTreeSet::new();
     for (operation, action) in plan
@@ -623,11 +718,9 @@ fn execute_reviewed_plan(
                 reporter.action_failed(journal.run_id(), operation, action, &failure)?;
                 if failure.kind() != io::ErrorKind::InvalidData {
                     if let Some(deletion) = structural_delete {
-                        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
+                        fail_structural_delete(deletion, journal, reporter, stats)?;
                     }
-                    journal.summary(&stats).map_err(journal_runtime_error)?;
-                    reporter.summary(journal.run_id(), &stats)?;
-                    return Ok(1);
+                    return Ok(());
                 }
             }
         }
@@ -636,7 +729,7 @@ fn execute_reviewed_plan(
         started_structural_deletes.contains(&deletion.rel_path)
             && !completed_structural_deletes.contains(&deletion.rel_path)
     }) {
-        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
+        fail_structural_delete(deletion, journal, reporter, stats)?;
     }
     for action in plan
         .deletes
@@ -645,24 +738,18 @@ fn execute_reviewed_plan(
     {
         crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         execute_delete_action(
-            &pair,
+            pair,
             action,
-            &mut journal,
+            journal,
             permanent_delete,
             plan.directory_deletes.contains(&action.rel_path),
-            &reporter,
-            &mut stats,
+            reporter,
+            stats,
         )?;
     }
 
     crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
-    journal.summary(&stats).map_err(journal_runtime_error)?;
-    reporter.summary(journal.run_id(), &stats)?;
-    if stats.counts.failed == 0 {
-        Ok(EXIT_OK)
-    } else {
-        Ok(1)
-    }
+    Ok(())
 }
 
 /// Whether the run may proceed to reconciliation after cleanup, or must
@@ -2163,6 +2250,57 @@ mod tests {
 
             assert_eq!(plan.copies, initial_plan.copies);
             assert_eq!(stats.discovered_after_review, 1);
+        });
+    }
+
+    #[test]
+    fn dispatch_copies_planned_action_and_updates_stats() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        fs::write(source_dir.path().join("a.txt"), "hello").unwrap();
+        crate::pair::add(
+            &config_path,
+            "dispatch-pair",
+            source_dir.path(),
+            destination_dir.path(),
+            crate::config::Mode::Mirror,
+            false,
+        )
+        .unwrap();
+        let (pair, plan) = plan::build(&config_path, "dispatch-pair", &[]).unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        with_isolated_home_env(home.path(), || {
+            let mut journal = Journal::create("dispatch-pair", destination_dir.path()).unwrap();
+            let reporter = RunReporter::new(false);
+            let mut stats = RunStats {
+                counts: Counts {
+                    planned: plan.copies.len(),
+                    ..Counts::default()
+                },
+                ..RunStats::default()
+            };
+
+            dispatch(
+                &pair,
+                &plan,
+                false,
+                false,
+                &mut journal,
+                &reporter,
+                &mut stats,
+            )
+            .unwrap();
+
+            assert_eq!(
+                fs::read_to_string(destination_dir.path().join("a.txt")).unwrap(),
+                "hello"
+            );
+            assert_eq!(stats.counts.done, 1);
+            assert_eq!(stats.counts.copied, 1);
+            assert_eq!(stats.counts.failed, 0);
         });
     }
 }
