@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK, EXIT_PRECONDITION};
+use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
 use crate::event::{MetadataWarning, VerificationTier};
 use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
@@ -33,18 +33,6 @@ pub(crate) enum RunOutcome {
     PairChangedDuringReview,
     /// Any other error; callers should surface or propagate it.
     Failed(AppError),
-}
-
-impl RunOutcome {
-    /// Widens to an `i32` process exit code, preserving ADR-0004's taxonomy.
-    pub(crate) fn into_exit_code(self) -> Result<i32, AppError> {
-        match self {
-            RunOutcome::Completed(code) => Ok(code),
-            RunOutcome::LockContention => Ok(EXIT_PRECONDITION),
-            RunOutcome::PairChangedDuringReview => Ok(EXIT_PRECONDITION),
-            RunOutcome::Failed(err) => Err(err),
-        }
-    }
 }
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 18) | (1 << 19);
@@ -595,7 +583,7 @@ fn dispatch(
         crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
-        let structural_delete = conflicts.find_structural_delete_for(&plan, &action.rel_path);
+        let structural_delete = conflicts.find_structural_delete_for(plan, &action.rel_path);
         let temp_target = structural_delete
             .filter(|_| !destination.parent().is_some_and(Path::is_dir))
             .map(|deletion| pair.destination.join(&deletion.rel_path));
@@ -738,7 +726,7 @@ fn dispatch(
             }
         }
     }
-    for deletion in conflicts.drain_incomplete(&plan) {
+    for deletion in conflicts.drain_incomplete(plan) {
         fail_structural_delete(deletion, journal, reporter, stats)?;
     }
     for action in plan
