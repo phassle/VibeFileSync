@@ -17,11 +17,16 @@
 //! actually implement it. Existence is mechanical; aptness is a reading. Treat a green run
 //! as "no reference is dangling", never as "the docs are accurate".
 
+use assert_cmd::Command;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-const DOCS: &[&str] = &["AGENTS.md", "docs/architectural_patterns.md"];
+const DOCS: &[&str] = &[
+    "AGENTS.md",
+    "docs/architectural_patterns.md",
+    ".agents/skills/use-vibesync/SKILL.md",
+];
 
 /// The file kinds the docs address. Every check below reads the same list, because
 /// a kind one check knows and another does not is a hole: a `path:line` on it would
@@ -309,5 +314,143 @@ fn every_documented_section_exists() {
         missing.is_empty(),
         "documented sections and keys do not exist:\n  {}",
         missing.iter().cloned().collect::<Vec<_>>().join("\n  ")
+    );
+}
+
+/// The subcommand path and `--flag`s of a documented `vibesync ...` invocation.
+/// Subcommands are the leading run of tokens before the first flag-looking
+/// one; flags are every later token that itself starts with `-`. A bare token
+/// after the first flag (e.g. a placeholder like `<PATH>` documenting a
+/// flag's argument) is neither: skipping it keeps that placeholder from
+/// being checked as if it were a second flag or a subcommand. `None` for a
+/// span that isn't a `vibesync` invocation at all — most backticked spans
+/// are paths or symbols, not commands.
+fn cli_invocation(span: &str) -> Option<(Vec<&str>, Vec<&str>)> {
+    let mut tokens = span.split_whitespace();
+    if tokens.next()? != "vibesync" {
+        return None;
+    }
+    let tokens: Vec<&str> = tokens.collect();
+    let split = tokens
+        .iter()
+        .position(|token| token.starts_with('-'))
+        .unwrap_or(tokens.len());
+    let (subcommands, rest) = tokens.split_at(split);
+    let flags: Vec<&str> = rest
+        .iter()
+        .copied()
+        .filter(|token| token.starts_with('-'))
+        .collect();
+    Some((subcommands.to_vec(), flags))
+}
+
+/// `vibesync <path> --help`'s stdout, run against the real built binary —
+/// never a glob engine or a hand-maintained list of flags.
+fn help_output(path: &[&str]) -> String {
+    let mut cmd = Command::cargo_bin("vibesync").expect("binary builds");
+    cmd.args(path).arg("--help");
+    let output = cmd.output().expect("vibesync --help runs");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Whether `--help`'s `Commands:` block lists `name` as a subcommand.
+fn help_lists_command(help: &str, name: &str) -> bool {
+    let mut in_commands = false;
+    for line in help.lines() {
+        if line.trim_end() == "Commands:" {
+            in_commands = true;
+            continue;
+        }
+        if !in_commands {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        if line.split_whitespace().next() == Some(name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `--help`'s `Options:` block lists `flag` (bare, no `=value`).
+fn help_lists_option(help: &str, flag: &str) -> bool {
+    let mut in_options = false;
+    for line in help.lines() {
+        if line.trim_end() == "Options:" {
+            in_options = true;
+            continue;
+        }
+        if !in_options {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        if line
+            .trim_start()
+            .split(',')
+            .map(str::trim)
+            .any(|part| part == flag || part.starts_with(&format!("{flag} ")))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every fenced `vibesync ...` invocation an agent doc shows must resolve
+/// against the real binary's own `--help`: each subcommand it names must be
+/// listed at that level, and each `--flag` it passes must be listed on that
+/// exact invocation's help. No glob engine, no invented flags, no exit-code
+/// strings the binary doesn't emit — the binary is the only source of truth.
+#[test]
+fn every_documented_cli_invocation_exists() {
+    let mut offenders = BTreeSet::new();
+    for doc in DOCS {
+        for span in backticked(&read(doc)) {
+            let Some((subcommands, flags)) = cli_invocation(&span) else {
+                continue;
+            };
+
+            let mut path: Vec<&str> = Vec::new();
+            let mut chain_broken = false;
+            for subcommand in &subcommands {
+                let help = help_output(&path);
+                if !help_lists_command(&help, subcommand) {
+                    let shown = if path.is_empty() {
+                        "vibesync".to_string()
+                    } else {
+                        format!("vibesync {}", path.join(" "))
+                    };
+                    offenders.insert(format!(
+                        "{doc}: `{span}` — {shown} has no `{subcommand}` subcommand"
+                    ));
+                    chain_broken = true;
+                    break;
+                }
+                path.push(subcommand);
+            }
+            if chain_broken {
+                continue;
+            }
+
+            let help = help_output(&path);
+            for flag in &flags {
+                let bare = flag.split('=').next().unwrap_or(flag);
+                if !help_lists_option(&help, bare) {
+                    offenders.insert(format!(
+                        "{doc}: `{span}` — vibesync {} has no `{bare}` option",
+                        path.join(" ")
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "documented CLI invocations do not match the real binary:\n  {}",
+        offenders.iter().cloned().collect::<Vec<_>>().join("\n  ")
     );
 }
