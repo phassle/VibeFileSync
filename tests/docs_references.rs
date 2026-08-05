@@ -10,6 +10,12 @@
 //! `path:line` reintroduced by hand would rot invisibly again, so this test rejects the
 //! notation outright.
 //!
+//! Which documents are guarded is part of the guarantee, so `docs` discovers them rather
+//! than naming them. An allowlist held the convention only where someone had remembered
+//! to ask: three of this repo's own skills and an ADR carried `path:line` references for
+//! as long as they did because they were never added to it, and their line numbers had
+//! already drifted off the code they named by the time anyone looked.
+//!
 //! What it deliberately cannot check: whether a reference names the *right* symbol. An
 //! anchor pointing at a real function that has nothing to do with the sentence around it
 //! passes every check here — that happened on this very file, where the in-process render
@@ -22,11 +28,115 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-const DOCS: &[&str] = &[
-    "AGENTS.md",
-    "docs/architectural_patterns.md",
-    ".agents/skills/use-vibesync/SKILL.md",
-];
+/// The root guides, addressed by name because they are the only Markdown at the top
+/// level this test governs.
+const ROOT_GUIDES: &[&str] = &["AGENTS.md", "CLAUDE.md", "CONTEXT.md", "README.md"];
+
+/// A repository-owned skill is named for the product it operates: `build-vibesync`,
+/// `test-vibesync`, `release-vibesync`. Everything else under `.agents/skills/` comes
+/// from the upstream engineering bundle (`docs/dynamic-skills/README.md`).
+const OWN_SKILL_SUFFIX: &str = "-vibesync";
+
+/// The documents this repository owns, and which this test therefore governs.
+///
+/// Discovered, not listed. A hand-maintained list is opt-in, and opt-in is the hole:
+/// `build-vibesync` and `test-vibesync` kept `path:line` references for as long as they
+/// did precisely because nobody added them to the list, so the convention held only
+/// where someone had remembered to ask for it. Under discovery a document is governed
+/// from the moment it lands in one of these roots, and a new skill or ADR cannot arrive
+/// unenforced.
+///
+/// The upstream skills are deliberately excluded rather than overlooked. They are
+/// read-only here — replaced wholesale on reinstall — and their backticked spans are
+/// templates addressed at whatever repository installs them (`MISSION.md`,
+/// `0001-slug.md`), so checking them against *this* tree asks the wrong question.
+fn docs() -> Vec<String> {
+    let mut found: Vec<String> = ROOT_GUIDES.iter().map(|doc| doc.to_string()).collect();
+    markdown_under(Path::new("docs"), &mut found);
+    markdown_under(Path::new(".sandcastle"), &mut found);
+    for skill in own_skills() {
+        found.push(skill);
+    }
+    found.sort();
+    found
+}
+
+fn own_skills() -> Vec<String> {
+    let root = Path::new(".agents/skills");
+    let Ok(entries) = fs::read_dir(repo_root().join(root)) else {
+        return Vec::new();
+    };
+    let mut skills = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(OWN_SKILL_SUFFIX) {
+            continue;
+        }
+        markdown_under(&root.join(name), &mut skills);
+    }
+    skills
+}
+
+/// Every Markdown file below `relative`, at any depth.
+fn markdown_under(relative: &Path, into: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(repo_root().join(relative)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let child = relative.join(entry.file_name());
+        if entry.path().is_dir() {
+            markdown_under(&child, into);
+        } else if child.extension().is_some_and(|ext| ext == "md") {
+            into.push(child.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// A span the docs write as a shape rather than as a reference: a placeholder segment
+/// (`runs/<pair-name>/.lock`) or a glob (`tests/captures/*.txt`). Neither names one
+/// file, so neither can be resolved — and a check that tried would only teach authors
+/// to drop the backticks.
+fn is_pattern(span: &str) -> bool {
+    span.contains('<') || span.contains('*')
+}
+
+/// Whether `candidate` names a file in this repository.
+///
+/// A path with a directory in it claims a location, and is held to it. A bare filename
+/// claims only a name — `SKILL.md` and `main.mts` are the kind of file, wherever it
+/// lives — so it resolves against any file so named. That still catches the rot worth
+/// catching: rename `main.mts` or mistype `Cargo.toml` and the reference fails. What it
+/// does not do is demand a repository-root location that the prose never claimed.
+fn resolves(candidate: &str) -> bool {
+    if candidate.contains('/') {
+        return repo_root().join(candidate).exists();
+    }
+    named_anywhere(Path::new("."), candidate)
+}
+
+fn named_anywhere(relative: &Path, name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(repo_root().join(relative)) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        // `target/` is build output and `.git/` is history; neither is documentation's
+        // subject, and both are large enough to be worth not walking.
+        if matches!(
+            file_name.to_string_lossy().as_ref(),
+            "target" | ".git" | "node_modules"
+        ) {
+            continue;
+        }
+        if file_name == name {
+            return true;
+        }
+        if entry.path().is_dir() && named_anywhere(&relative.join(file_name), name) {
+            return true;
+        }
+    }
+    false
+}
 
 /// The file kinds the docs address. Every check below reads the same list, because
 /// a kind one check knows and another does not is a hole: a `path:line` on it would
@@ -83,6 +193,35 @@ fn impl_type(tail: &str) -> Option<String> {
     (!ident.is_empty()).then_some(ident)
 }
 
+/// Strips the modifiers that can stand between the start of a declaration and its
+/// keyword, so `unsafe fn get_vol_attr` is as referenceable as `fn traverse`. Without
+/// this the convention has a hole rather than a gap: the docs cannot name an `unsafe fn`
+/// at all, and the check reports the apt reference as the broken one.
+///
+/// `const` is stripped only ahead of `fn`, because a bare `const NAME` is itself the
+/// declaration.
+fn without_modifiers(line: &str) -> &str {
+    let mut head = line.strip_prefix("pub ").unwrap_or(line);
+    head = head
+        .split_once(") ")
+        .filter(|_| line.starts_with("pub("))
+        .map(|(_, tail)| tail)
+        .unwrap_or(head);
+    loop {
+        let stripped = ["unsafe ", "async ", "extern \"C\" ", "default "]
+            .iter()
+            .find_map(|modifier| head.strip_prefix(modifier))
+            .or_else(|| {
+                head.strip_prefix("const ")
+                    .filter(|tail| tail.starts_with("fn "))
+            });
+        match stripped {
+            Some(tail) => head = tail,
+            None => return head,
+        }
+    }
+}
+
 /// A Rust item declaration for `name`, however it is spelled.
 fn declares(source: &str, name: &str) -> bool {
     source.lines().any(|line| {
@@ -91,12 +230,7 @@ fn declares(source: &str, name: &str) -> bool {
             "fn ", "struct ", "enum ", "const ", "static ", "trait ", "type ", "mod ", "impl ",
             "union ",
         ] {
-            let head = line.strip_prefix("pub ").unwrap_or(line);
-            let head = head
-                .split_once(") ")
-                .filter(|_| line.starts_with("pub("))
-                .map(|(_, tail)| tail)
-                .unwrap_or(head);
+            let head = without_modifiers(line);
             if let Some(tail) = head.strip_prefix(keyword) {
                 if keyword == "impl " {
                     // An impl header declares its type, not the trait it satisfies.
@@ -140,10 +274,32 @@ impl fmt::Display for Mode {}
     assert!(!declares(source, "Review"));
 }
 
+/// A modifier ahead of the keyword must not make an item unnameable — otherwise the
+/// convention quietly excludes exactly the FFI and async seams most worth pointing at,
+/// and the only reference that resolves is a worse one.
+#[test]
+fn declares_sees_through_the_modifiers_ahead_of_a_keyword() {
+    let source = "\
+unsafe fn get_vol_attr<T>() {}
+pub(crate) async fn poll() {}
+const fn width() -> usize { 0 }
+const ATTR_VOL_UUID: u32 = 0;
+    unsafe fn nested_in_an_impl() {}
+";
+    assert!(declares(source, "get_vol_attr"));
+    assert!(declares(source, "poll"));
+    assert!(declares(source, "width"));
+    assert!(declares(source, "nested_in_an_impl"));
+    // A bare `const` still declares its own name, not the keyword after it.
+    assert!(declares(source, "ATTR_VOL_UUID"));
+    assert!(!declares(source, "fn"));
+    assert!(!declares(source, "unsafe"));
+}
+
 #[test]
 fn docs_never_reference_code_by_line_number() {
     let mut offenders = BTreeSet::new();
-    for doc in DOCS {
+    for doc in &docs() {
         for span in backticked(&read(doc)) {
             let Some((path, tail)) = span.rsplit_once(':') else {
                 continue;
@@ -172,7 +328,7 @@ fn docs_never_reference_code_by_line_number() {
 #[test]
 fn every_documented_symbol_exists() {
     let mut missing = BTreeSet::new();
-    for doc in DOCS {
+    for doc in &docs() {
         for span in backticked(&read(doc)) {
             let Some((relative, symbol)) = span.split_once("::") else {
                 continue;
@@ -207,7 +363,7 @@ fn every_documented_symbol_exists() {
 #[test]
 fn every_documented_path_exists() {
     let mut missing = BTreeSet::new();
-    for doc in DOCS {
+    for doc in &docs() {
         for span in backticked(&read(doc)) {
             // `Cargo.toml [dependencies]` and `package.json "devDependencies"`.
             let candidate = span
@@ -224,10 +380,13 @@ fn every_documented_path_exists() {
             if candidate.starts_with('~') || candidate.starts_with('/') {
                 continue;
             }
+            if is_pattern(&span) {
+                continue;
+            }
             if !EXTENSIONS.iter().any(|ext| candidate.ends_with(ext)) {
                 continue;
             }
-            if !repo_root().join(candidate).exists() {
+            if !resolves(candidate) {
                 missing.insert(format!("{doc}: `{span}` — {candidate} does not exist"));
             }
         }
@@ -252,7 +411,7 @@ fn every_documented_path_exists() {
 #[test]
 fn no_reference_list_names_the_same_thing_twice() {
     let mut repeats = BTreeSet::new();
-    for doc in DOCS {
+    for doc in &docs() {
         for (number, line) in read(doc).lines().enumerate() {
             let refs: Vec<String> = backticked(line)
                 .into_iter()
@@ -278,7 +437,7 @@ fn no_reference_list_names_the_same_thing_twice() {
 #[test]
 fn every_documented_section_exists() {
     let mut missing = BTreeSet::new();
-    for doc in DOCS {
+    for doc in &docs() {
         for span in backticked(&read(doc)) {
             let Some((relative, anchor)) = span.split_once(' ') else {
                 continue;
@@ -293,6 +452,12 @@ fn every_documented_section_exists() {
             };
             let found = if anchor.starts_with('[') && anchor.ends_with(']') {
                 // A TOML section header stands alone on its line.
+                source.lines().any(|line| line.trim() == anchor)
+            } else if anchor.starts_with('#') {
+                // A Markdown heading stands alone on its line too, so it resolves by the
+                // same rule. Naming the heading is what lets a reference into a document
+                // be as specific as a line number was without being positional: rename
+                // the heading and this fails by name, move it and the reference follows.
                 source.lines().any(|line| line.trim() == anchor)
             } else if anchor.len() > 1 && anchor.starts_with('"') && anchor.ends_with('"') {
                 // A JSON key is quoted and followed by its colon.
@@ -421,7 +586,7 @@ fn help_lists_option(help: &str, flag: &str) -> bool {
 #[test]
 fn every_documented_cli_invocation_exists() {
     let mut offenders = BTreeSet::new();
-    for doc in DOCS {
+    for doc in &docs() {
         for span in backticked(&read(doc)) {
             let Some((subcommands, flags)) = cli_invocation(&span) else {
                 continue;

@@ -13,15 +13,15 @@ The unique user-chosen identifier of a Folder pair — the handle runs are invok
 _Avoid_: pair id, profile name, job name
 
 **Mirror**:
-The Sync mode that makes the destination an exact copy of the source, including removals — every removal or replacement goes through SafetyNet.
+The Sync mode that makes the destination an exact copy of the source, including removals — the only mode that removes a destination object for being absent from the source. Every removal or replacement goes through SafetyNet unless permanent deletion was explicitly selected for that run.
 _Avoid_: backup mode, clone
 
 **Update**:
-The additive-only Sync mode — new and changed source files are copied; nothing on the destination is ever removed.
+The additive-only Sync mode — new and changed source files are copied; nothing on the destination is removed for being absent from the source. Structural replacements are the exception: a source file replacing a destination directory, or a source directory replacing a destination file, removes what it replaces in Update as much as in Mirror.
 _Avoid_: copy mode, additive sync
 
 **SafetyNet**:
-The retention guarantee that the previous destination version is durably kept — by renaming it into the destination's `_SafetyNet/` tree — before any operation in any Sync mode removes or replaces an existing destination object, unless permanent deletion was explicitly selected for that run.
+The retention guarantee that the previous destination version is durably kept — by renaming it into the destination's `_SafetyNet/` tree — before any operation in any Sync mode removes or replaces an existing destination object, unless permanent deletion was explicitly selected for that run (`--permanent-delete`).
 _Avoid_: trash, recycle bin, versioning (as a synonym — versioning is one mechanism SafetyNet may use)
 
 **Run folder**:
@@ -53,7 +53,7 @@ The atomic step that makes a verified temp file appear under its final destinati
 _Avoid_: commit (reserved for the Journal state), finalize
 
 **Convergence**:
-The guarantee that the next run after any interruption or fault reaches the correct destination state through its own fresh scan — one rerun, no manual repair, nothing replayed.
+The guarantee that the next run after any interruption or fault reaches the correct destination state through its own fresh scan — one rerun, no manual repair, nothing replayed. The rerun is an ordinary run: it must still pass Run preconditions, and a file that fails Verification waits for a later one.
 _Avoid_: recovery, self-healing, resume (reserved for the rejected mid-file sense)
 
 **Verification**:
