@@ -26,7 +26,7 @@ Module map:
 - `src/volume.rs::volume_uuid` — volume UUID is the sole identity; `src/volume.rs::filesystem_type`, `src/volume.rs::expected_degradations`.
 - `src/preconditions.rs::resolve_pair` — mount relocation and abort-before-mutation guards; six-state classifier `src/preconditions.rs::classify_pair`; run-only gates `src/preconditions.rs::check_run`.
 - `src/plan.rs::traverse` — single tree walk; per-entry diff `src/plan.rs::classify_source_entry`; human rendering `src/plan.rs::render`; NDJSON stream `src/plan.rs::run_json`.
-- `src/run.rs::run` — human/JSON Run; review/reconcile/execute `src/run.rs::execute_reviewed_plan`; verification gate `src/run.rs::verify_temp`; SafetyNet rename `src/run.rs::archive_by_rename`.
+- `src/run.rs::run` — human/JSON Run; lifecycle orchestrator `src/run.rs::execute_reviewed_plan`; Review `src/run.rs::review_plan`; cleanup `src/run.rs::cleanup_stray_temps`; reconcile `src/run.rs::reconcile_plan`; execute `src/run.rs::dispatch`; summary/exit `src/run.rs::finalize`; verification gate `src/run.rs::verify_temp`; SafetyNet rename `src/run.rs::archive_by_rename`.
 - `src/tui.rs::run` — TUI entry; staged lifecycle `src/tui.rs::run_pair_flow`; pair selector `src/tui.rs::select_pair`. Largest module: read the stage you are changing, not the file.
 - `src/event.rs::run_start` — NDJSON event constructors; the schema agents parse. Additive changes only.
 - `src/journal.rs::Journal` — retained run record, pair lock, Status/History.
