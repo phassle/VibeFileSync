@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
+use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK, EXIT_PRECONDITION};
 use crate::event::{MetadataWarning, VerificationTier};
 use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
@@ -35,6 +35,26 @@ pub(crate) enum RunOutcome {
     Failed(AppError),
 }
 
+impl RunOutcome {
+    /// Widens to an `i32` process exit code, preserving ADR-0004's taxonomy.
+    ///
+    /// Not called yet. #105 specifies that the CLI's `src/run.rs::run` widens
+    /// the variant back to the integer at the process boundary, but `run` still
+    /// calls `src/run.rs::execute_reviewed_plan` directly, so `RunOutcome` has
+    /// only one consumer — the TUI — and it matches every variant itself.
+    /// `expect` rather than `allow` is deliberate: when #105 wires the CLI
+    /// through here, the attribute becomes an unfulfilled expectation and the
+    /// compiler asks for its removal, instead of quietly outliving its reason.
+    #[expect(dead_code)]
+    pub(crate) fn into_exit_code(self) -> Result<i32, AppError> {
+        match self {
+            RunOutcome::Completed(code) => Ok(code),
+            RunOutcome::LockContention => Ok(EXIT_PRECONDITION),
+            RunOutcome::PairChangedDuringReview => Ok(EXIT_PRECONDITION),
+            RunOutcome::Failed(err) => Err(err),
+        }
+    }
+}
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 18) | (1 << 19);
 const F_FULLFSYNC: libc::c_int = 51;
 const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
@@ -1972,7 +1992,9 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         let mut config = crate::config::Config::default();
-        config.pairs.insert("pair-changed-test".to_string(), current_pair);
+        config
+            .pairs
+            .insert("pair-changed-test".to_string(), current_pair);
         crate::config::save(&config_path, &config).unwrap();
 
         let outcome = run_reviewed(

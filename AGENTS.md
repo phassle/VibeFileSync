@@ -7,7 +7,7 @@ At the end of each plan, list unresolved questions.
 
 - Read only relevant linked docs; preserve `CONTEXT.md` terminology.
 - Surface conflicts with an ADR. Never silently override a decision.
-- Reference code by **symbol**, never by line number: `` `src/run.rs::execute_reviewed_plan` ``, not `src/run.rs:‹line›`. A line number is a position, so every insertion above it silently retargets the reference — path and line both still exist, and nothing catches it. A symbol survives edits above it, and breaks loudly when it stops existing. Sections likewise: `` `Cargo.toml [dependencies]` ``. Enforced by `tests/docs_references.rs`. Never paste source into docs.
+- Reference code by **symbol**, never by line number: `` `src/run.rs::execute_reviewed_plan` ``, not `src/run.rs:‹line›`. A line number is a position, so every insertion above it silently retargets the reference — path and line both still exist, and nothing catches it. A symbol survives edits above it, and breaks loudly when it stops existing. Sections likewise: `` `Cargo.toml [dependencies]` ``, and a Markdown heading spelled as it stands: `` `docs/agents/git-workflow.md ## Branches` ``. Enforced by `tests/docs_references.rs`, which discovers what it governs — the root guides, everything under `docs/` and `.sandcastle/`, and this repo's own `*-vibesync` skills — so a new doc under those roots is enforced on arrival rather than when someone remembers to enrol it. The upstream skills under `.agents/skills/` are out of scope: they are replaced wholesale on reinstall, and their spans are templates for the installing repo. Never paste source into docs.
 - Treat safety invariants, exit codes, and versioned schemas as public contracts.
 
 ## WHAT: stack and layout
