@@ -209,21 +209,23 @@ above for that refusal; this section only adds what exit 1 and exit 4 themselves
 ### Exit 1 — partial (one or more actions failed)
 
 A Run that finishes but leaves one or more actions failed exits with status 1. There is no named constant
-for this exit code — `src/error.rs` defines `EXIT_OK`, `EXIT_PRECONDITION`, `EXIT_BLOCKED_PLAN`,
-`src/error.rs::EXIT_INTERRUPTED`, and `EXIT_USAGE`, and none of them is exit 1 — but the exit code is
-real behaviour: ADR-0004 §6 documents "1 partial (run finished, ≥1 action failed)" in its taxonomy, and
-`src/run.rs`'s `finalize` function returns it literally whenever the run's failed-action count is non-zero.
+for this exit code — `src/error.rs::EXIT_OK`, `src/error.rs::EXIT_PRECONDITION`,
+`src/error.rs::EXIT_BLOCKED_PLAN`, `src/error.rs::EXIT_INTERRUPTED`, and `src/error.rs::EXIT_USAGE`, and
+none of them is exit 1 — but the exit code is real behaviour: ADR-0004 §6 documents "1 partial (run
+finished, ≥1 action failed)" in its taxonomy, and `src/run.rs::finalize` returns it literally whenever the
+run's failed-action count is non-zero.
 
 Identify which actions failed by reading `src/event.rs::action_failed` rows already surfaced on the run
-stream as they arrived — do not re-scan the destination to discover them. `src/event.rs` defines two
-separate constructors for a finished action, and only one of the two ever carries a failure: see the
-discrepancy note below for why `action_done` is not that source. An `action_failed` row's `reason` field is
-drawn from the closed `FailureReason` vocabulary (`src/failure.rs`: `verify_mismatch`, `source_changed`,
-`destination_full`, `reconciliation_changed`, `dependency_failed`, `filesystem_error`). Report back each
-failed action's path and reason from the `action_failed` rows already seen, then offer the human a rerun —
-the same `vibesync run` invocation shown above, with the same `--yes --json` gate and confirmation this
-section does not repeat; a rerun is just another Run of the same Folder pair, and its own fresh scan is
-what converges on the correct destination state, not anything read back out of the Journal.
+stream as they arrived — do not re-scan the destination to discover them. `src/event.rs::action_done` and
+`src/event.rs::action_failed` are the two separate constructors for a finished action, and only one of the
+two ever carries a failure: see the discrepancy note below for why `action_done` is not that source. An
+`action_failed` row's `reason` field is drawn from the closed `src/failure.rs::FailureReason` vocabulary
+(`verify_mismatch`, `source_changed`, `destination_full`, `reconciliation_changed`, `dependency_failed`,
+`filesystem_error`). Report back each failed action's path and reason from the `action_failed` rows already
+seen, then offer the human a rerun — the same `vibesync run` invocation shown above, with the same
+`--yes --json` gate and confirmation this section does not repeat; a rerun is just another Run of the same
+Folder pair, and its own fresh scan is what converges on the correct destination state, not anything read
+back out of the Journal.
 
 ### Exit 4 — interrupted (signal or crash)
 
