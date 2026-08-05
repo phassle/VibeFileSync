@@ -5380,15 +5380,24 @@ mod tests {
         assert!(matches!(outcome, PostPaneOutcome::Finished(0)));
         assert_eq!(runner.calls(), 2, "both Run attempts must have executed");
 
-        let rendered = frames.borrow().join("\n----\n");
+        let frame_texts = frames.borrow();
+        let message_idx = frame_texts
+            .iter()
+            .position(|frame| frame.contains("Another run is already in progress for this pair"))
+            .expect("the contention message must render once Review is reached again");
+        // draw_actions (not draw_confirmation) is what carries the
+        // per-row checkbox, so the redraw immediately before the message's
+        // Confirm frame is where "prior exclusions ... intact" is checkable:
+        // the row must still show "[ ]", not have silently reverted to
+        // included, after bouncing back from LockContention.
+        let post_bounce_actions = &frame_texts[message_idx - 1];
         assert!(
-            rendered.contains("Another run is already in progress for this pair"),
-            "the contention message must render once Review is reached again: {rendered}"
+            post_bounce_actions
+                .lines()
+                .any(|line| line.contains("a.txt") && line.contains("[ ]")),
+            "the excluded row must still be unchecked right after the lock-contention bounce-back: {post_bounce_actions}"
         );
-        assert!(
-            rendered.matches("a.txt").count() >= 2,
-            "the excluded row must still be visible after bouncing back to Review: {rendered}"
-        );
+        drop(frame_texts);
         let last_frame = frames.borrow().last().cloned().unwrap_or_default();
         assert!(
             last_frame.contains("Result"),
