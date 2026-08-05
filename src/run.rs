@@ -20,7 +20,7 @@ use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
 use crate::structural_conflict::{self, ConflictSet};
 
-/// The human-facing line for pair-lock contention (ADR-0010's fail-fast
+/// The human-facing line for pair-lock contention (ADR-0007 §8's fail-fast
 /// precondition abort). Shared by `lock_error` (the `prune` path, which never
 /// goes through `RunOutcome`) and `RunOutcome::into_exit_code` (the `run`
 /// path), so the prose lives in exactly one place even though two callers
