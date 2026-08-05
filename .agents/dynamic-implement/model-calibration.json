@@ -1,21 +1,28 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-05T12:46:39Z",
+  "updatedAt": "2026-08-05T12:57:25Z",
   "source": "GitHub issue model-telemetry:v1 sections",
   "externalReview": {
-    "lastCheckedAt": "2026-08-05T12:46:39Z",
+    "lastCheckedAt": "2026-08-05T12:57:25Z",
     "outcome": "unchanged",
     "isFirstCheck": false,
     "examined": [
-      "claude:claude-sonnet-5 route, availability, and pricing delta against the tracked 2026-08-05 snapshot (Anthropic Claude Platform pricing and Sonnet 5 documentation)",
-      "claude:claude-opus-5 route, availability, and pricing delta against the tracked 2026-08-05 snapshot (Anthropic Claude Platform pricing and Opus 5 documentation)",
-      "new cost-per-completed-task benchmark rounds since the tracked snapshot (Anthropic Sonnet 5 system card and official model documentation)"
+      "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta against the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+      "claude:claude-opus-5 route, availability, active status, and pricing delta against the tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+      "new official cost-per-completed-task benchmark rounds since the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+      "known advertised claude:claude-fable-5 candidate status; still excluded from the verified code ladder by the existing user decision"
     ],
     "findings": [
       {
         "kind": "dated-price-change",
         "route": "claude:claude-sonnet-5",
-        "ladderIndices": [0, 1, 2, 3, 4],
+        "ladderIndices": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
         "effectiveAt": "2026-09-01",
         "from": {
           "inPerMToken": 2.0,
@@ -36,7 +43,13 @@
       {
         "kind": "untested-route",
         "route": "claude:claude-opus-5",
-        "ladderIndices": [5, 6, 7, 8, 9],
+        "ladderIndices": [
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
         "localTelemetry": "none",
         "detail": "Known and unchanged: $5/MTok input and $25/MTok output; still no eligible local implementer observation starting on this route. #111 started and finished on Sonnet 5/low; #113 started on Sonnet 5/low and finished a review-driven correction on Sonnet 5/medium.",
         "source": "Anthropic, Claude Opus 5 documentation, https://platform.claude.com/docs/en/about-claude/models/whats-new-opus-5",
@@ -44,7 +57,8 @@
       }
     ],
     "implications": [
-      "No external delta: Sonnet 5 introductory pricing remains $2/$10 through 2026-08-31 with $3/$15 scheduled for 2026-09-01; Opus 5 remains $5/$25; no new or retired ladder route and no newer official cost-per-completed-task benchmark round was found."
+      "No external delta: Sonnet 5 remains active with introductory pricing of $2/$10 through 2026-08-31 and $3/$15 scheduled for 2026-09-01; Opus 5 remains active at $5/$25; no new or retired verified ladder route and no newer official cost-per-completed-task benchmark round was found.",
+      "Claude Fable 5 remains an already-known advertised candidate outside the verified code ladder; schema normalization does not change its status or count as capability evidence."
     ]
   },
   "groups": [
@@ -54,7 +68,10 @@
         "harness": "claude",
         "plannerSize": "small",
         "languageOrChangeKind": "rust-cli-tui",
-        "calibrationKeys": ["rust", "docs"]
+        "calibrationKeys": [
+          "rust",
+          "docs"
+        ]
       },
       "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
       "recommendedStart": {
@@ -86,9 +103,15 @@
         "inputTokensRange": null,
         "outputTokensRange": null,
         "creditsRange": null,
-        "costRange": [3.51, 3.51],
+        "costRange": [
+          3.51,
+          3.51
+        ],
         "currency": "USD",
-        "durationMsRange": [360000, 360000]
+        "durationMsRange": [
+          360000,
+          360000
+        ]
       },
       "costToAcceptance": {
         "basis": "measured",
@@ -109,11 +132,12 @@
         "confidence": "low"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-05T12:46:39Z",
+        "lastCheckedAt": "2026-08-05T12:57:25Z",
         "examined": [
-          "claude:claude-sonnet-5 route, availability, and pricing delta vs 2026-08-05 snapshot (Anthropic Claude Platform pricing and Sonnet 5 model documentation)",
-          "claude:claude-opus-5 route, availability, and pricing delta vs 2026-08-05 snapshot (Anthropic Claude Platform pricing and Opus 5 model documentation)",
-          "new cost-per-completed-task benchmark rounds since 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)"
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
         ],
         "changesFound": [],
         "outcome": "unchanged",
@@ -144,8 +168,10 @@
       },
       "costBasis": "measured",
       "confidence": "low",
-      "evidenceIssues": [60],
-      "calibratedAt": "2026-08-05T12:46:39Z",
+      "evidenceIssues": [
+        60
+      ],
+      "calibratedAt": "2026-08-05T12:57:25Z",
       "sourceCursor": "2026-08-02T21:45:45Z",
       "notes": "One eligible unit (#60, rust docs). Recommendation retained unchanged at the ladder floor: a single observation cannot support any threshold in the rubric, and index 0 is already the lowest verified step so no floor lowering and no boundary probe below it are possible. The unit needed one fix pass, which is weak evidence toward a stronger start, but the rubric's floor-raise grounds both require at least two comparable units and one of them requires a measured comparison against a stronger step - no stronger step was ever run in this repository, so no raise is permitted. capabilityEscalation is recorded as 0 because the telemetry records no capability failure or route change on any attempt; it is not evidence that escalation was tried and unnecessary."
     },
@@ -156,9 +182,21 @@
         "plannerSize": "medium",
         "languageOrChangeKind": "rust-cli-tui",
         "calibrationKeys": [
-          "rust", "config-schema", "schema-evolution", "journal", "pair-identity",
-          "filesystem", "atomic-save", "validation", "tui", "review-table",
-          "startup", "pty-test-harness", "volume-classification", "keyboard", "responsive"
+          "rust",
+          "config-schema",
+          "schema-evolution",
+          "journal",
+          "pair-identity",
+          "filesystem",
+          "atomic-save",
+          "validation",
+          "tui",
+          "review-table",
+          "startup",
+          "pty-test-harness",
+          "volume-classification",
+          "keyboard",
+          "responsive"
         ]
       },
       "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
@@ -191,9 +229,15 @@
         "inputTokensRange": null,
         "outputTokensRange": null,
         "creditsRange": null,
-        "costRange": [3.12, 24.32],
+        "costRange": [
+          3.12,
+          24.32
+        ],
         "currency": "USD",
-        "durationMsRange": [96000, 5130000]
+        "durationMsRange": [
+          96000,
+          5130000
+        ]
       },
       "costToAcceptance": {
         "basis": "measured",
@@ -214,11 +258,12 @@
         "confidence": "medium"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-05T12:46:39Z",
+        "lastCheckedAt": "2026-08-05T12:57:25Z",
         "examined": [
-          "claude:claude-sonnet-5 route, availability, and pricing delta vs 2026-08-05 snapshot (Anthropic Claude Platform pricing and Sonnet 5 model documentation)",
-          "claude:claude-opus-5 route, availability, and pricing delta vs 2026-08-05 snapshot (Anthropic Claude Platform pricing and Opus 5 model documentation)",
-          "new cost-per-completed-task benchmark rounds since 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)"
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
         ],
         "changesFound": [],
         "outcome": "unchanged",
@@ -249,9 +294,20 @@
       },
       "costBasis": "measured",
       "confidence": "low",
-      "evidenceIssues": [48, 49, 51, 52, 53, 54, 55, 56, 59, 111],
-      "calibratedAt": "2026-08-05T12:46:39Z",
-      "sourceCursor": "2026-08-05T12:43:53Z",
+      "evidenceIssues": [
+        48,
+        49,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        59,
+        111
+      ],
+      "calibratedAt": "2026-08-05T12:57:25Z",
+      "sourceCursor": "2026-08-05T12:55:26Z",
       "notes": "Ten eligible units; all started at ladder index 0, the only starting step this repository has measured. Recommendation retained at claude:claude-sonnet-5/low with low confidence because evidence remains single-armed. Three units were accepted without a material fix/re-review; seven required one or more. #111 is correctly counted as material re-review: one Standards finding, one Spec finding, and two fix passes (unit fix plus root test-evidence remediation). Its implementation started and finished at Sonnet 5/low. Two planner API-529 failures, one reviewer sandbox failure, the nested-PTY row, and the root-remediation Codex attempts all carry capabilityFailure:false or are environment/integration evidence, so none support a route floor increase. #111 reports null usage, cost, token, and duration values; it is included in sample counts but excluded from dollar medians, which retain nine cost-reporting units. No capability failure exists and no comparable unit started at a stronger step, so neither the two-unit capability ground nor a 25%-cheaper stronger-step comparison can be established. Index 0 cannot be lowered and no lower boundary probe exists. Cost remains confounded by change/context size and attempt count; do not compare this median across groups without normalization."
     },
     {
@@ -260,7 +316,16 @@
         "harness": "claude",
         "plannerSize": "large",
         "languageOrChangeKind": "rust-cli-tui",
-        "calibrationKeys": ["rust", "tui", "ratatui", "state-machine", "pair-crud", "config-write", "concurrency", "lock-contention"]
+        "calibrationKeys": [
+          "rust",
+          "tui",
+          "ratatui",
+          "state-machine",
+          "pair-crud",
+          "config-write",
+          "concurrency",
+          "lock-contention"
+        ]
       },
       "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
       "recommendedStart": {
@@ -292,9 +357,15 @@
         "inputTokensRange": null,
         "outputTokensRange": null,
         "creditsRange": null,
-        "costRange": [9.28, 17.75],
+        "costRange": [
+          9.28,
+          17.75
+        ],
         "currency": "USD",
-        "durationMsRange": [528000, 1614000]
+        "durationMsRange": [
+          528000,
+          1614000
+        ]
       },
       "costToAcceptance": {
         "basis": "measured",
@@ -315,11 +386,12 @@
         "confidence": "low"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-05T12:46:39Z",
+        "lastCheckedAt": "2026-08-05T12:57:25Z",
         "examined": [
-          "claude:claude-sonnet-5 route, availability, and pricing delta vs 2026-08-05 snapshot (Anthropic Claude Platform pricing and Sonnet 5 model documentation)",
-          "claude:claude-opus-5 route, availability, and pricing delta vs 2026-08-05 snapshot (Anthropic Claude Platform pricing and Opus 5 model documentation)",
-          "new cost-per-completed-task benchmark rounds since 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)"
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
         ],
         "changesFound": [],
         "outcome": "unchanged",
@@ -350,9 +422,14 @@
       },
       "costBasis": "measured",
       "confidence": "low",
-      "evidenceIssues": [50, 57, 58, 113],
-      "calibratedAt": "2026-08-05T12:46:39Z",
-      "sourceCursor": "2026-08-05T12:44:19Z",
+      "evidenceIssues": [
+        50,
+        57,
+        58,
+        113
+      ],
+      "calibratedAt": "2026-08-05T12:57:25Z",
+      "sourceCursor": "2026-08-05T12:55:27Z",
       "notes": "Four eligible units; all started at ladder index 0. Recommendation retained at claude:claude-sonnet-5/low with low confidence because no comparable unit started at a stronger step. Corrected #113 from clean-at-low to material re-review: its final unit route was claude:claude-sonnet-5/medium (ladder index 1), after low-effort work and review-driven correction; root review then added two Spec findings and one aggregated test-only fix pass. Therefore the group has two clean successes and two material re-reviews. #113's first implementer harness failure, planner API-529 failures, nested-PTY evidence, and root-remediation Codex attempts all have capabilityFailure:false or are explicitly non-capability integration evidence; they do not establish a required route escalation. #113 reports null usage, cost, token, and duration values, so it is counted in samples but not in the dollar median, which retains three cost-reporting units. The medium final effort is an observed successful recovery step, not a measured medium starting-step cost, so it is not added as a comparable costToAcceptance arm. No two capability-driven units and no 25%-lower stronger-step median exist; no floor raise is allowed. Index 0 cannot be lowered and no lower boundary probe exists. Cost remains confounded by change/context size."
     }
   ]
