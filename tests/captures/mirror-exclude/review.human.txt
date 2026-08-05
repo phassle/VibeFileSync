@@ -1,0 +1,15 @@
+Dry-run for 'sync' (mirror): 1 copy · 0 update · 0 delete · 0 error
+
+COPY (1)
+  keep.txt        5 B  new
+
+UPDATE (0) → _SafetyNet/<run-id>/
+
+DELETE (0) → _SafetyNet/<run-id>/
+
+ERRORS (0)
+
+Stray temps (0)
+
+Scanned 2 · unchanged 0 · excluded 1
+Proceed with COPY actions? [y/N] Run cancelled; destination unchanged.
