@@ -26,6 +26,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// The root guides, addressed by name because they are the only Markdown at the top
 /// level this test governs.
@@ -36,7 +37,40 @@ const ROOT_GUIDES: &[&str] = &["AGENTS.md", "CLAUDE.md", "CONTEXT.md", "README.m
 /// from the upstream engineering bundle (`docs/dynamic-skills/README.md`).
 const OWN_SKILL_SUFFIX: &str = "-vibesync";
 
-/// The documents this repository owns, and which this test therefore governs.
+/// Build output, history, and installed packages. None is documentation's subject, and
+/// each is large enough that walking it would dominate the cost of this suite.
+const UNWALKED: &[&str] = &["target", ".git", "node_modules"];
+
+/// What one walk of the repository tells this suite: which documents it governs, and
+/// every filename present. Both answers come from the same traversal, taken once —
+/// every check below reads it, and resolving a bare filename asks it a question rather
+/// than re-walking to answer.
+struct Tree {
+    docs: Vec<String>,
+    file_names: BTreeSet<String>,
+}
+
+fn tree() -> &'static Tree {
+    static TREE: OnceLock<Tree> = OnceLock::new();
+    TREE.get_or_init(|| {
+        let mut paths = Vec::new();
+        walk(Path::new(""), &mut paths);
+        let mut docs: Vec<String> = paths
+            .iter()
+            .filter(|path| governed(path))
+            .cloned()
+            .collect();
+        docs.sort();
+        let file_names = paths
+            .iter()
+            .filter_map(|path| path.rsplit('/').next().map(str::to_string))
+            .collect();
+        Tree { docs, file_names }
+    })
+}
+
+/// Whether this repository owns `path` as documentation, and this test therefore
+/// governs it.
 ///
 /// Discovered, not listed. A hand-maintained list is opt-in, and opt-in is the hole:
 /// `build-vibesync` and `test-vibesync` kept `path:line` references for as long as they
@@ -49,46 +83,42 @@ const OWN_SKILL_SUFFIX: &str = "-vibesync";
 /// read-only here — replaced wholesale on reinstall — and their backticked spans are
 /// templates addressed at whatever repository installs them (`MISSION.md`,
 /// `0001-slug.md`), so checking them against *this* tree asks the wrong question.
-fn docs() -> Vec<String> {
-    let mut found: Vec<String> = ROOT_GUIDES.iter().map(|doc| doc.to_string()).collect();
-    markdown_under(Path::new("docs"), &mut found);
-    markdown_under(Path::new(".sandcastle"), &mut found);
-    for skill in own_skills() {
-        found.push(skill);
+fn governed(path: &str) -> bool {
+    if ROOT_GUIDES.contains(&path) {
+        return true;
     }
-    found.sort();
-    found
+    if !path.ends_with(".md") {
+        return false;
+    }
+    if path.starts_with("docs/") || path.starts_with(".sandcastle/") {
+        return true;
+    }
+    path.strip_prefix(".agents/skills/")
+        .and_then(|tail| tail.split_once('/'))
+        .is_some_and(|(skill, _)| skill.ends_with(OWN_SKILL_SUFFIX))
 }
 
-fn own_skills() -> Vec<String> {
-    let root = Path::new(".agents/skills");
-    let Ok(entries) = fs::read_dir(repo_root().join(root)) else {
-        return Vec::new();
-    };
-    let mut skills = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(OWN_SKILL_SUFFIX) {
-            continue;
-        }
-        markdown_under(&root.join(name), &mut skills);
-    }
-    skills
-}
-
-/// Every Markdown file below `relative`, at any depth.
-fn markdown_under(relative: &Path, into: &mut Vec<String>) {
+/// Every file below `relative`, at any depth, as a repository-relative slash path.
+fn walk(relative: &Path, into: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(repo_root().join(relative)) else {
         return;
     };
     for entry in entries.flatten() {
-        let child = relative.join(entry.file_name());
+        let name = entry.file_name();
+        if UNWALKED.contains(&name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let child = relative.join(name);
         if entry.path().is_dir() {
-            markdown_under(&child, into);
-        } else if child.extension().is_some_and(|ext| ext == "md") {
-            into.push(child.to_string_lossy().into_owned());
+            walk(&child, into);
+        } else {
+            into.push(child.to_string_lossy().replace('\\', "/"));
         }
     }
+}
+
+fn docs() -> &'static [String] {
+    &tree().docs
 }
 
 /// A span the docs write as a shape rather than as a reference: a placeholder segment
@@ -110,31 +140,7 @@ fn resolves(candidate: &str) -> bool {
     if candidate.contains('/') {
         return repo_root().join(candidate).exists();
     }
-    named_anywhere(Path::new("."), candidate)
-}
-
-fn named_anywhere(relative: &Path, name: &str) -> bool {
-    let Ok(entries) = fs::read_dir(repo_root().join(relative)) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        // `target/` is build output and `.git/` is history; neither is documentation's
-        // subject, and both are large enough to be worth not walking.
-        if matches!(
-            file_name.to_string_lossy().as_ref(),
-            "target" | ".git" | "node_modules"
-        ) {
-            continue;
-        }
-        if file_name == name {
-            return true;
-        }
-        if entry.path().is_dir() && named_anywhere(&relative.join(file_name), name) {
-            return true;
-        }
-    }
-    false
+    tree().file_names.contains(candidate)
 }
 
 /// The file kinds the docs address. Every check below reads the same list, because
@@ -298,7 +304,7 @@ const ATTR_VOL_UUID: u32 = 0;
 #[test]
 fn docs_never_reference_code_by_line_number() {
     let mut offenders = BTreeSet::new();
-    for doc in &docs() {
+    for doc in docs() {
         for span in backticked(&read(doc)) {
             let Some((path, tail)) = span.rsplit_once(':') else {
                 continue;
@@ -327,7 +333,7 @@ fn docs_never_reference_code_by_line_number() {
 #[test]
 fn every_documented_symbol_exists() {
     let mut missing = BTreeSet::new();
-    for doc in &docs() {
+    for doc in docs() {
         for span in backticked(&read(doc)) {
             let Some((relative, symbol)) = span.split_once("::") else {
                 continue;
@@ -362,7 +368,7 @@ fn every_documented_symbol_exists() {
 #[test]
 fn every_documented_path_exists() {
     let mut missing = BTreeSet::new();
-    for doc in &docs() {
+    for doc in docs() {
         for span in backticked(&read(doc)) {
             // `Cargo.toml [dependencies]` and `package.json "devDependencies"`.
             let candidate = span
@@ -410,7 +416,7 @@ fn every_documented_path_exists() {
 #[test]
 fn no_reference_list_names_the_same_thing_twice() {
     let mut repeats = BTreeSet::new();
-    for doc in &docs() {
+    for doc in docs() {
         for (number, line) in read(doc).lines().enumerate() {
             let refs: Vec<String> = backticked(line)
                 .into_iter()
@@ -436,7 +442,7 @@ fn no_reference_list_names_the_same_thing_twice() {
 #[test]
 fn every_documented_section_exists() {
     let mut missing = BTreeSet::new();
-    for doc in &docs() {
+    for doc in docs() {
         for span in backticked(&read(doc)) {
             let Some((relative, anchor)) = span.split_once(' ') else {
                 continue;
