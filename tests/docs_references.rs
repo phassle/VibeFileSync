@@ -317,14 +317,27 @@ fn every_documented_section_exists() {
     );
 }
 
+/// Whether `token` documents an argument placeholder — `<pair>`, `<PATH>`, or
+/// the bracketed-optional spelling `[<pair>]` — rather than a real subcommand
+/// or flag. A placeholder can appear in its natural position (`status
+/// <pair>`), not only after a flag, so it must be recognised on its own
+/// shape, not merely by where it sits in the token stream.
+fn is_placeholder(token: &str) -> bool {
+    let inner = token
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(token);
+    inner.starts_with('<') && inner.ends_with('>') && inner.len() > 1
+}
+
 /// The subcommand path and `--flag`s of a documented `vibesync ...` invocation.
-/// Subcommands are the leading run of tokens before the first flag-looking
-/// one; flags are every later token that itself starts with `-`. A bare token
-/// after the first flag (e.g. a placeholder like `<PATH>` documenting a
-/// flag's argument) is neither: skipping it keeps that placeholder from
-/// being checked as if it were a second flag or a subcommand. `None` for a
-/// span that isn't a `vibesync` invocation at all — most backticked spans
-/// are paths or symbols, not commands.
+/// Subcommands are the leading run of tokens before the first token that is
+/// either a flag or a placeholder; flags are every later token that itself
+/// starts with `-`. A placeholder is never treated as a subcommand — whether
+/// it sits after a flag (documenting the flag's argument) or in its natural
+/// position (documenting a positional, e.g. `status <pair>`) — and never as a
+/// flag either. `None` for a span that isn't a `vibesync` invocation at all —
+/// most backticked spans are paths or symbols, not commands.
 fn cli_invocation(span: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     let mut tokens = span.split_whitespace();
     if tokens.next()? != "vibesync" {
@@ -333,7 +346,7 @@ fn cli_invocation(span: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     let tokens: Vec<&str> = tokens.collect();
     let split = tokens
         .iter()
-        .position(|token| token.starts_with('-'))
+        .position(|token| token.starts_with('-') || is_placeholder(token))
         .unwrap_or(tokens.len());
     let (subcommands, rest) = tokens.split_at(split);
     let flags: Vec<&str> = rest

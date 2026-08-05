@@ -32,3 +32,46 @@ This skill assumes `CONTEXT.md` and the ADRs below; consult them rather than res
 - Development fallback: `cargo run --locked -- pair list`
 
 Report back the Folder pairs it returns.
+
+## Read-only reporting — status, history, filtered pair list
+
+Like `pair list`, these commands never mutate the destination, so each runs immediately: no review, no
+confirmation gate.
+
+### Status
+
+Reports the last run's outcome for one Folder pair, read from the Journal (ADR-0007) — forensic only, not
+a resume mechanism.
+
+- Real binary: `vibesync status <pair>`
+- Development fallback: `cargo run --locked -- status <pair>`
+
+Give the Pair name as the command's only argument. Report back the Run id, result, action counts, bytes,
+and warning count it prints, along with any stray temp files it lists.
+
+### History
+
+Reports past runs for one Folder pair over time, also read from the Journal (ADR-0007).
+
+- Real binary: `vibesync history <pair>`
+- Development fallback: `cargo run --locked -- history <pair>`
+- JSON form: `vibesync history --json <pair>`
+- JSON development fallback: `cargo run --locked -- history --json <pair>`
+
+Give the Pair name as the command's argument; add `--json` for the machine-readable form. Report back one
+entry per past Run id: its Run id, result, action counts, bytes, and warning count.
+
+### Filtered pair list
+
+`pair list --check` classifies each side of every Folder pair's volume state — advisory only, per the Run
+preconditions ADR-0002 — so a missing drive is visible before a sync is attempted, not after.
+
+- Real binary: `vibesync pair list --check`
+- Development fallback: `cargo run --locked -- pair list --check`
+
+`pair list --source <PATH>` narrows the listing to the Folder pair whose source matches that directory.
+
+- Real binary: `vibesync pair list --source <PATH>`
+- Development fallback: `cargo run --locked -- pair list --source <PATH>`
+
+Report back whichever Folder pairs, and whichever volume-state classification, the command returns.
