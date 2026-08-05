@@ -129,3 +129,49 @@ confirmation gate and event stream are a separate concern this section does not 
 - Development fallback: `cargo run --locked -- run <pair> --exclude <PATH> --exclude <PATH>`
 
 Repeat `--exclude <PATH>` once per chosen path.
+
+## Run — review, confirm, stream
+
+The Compare table above (with whatever `--exclude` flags the human chose) is the review. Only after the
+human replies with an explicit "yes" in chat does the agent invoke the Run itself — never on an unconfirmed
+Compare, and never because a plan merely rendered cleanly. The order is fixed: review first, then the
+human's explicit chat "yes", and only then does the agent pass `--yes` to the binary.
+
+`--yes` suppresses the binary's own interactive confirmation prompt (the CLI otherwise "prints the plan and
+asks y/N", ADR-0003 §4). That is legitimate only because the review and the human's "yes" already happened
+in chat before the agent ran anything — the confirmation moved, it was not removed. An agent has no TTY to
+answer the binary's own prompt with, so `--yes` is how that same review-first requirement is honoured in a
+TTY-less context, not a way to bypass it.
+
+- Real binary: `vibesync run <pair> --yes --json --exclude <PATH> --exclude <PATH>`
+- Development fallback: `cargo run --locked -- run <pair> --yes --json --exclude <PATH> --exclude <PATH>`
+
+Carry forward whichever `--exclude <PATH>` flags the previous section assembled; omit them entirely when
+the human excluded nothing.
+
+`--json` streams the Run as NDJSON, schema `vibefilesync.run/v1` — a different schema from Compare's
+`vibefilesync.plan/v1`, with its own event types. Surface these live as they arrive, not as a wall of JSON
+at the end:
+
+- `action_done` rows, one per finished action, each as it arrives. `result` is this action's outcome
+  ("done" for a successful action on this stream). `verified` names the Verification tier that action
+  passed — "standard" or "full" under `--verify` — and is the agent's **only** source of truth for
+  Verification; report what it says and do not re-hash, re-stat, or otherwise re-check the file yourself,
+  since Verification is the binary's own per-file gate strictly before Publish (ADR-0008), not something
+  the agent repeats. `safety_net` is the path the previous destination object was archived to by rename,
+  or `null` when nothing was archived for that action. That archiving is the run's default, not a
+  standing guarantee (ADR-0001): a run started with `--permanent-delete` removes the replaced or removed
+  object directly instead, so a `null` on such a run reflects that the run itself opted out, not that
+  nothing needed archiving. `--permanent-delete` is named here only to explain why `safety_net` can
+  legitimately be `null`; deciding whether to offer it for a given run is a separate concern this section
+  does not cover.
+- `progress` rows for large files in flight. The binary throttles these itself — only for Copy and Update
+  actions at or above its own size threshold, and at its own fixed time interval thereafter — so surface
+  each one as it arrives rather than batching or re-throttling them further.
+- a trailing `summary` event once the Run finishes: action and byte counts, a warning count, and how many
+  actions the fresh scan discovered after the reviewed plan was fixed. Read it, but do not print it verbatim.
+
+On exit 0, report "done" and stop. Do not dump the `summary` event's JSON to the human — they already saw
+the reviewed plan in the Compare table; the live `action_done` rows and the final "done" are enough.
+
+Fault exits are a separate concern this section does not cover.
