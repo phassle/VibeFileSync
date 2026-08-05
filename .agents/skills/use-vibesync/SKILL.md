@@ -24,6 +24,30 @@ This skill assumes `CONTEXT.md` and the ADRs below; consult them rather than res
 - `docs/adr/0010-commander-two-sided-review.md` — the TUI's two-sided action table.
 - `docs/adr/0011-scripted-tui-input-synchronisation.md` — scripted TUI input rendezvous.
 
+## Add a Folder pair
+
+Adding a **new** Folder pair does not mutate the destination, so it runs immediately: no review, no
+confirmation gate. (Redefining an *existing* pair, with `--replace`, is a different operation and out of
+scope here.)
+
+Before saving, tell the human which Sync mode they picked, in plain language:
+
+- **Mirror** — the destination becomes an exact copy of the source; this includes removing destination
+  files and folders that no longer exist on the source.
+- **Update** — new and changed source files are copied to the destination; the mode does not remove a
+  destination object merely because it is missing from the source.
+
+Lead with the Mirror warning — that is the mode where the human is most likely to be surprised by the
+next Run.
+
+The human supplies the Pair name, the source, the destination, and the Sync mode; the binary pins both
+volume UUIDs when it saves the pair.
+
+- Real binary: `vibesync pair add <pair> --source <PATH> --destination <PATH> --mode <mirror|update>`
+- Development fallback: `cargo run --locked -- pair add <pair> --source <PATH> --destination <PATH> --mode <mirror|update>`
+
+Give the Pair name as the command's only positional argument. Confirm back that the pair was saved.
+
 ## Pair list — direct, ungated, read-only
 
 `pair list` never mutates the destination, so it runs immediately: no review, no confirmation gate.
