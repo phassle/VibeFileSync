@@ -198,3 +198,57 @@ The skill does not fabricate a `restore` command; never invent this invocation.
 ### Resume request ("pick up where it left off" after an interruption)
 
 Refuse the request as asked — there is no mid-file resume in this product, the sense `CONTEXT.md`'s Convergence entry names only to reject. The Journal (ADR-0007) is a forensic, historical record of what happened on past runs; it is never copy authority and never decides what the next run copies. Tell the human the correct next step is to rerun the Folder pair: its own fresh scan converges on the correct destination state — one rerun, nothing replayed from the Journal, no manual repair.
+
+## When a Run does not finish cleanly — exit 1 and exit 4
+
+The Run section above covers exit 0. Two fault exits need their own handling, both resolved by Convergence
+(ADR-0007) rather than by the Journal: a rerun always proceeds from that rerun's own fresh scan, never from
+a replay of Journal state, and the agent never attempts a mid-file resume — see Steering's Resume request
+above for that refusal; this section only adds what exit 1 and exit 4 themselves require.
+
+### Exit 1 — partial (one or more actions failed)
+
+A Run that finishes but leaves one or more actions failed exits with status 1. There is no named constant
+for this exit code — `src/error.rs` defines `EXIT_OK`, `EXIT_PRECONDITION`, `EXIT_BLOCKED_PLAN`,
+`src/error.rs::EXIT_INTERRUPTED`, and `EXIT_USAGE`, and none of them is exit 1 — but the exit code is
+real behaviour: ADR-0004 §6 documents "1 partial (run finished, ≥1 action failed)" in its taxonomy, and
+`src/run.rs`'s `finalize` function returns it literally whenever the run's failed-action count is non-zero.
+
+Identify which actions failed by reading `src/event.rs::action_failed` rows already surfaced on the run
+stream as they arrived — do not re-scan the destination to discover them. `src/event.rs` defines two
+separate constructors for a finished action, and only one of the two ever carries a failure: see the
+discrepancy note below for why `action_done` is not that source. An `action_failed` row's `reason` field is
+drawn from the closed `FailureReason` vocabulary (`src/failure.rs`: `verify_mismatch`, `source_changed`,
+`destination_full`, `reconciliation_changed`, `dependency_failed`, `filesystem_error`). Report back each
+failed action's path and reason from the `action_failed` rows already seen, then offer the human a rerun —
+the same `vibesync run` invocation shown above, with the same `--yes --json` gate and confirmation this
+section does not repeat; a rerun is just another Run of the same Folder pair, and its own fresh scan is
+what converges on the correct destination state, not anything read back out of the Journal.
+
+### Exit 4 — interrupted (signal or crash)
+
+Exit 4, `src/error.rs::EXIT_INTERRUPTED`, is a Run that started, began mutating the destination, and did not
+reach its final `summary`. On this exit, rerun the same Folder pair once, automatically — the same
+`vibesync run` invocation as above, re-issued without waiting for a fresh human "yes", since a rerun's own
+fresh scan is what Convergence (ADR-0007) relies on to make that one automatic retry safe. ADR-0004 §6
+glosses this exit as "Journal holds state, rerun resumes"; read that gloss alongside ADR-0007's own
+consequences, which state the same "rerun resumes" more precisely: the rerun re-scans and converges, and
+never replays the Journal. This section follows ADR-0007's more precise wording rather than reproducing
+ADR-0004 §6's looser gloss.
+
+Bound the retry: exactly one automatic rerun. If that rerun also exits 4, stop — do not rerun a second
+time automatically, and do not loop. Surface the second failure to the human instead and let them decide
+the next step.
+
+### A discrepancy this section does not silently resolve
+
+Issue #90's own acceptance criterion 4 says failed actions are read from `action_done` stream events. That
+is not what the source does: `action_done`'s `result` field is hardcoded to the literal string `"done"` and
+never carries a failure value, so a failed action can never appear as an `action_done` row — it always
+arrives as the separate `action_failed` row this section documents above (`src/event.rs`, both
+constructors; `src/run.rs` chooses between them per action). ADR-0004 §4's run-stream event list
+(`run_start`, `action_start`, `progress`, `action_done`, `summary`) is also incomplete for the same reason:
+it omits `action_failed` entirely. Issue #90's text and ADR-0004 §4 agree with each other and both disagree
+with the implementation; this section documents what the source actually emits rather than the issue's
+wording, and the discrepancy against both issue #90 criterion 4 and ADR-0004 §4 is reported in this unit's
+handoff rather than corrected here.
