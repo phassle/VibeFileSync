@@ -43,8 +43,8 @@ confirmation gate.
 Reports the last run's outcome for one Folder pair, read from the Journal (ADR-0007) — forensic only, not
 a resume mechanism.
 
-- Real binary: `vibesync status`
-- Development fallback: `cargo run --locked -- status`
+- Real binary: `vibesync status <pair>`
+- Development fallback: `cargo run --locked -- status <pair>`
 
 Give the Pair name as the command's only argument. Report back the Run id, result, action counts, bytes,
 and warning count it prints, along with any stray temp files it lists.
@@ -53,10 +53,10 @@ and warning count it prints, along with any stray temp files it lists.
 
 Reports past runs for one Folder pair over time, also read from the Journal (ADR-0007).
 
-- Real binary: `vibesync history`
-- Development fallback: `cargo run --locked -- history`
-- JSON form: `vibesync history --json`
-- JSON development fallback: `cargo run --locked -- history --json`
+- Real binary: `vibesync history <pair>`
+- Development fallback: `cargo run --locked -- history <pair>`
+- JSON form: `vibesync history --json <pair>`
+- JSON development fallback: `cargo run --locked -- history --json <pair>`
 
 Give the Pair name as the command's argument; add `--json` for the machine-readable form. Report back one
 entry per past Run id: its Run id, result, action counts, bytes, and warning count.
