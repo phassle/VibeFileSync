@@ -2671,9 +2671,9 @@ fn json_exit_codes_distinguish_partial_precondition_blocked_and_usage() {
 
 /// Lock contention at execute must still exit 2, per ADR-0010's lifecycle:
 /// the TUI now returns to Review instead of tearing down the session on
-/// contention (see `tui::is_lock_contention`), so the CLI's own exit code on
-/// the same contention is a regression guard the TUI change could otherwise
-/// silently break. Contention is made genuine by holding the pair's `.lock`
+/// contention (see `run::RunOutcome::LockContention`), so the CLI's own exit
+/// code on the same contention is a regression guard the TUI change could
+/// otherwise silently break. Contention is made genuine by holding the pair's `.lock`
 /// file's flock from this test process before invoking the binary, exactly
 /// as `journal::PairLock::acquire` would from a concurrent run.
 #[test]
