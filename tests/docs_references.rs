@@ -721,12 +721,9 @@ impl HelpCache {
         Self::default()
     }
 
-    fn get(&mut self, path: &[&str]) -> String {
+    fn get(&mut self, path: &[&str]) -> &str {
         let key: Vec<String> = path.iter().map(|part| part.to_string()).collect();
-        self.0
-            .entry(key)
-            .or_insert_with(|| help_output(path))
-            .clone()
+        self.0.entry(key).or_insert_with(|| help_output(path))
     }
 }
 
@@ -797,7 +794,7 @@ fn every_documented_cli_invocation_exists() {
             let mut chain_broken = false;
             for subcommand in &subcommands {
                 let help = helps.get(&path);
-                if !help_lists_command(&help, subcommand) {
+                if !help_lists_command(help, subcommand) {
                     let shown = if path.is_empty() {
                         "vibesync".to_string()
                     } else {
@@ -818,7 +815,7 @@ fn every_documented_cli_invocation_exists() {
             let help = helps.get(&path);
             for flag in &flags {
                 let bare = flag.split('=').next().unwrap_or(flag);
-                if !help_lists_option(&help, bare) {
+                if !help_lists_option(help, bare) {
                     offenders.insert(format!(
                         "{doc}: `{span}` — vibesync {} has no `{bare}` option",
                         path.join(" ")
