@@ -777,8 +777,8 @@ fn help_lists_option(help: &str, flag: &str) -> bool {
     false
 }
 
-/// Every documented invocation — inline or fenced, installed binary or
-/// development fallback (`BINARY_SPELLINGS`) — must resolve
+/// Every documented invocation an agent doc shows — inline-backtick or fenced,
+/// installed binary or development fallback (`BINARY_SPELLINGS`) — must resolve
 /// against the real binary's own `--help`: each subcommand it names must be
 /// listed at that level, and each `--flag` it passes must be listed on that
 /// exact invocation's help. No glob engine, no invented flags, no exit-code
@@ -786,10 +786,7 @@ fn help_lists_option(help: &str, flag: &str) -> bool {
 #[test]
 fn every_documented_cli_invocation_exists() {
     let mut offenders = BTreeSet::new();
-    // One `--help` per distinct subcommand path, not per span that names it. The
-    // docs invoke a handful of paths over and over in both spellings, and each
-    // miss here is a process spawn.
-    let mut helps: HelpCache = HelpCache::new();
+    let mut helps = HelpCache::new();
     for doc in &docs() {
         for span in command_spans(&read(doc)) {
             let Some((subcommands, flags)) = cli_invocation(&span) else {
