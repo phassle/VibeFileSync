@@ -198,3 +198,56 @@ The skill does not fabricate a `restore` command; never invent this invocation.
 ### Resume request ("pick up where it left off" after an interruption)
 
 Refuse the request as asked — there is no mid-file resume in this product, the sense `CONTEXT.md`'s Convergence entry names only to reject. The Journal (ADR-0007) is a forensic, historical record of what happened on past runs; it is never copy authority and never decides what the next run copies. Tell the human the correct next step is to rerun the Folder pair: its own fresh scan converges on the correct destination state — one rerun, nothing replayed from the Journal, no manual repair.
+
+## Redefining and removing a Folder pair — gated mutations
+
+`pair add --replace` (redefining an existing Folder pair's volumes) and `pair remove` (deleting a pair) are the
+only two Folder-pair mutations, and each is irreversible for its own reason. Both go through the same
+review-first gate as a Run (ADR-0003; re-anchored as a chat gate by ADR-0010): preview what will be lost →
+agent summary → the human's explicit chat "yes" → only then does the agent invoke the command.
+
+That gate is entirely agent-mediated, not something the binary offers. Neither `src/pair.rs::add` nor
+`src/pair.rs::remove`, nor `src/main.rs::run_pair`, contains a confirmation prompt, a review step, or a
+`--yes`-style flag for either operation — both write their result and save immediately once called, with no
+branch that waits for input. This is unlike Run's own `--yes`, above, which suppresses a real interactive y/N
+prompt the binary does ask; here there is no prompt to suppress, because the binary never asks one in the
+first place. So the preview, the summary, and the "yes" are steps the agent performs *before* calling either
+command at all — never a flag or prompt the binary itself provides — and the agent must never invoke either
+command on an unconfirmed preview.
+
+Both saves are atomic: `pair add --replace` rewrites the pair's config entry in one save (ADR-0006 §6), and
+`pair remove` deletes it in one save, so neither can leave the config half-written. Atomicity is not safety —
+it only means the write itself cannot corrupt the file. It says nothing about whether what that write discards
+can be gotten back, and for both of these mutations, it cannot: once the save completes, there is no undo.
+
+### `pair add --replace` — redefining which volumes a pair points at
+
+Preview the new source, destination, and Sync mode the human is proposing, and that saving will re-pin both
+volume UUIDs to that new source and destination. Saving discards the pair's previous volume binding: the old
+source path, destination path, and both volume UUIDs are overwritten in the same save and are not recorded
+anywhere else, so there is no way back to what the pair pointed at before. The Pair name and its Journal
+history are unaffected by `--replace` — only what the name points at changes.
+
+- Real binary: `vibesync pair add <pair> --source <PATH> --destination <PATH> --mode <mirror|update> --replace`
+- Development fallback: `cargo run --locked -- pair add <pair> --source <PATH> --destination <PATH> --mode <mirror|update> --replace`
+
+This is the one case the Add-a-Folder-pair section above places out of its own scope. Do not re-derive
+Sync-mode wording or volume-UUID pinning here; refer to that section for what those mean, and use this one
+only for what changes when `--replace` is set.
+
+### `pair remove` — deleting a pair
+
+Preview the Pair name being removed, and that afterward the human will no longer be able to run `status` or
+`history` against that name. What the command itself deletes is narrower than it sounds: it removes only the
+pair's entry from the config, and never touches the Journal on disk. But the status and history commands
+above both resolve a Pair name through the config before they will read its Journal, and a removed name no
+longer resolves — so that Journal history becomes unreachable through this product from that point on, even
+though the underlying records are not the thing the command deleted. Preview it that way, not as "the history
+is deleted."
+
+- Real binary: `vibesync pair remove <pair>`
+- Development fallback: `cargo run --locked -- pair remove <pair>`
+
+Do not tell the human `_SafetyNet/` can recover a removed pair or its Journal history. SafetyNet archives
+destination *objects* that a Run replaces or removes (ADR-0001); it has no relationship to the pair config or
+the Journal, and nothing in either of this section's mutations writes to it.
