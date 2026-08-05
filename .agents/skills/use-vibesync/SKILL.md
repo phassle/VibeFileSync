@@ -181,7 +181,7 @@ Fault exits are a separate concern this section does not cover.
 The Run section above covers exit 0. Two fault exits need their own handling, both resolved by Convergence
 (ADR-0007) rather than by the Journal: a rerun always proceeds from that rerun's own fresh scan, never from
 a replay of Journal state, and the agent never attempts a mid-file resume — see Steering's Resume request
-above for that refusal; this section only adds what exit 1 and exit 4 themselves require.
+below for that refusal; this section only adds what exit 1 and exit 4 themselves require.
 
 ### Exit 1 — partial (one or more actions failed)
 
