@@ -198,3 +198,22 @@ The skill does not fabricate a `restore` command; never invent this invocation.
 ### Resume request ("pick up where it left off" after an interruption)
 
 Refuse the request as asked — there is no mid-file resume in this product, the sense `CONTEXT.md`'s Convergence entry names only to reject. The Journal (ADR-0007) is a forensic, historical record of what happened on past runs; it is never copy authority and never decides what the next run copies. Tell the human the correct next step is to rerun the Folder pair: its own fresh scan converges on the correct destination state — one rerun, nothing replayed from the Journal, no manual repair.
+
+## When a Run aborts on a Run precondition — exit 2
+
+Exit 2 (`EXIT_PRECONDITION`, `src/error.rs`) means the binary aborted before touching the destination, per ADR-0002's abort-by-default. Exit 2 is not one failure — read the binary's own error message to identify which Run precondition fired before naming it back to the human; never guess from the exit code alone.
+
+Two Run preconditions are enforced by `run` itself (`src/preconditions.rs::check_run`, reached only at the run edge so a dry-run can still explain what would happen) and each has exactly one matching per-run override. All three flags named in this section are `Run`-variant fields in `src/main.rs`, confirmed against `vibesync run --help`.
+
+- **Empty source against a non-empty Mirror destination** — Mirror mode, the source scans as empty, the destination does not (an unmounted source volume also reads this way, per `CONTEXT.md`'s Run preconditions entry). The message names it: "source is empty while Mirror destination is non-empty". Offer `--allow-empty-source` only.
+- **Insufficient destination free space** — the plan's new-and-changed bytes exceed the destination's available space. The message names it: "destination free space is insufficient". Offer `--ignore-space-check` only.
+
+A third class also aborts with exit 2 but has **no matching override at all**: volume-identity mismatch and self-overlap, both raised earlier in `resolve_pair` (`src/preconditions.rs`), before `check_run` ever runs — a pinned volume not mounted, a foreign volume at the stored path, or source and destination naming the same or a nested directory (its message contains "same directory" or "nested inside"). No flag relaxes any of these; the fix sits outside the Run (remount the volume, or remove and re-add the Folder pair). Never invent or offer an override for this class — report the message as-is and stop.
+
+Offer only the override that matches the Run precondition actually named in the message, one at a time, each its own explicit yes/no question in chat: never bundled with another override, never applied because the human said yes to a different one, and never applied silently (ADR-0002). This is what keeps abort-by-default meaningful through the agent layer, not an aside. On an explicit "yes", re-invoke with that single flag added to the same `run --yes --json` invocation `## Run` above already establishes, carrying forward any `--exclude` flags already in play; on "no", stop and report the abort as-is.
+
+- Real binary: `vibesync run <pair> --yes --json --allow-empty-source`
+- Real binary: `vibesync run <pair> --yes --json --ignore-space-check`
+- Development fallback: prefix either with `cargo run --locked --`, per `## Binary invocation`.
+
+`--permanent-delete` does not belong in the mapping above. No Run precondition fires for it, and no exit 2 ever names it — it is not a Run precondition at all, but a SafetyNet bypass. By default, a replaced or removed destination object is archived by rename before removal; a run given `--permanent-delete` removes the object directly instead (`src/run.rs::remove_file`), and `tests/cli.rs::permanent_delete_bypasses_safetynet_for_this_run` asserts the object is gone afterward with no `_SafetyNet` left behind at all — that default-vs-bypass is conditional, never state it as an unqualified guarantee either way. Never offer `--permanent-delete` in response to an exit 2 abort, and never bundle it with `--allow-empty-source` or `--ignore-space-check`. If the human wants to skip SafetyNet for a run, that is its own separate explicit yes/no question, asked on its own terms, subject to the same never-auto-applied, never-silent rule as the two precondition overrides above.
