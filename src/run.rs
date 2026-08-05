@@ -13,12 +13,24 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK, EXIT_PRECONDITION};
+use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
 use crate::event::{Context, Event, MetadataWarning, VerificationTier, RUN_SCHEMA};
 use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
 use crate::structural_conflict::{self, ConflictSet};
+
+/// The human-facing line for pair-lock contention (ADR-0010's fail-fast
+/// precondition abort). Shared by `lock_error` (the `prune` path, which never
+/// goes through `RunOutcome`) and `RunOutcome::into_exit_code` (the `run`
+/// path), so the prose lives in exactly one place even though two callers
+/// need it.
+const LOCK_CONTENTION_MESSAGE: &str = "run already in progress";
+
+/// The human-facing line for a Folder pair whose definition changed during
+/// TUI review. Shared by `stale_pair_error` and `RunOutcome::into_exit_code`.
+const PAIR_CHANGED_MESSAGE: &str =
+    "Folder pair changed during TUI review; reopen the TUI before running";
 
 /// Typed outcome returned by `run_reviewed`. The two refusal classes the TUI
 /// branches on are named variants so callers can match without string-matching
@@ -36,21 +48,22 @@ pub(crate) enum RunOutcome {
 }
 
 impl RunOutcome {
-    /// Widens to an `i32` process exit code, preserving ADR-0004's taxonomy.
-    ///
-    /// Not called yet. #105 specifies that the CLI's `src/run.rs::run` widens
-    /// the variant back to the integer at the process boundary, but `run` still
-    /// calls `src/run.rs::execute_reviewed_plan` directly, so `RunOutcome` has
-    /// only one consumer — the TUI — and it matches every variant itself.
-    /// `expect` rather than `allow` is deliberate: when #105 wires the CLI
-    /// through here, the attribute becomes an unfulfilled expectation and the
-    /// compiler asks for its removal, instead of quietly outliving its reason.
-    #[expect(dead_code)]
+    /// Widens to an `i32` process exit code at the CLI boundary, preserving
+    /// ADR-0004's taxonomy. The refusal variants carry no prose themselves
+    /// (that is the point — the TUI matches them without re-parsing a
+    /// message), so this is where the human-facing line is reattached for the
+    /// one caller, `src/run.rs::run`, that turns a `RunOutcome` back into the
+    /// process's `Result<i32, AppError>`. The TUI never calls this: it
+    /// matches `RunOutcome` itself and keeps the refusal typed.
     pub(crate) fn into_exit_code(self) -> Result<i32, AppError> {
         match self {
             RunOutcome::Completed(code) => Ok(code),
-            RunOutcome::LockContention => Ok(EXIT_PRECONDITION),
-            RunOutcome::PairChangedDuringReview => Ok(EXIT_PRECONDITION),
+            RunOutcome::LockContention => {
+                Err(AppError::Precondition(LOCK_CONTENTION_MESSAGE.to_string()))
+            }
+            RunOutcome::PairChangedDuringReview => {
+                Err(AppError::Precondition(PAIR_CHANGED_MESSAGE.to_string()))
+            }
             RunOutcome::Failed(err) => Err(err),
         }
     }
@@ -346,9 +359,37 @@ fn emit_action_failed(
 
 pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
     configured_pair(config_path, pair_name)?;
-    let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
-    let (pair, initial_plan) = plan::build(config_path, pair_name, options.excludes)?;
-    execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, true)
+    let outcome = match lock_outcome(PairLock::acquire(pair_name)) {
+        Ok(_pair_lock) => match plan::build(config_path, pair_name, options.excludes) {
+            Ok((pair, initial_plan)) => match execute_reviewed_plan(
+                config_path,
+                pair_name,
+                options,
+                pair,
+                initial_plan,
+                true,
+            ) {
+                Ok(code) => RunOutcome::Completed(code),
+                Err(e) => RunOutcome::Failed(e),
+            },
+            Err(e) => RunOutcome::Failed(e),
+        },
+        Err(outcome) => outcome,
+    };
+    outcome.into_exit_code()
+}
+
+/// Classifies a pair-lock acquisition failure into the refusal `run` and
+/// `run_reviewed` both need to react to, so the `WouldBlock` check (ADR-0007's
+/// fail-fast contention) lives in one place instead of once per caller.
+fn lock_outcome(result: io::Result<PairLock>) -> Result<PairLock, RunOutcome> {
+    result.map_err(|e| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            RunOutcome::LockContention
+        } else {
+            RunOutcome::Failed(io_error(e))
+        }
+    })
 }
 
 /// Executes the exact plan confirmed by another human surface. The ordinary
@@ -365,12 +406,9 @@ pub(crate) fn run_reviewed(
         Ok(p) => p,
         Err(e) => return RunOutcome::Failed(e),
     };
-    let _pair_lock = match PairLock::acquire(pair_name) {
+    let _pair_lock = match lock_outcome(PairLock::acquire(pair_name)) {
         Ok(lock) => lock,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            return RunOutcome::LockContention;
-        }
-        Err(e) => return RunOutcome::Failed(io_error(e)),
+        Err(outcome) => return outcome,
     };
     let (pair, notices) = match crate::preconditions::resolve_pair(&configured) {
         Ok(r) => r,
@@ -400,9 +438,7 @@ fn stale_pair_error(
     if pair == reviewed_pair {
         None
     } else {
-        Some(AppError::Precondition(
-            "Folder pair changed during TUI review; reopen the TUI before running".to_string(),
-        ))
+        Some(AppError::Precondition(PAIR_CHANGED_MESSAGE.to_string()))
     }
 }
 
@@ -1849,7 +1885,7 @@ fn journal_runtime_error(error: io::Error) -> AppError {
 
 fn lock_error(error: io::Error) -> AppError {
     if error.kind() == io::ErrorKind::WouldBlock {
-        AppError::Precondition("run already in progress".to_string())
+        AppError::Precondition(LOCK_CONTENTION_MESSAGE.to_string())
     } else {
         io_error(error)
     }
