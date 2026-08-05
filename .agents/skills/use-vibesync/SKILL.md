@@ -229,8 +229,15 @@ back out of the Journal.
 
 ### Exit 4 — interrupted (signal or crash)
 
-Exit 4, `src/error.rs::EXIT_INTERRUPTED`, is a Run that started, began mutating the destination, and did not
-reach its final `summary`. On this exit, rerun the same Folder pair once, automatically — the same
+Exit 4, `src/error.rs::EXIT_INTERRUPTED`, is a Run that started but could not complete reliably — its own
+doc comment's phrasing — and did not reach its final `summary`. Whether the destination was actually
+touched before the interruption landed is not knowable from the exit code alone: the interruption check
+`crate::interrupt::check` runs before `src/run.rs::dispatch`'s own action loop even begins, so a signal
+caught that early can produce exit 4 with nothing yet copied, updated, or deleted. Do not tell the human the
+destination was already being mutated; the honest answer is "possibly, possibly not" — and that uncertainty
+is exactly why the next step is a rerun rather than a manual read of what was touched: Convergence
+(ADR-0007) means the rerun's own fresh scan settles the destination's real state regardless of how much or
+how little the interrupted run did. On this exit, rerun the same Folder pair once, automatically — the same
 `vibesync run` invocation as above, re-issued without waiting for a fresh human "yes", since a rerun's own
 fresh scan is what Convergence (ADR-0007) relies on to make that one automatic retry safe. ADR-0004 §6
 glosses this exit as "Journal holds state, rerun resumes"; read that gloss alongside ADR-0007's own
