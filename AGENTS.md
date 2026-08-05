@@ -115,6 +115,7 @@ Agent operations:
 - `docs/agents/issue-tracker.md` — GitHub issue/PR commands and wayfinding operations.
 - `docs/agents/issue-hierarchy.md` — Idea → Epic → Feature → Issue model.
 - `docs/agents/triage-labels.md` — canonical label mapping.
+- `.agents/skills/use-vibesync/SKILL.md` — drive the installed `vibesync` binary on a human's behalf: add a Folder pair, list pairs, read-only status/history, and Compare a plan.
 
 Specialized only:
 
