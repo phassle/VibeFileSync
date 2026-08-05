@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-05T20:10:00Z",
+  "updatedAt": "2026-08-05T21:15:00Z",
   "source": "GitHub issue model-telemetry:v1 sections",
   "externalReview": {
     "lastCheckedAt": "2026-08-05T20:10:00Z",
@@ -98,8 +98,8 @@
         "lastOutcome": null
       },
       "samples": {
-        "eligible": 2,
-        "cleanSuccess": 1,
+        "eligible": 3,
+        "cleanSuccess": 2,
         "capabilityEscalation": 0,
         "materialReReview": 1
       },
@@ -136,7 +136,7 @@
         "confidence": "low"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-05T16:49:56Z",
+        "lastCheckedAt": "2026-08-05T21:15:00Z",
         "examined": [
           "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
           "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
@@ -174,11 +174,12 @@
       "confidence": "low",
       "evidenceIssues": [
         60,
+        110,
         114
       ],
-      "calibratedAt": "2026-08-05T16:49:56Z",
-      "sourceCursor": "2026-08-05T16:46:02Z",
-      "notes": "Two eligible units (#60 and #114). Recommendation remains at claude:claude-sonnet-5/low with low confidence: #114 adds one accepted no-finding unit and one non-capability evidence retry, but no unit started at a stronger step and no capability failure exists. The one cost-reporting unit still defines the dollar arm; #114's unknown usage remains null and is not estimated. Index 0 is the verified ladder floor, so no lower boundary probe is possible."
+      "calibratedAt": "2026-08-05T21:15:00Z",
+      "sourceCursor": "2026-08-05T20:35:00Z",
+      "notes": "Three eligible units (#60, #110, #114). Recommendation remains at claude:claude-sonnet-5/low with low confidence: #110 (root feature #105's sole child, feature-reviewed) adds a third clean unit at ladderIndex 0 — two implementer attempts, both success, zero capabilityFailure, zero standards/spec findings — with no unit starting at a stronger step and no capability failure recorded anywhere in the group. #110's two implementer attempts and two review fixPasses report only durationMs (490000+55000ms and 185000ms review), no cost/token figures, so they are counted in samples but excluded from the dollar-cost median, which still rests on the single #60/#114-era cost-reporting unit at USD 3.51. #110's fixPasses:2 is not counted toward materialReReview because review.standardsFindings and review.specFindings are both 0 — no finding-driven fix was recorded, consistent with this group's existing precedent (#84) of excluding non-review-driven self-correction from materialReReview. Index 0 is the verified ladder floor, so no lower boundary probe is possible; three-of-three clean-or-non-capability at the floor is evidence toward retaining it, still short of the five-unit lowering threshold (moot, since there is no lower step to move to)."
     },
     {
       "key": "phassle/VibeFileSync:claude:rust-cli-tui:medium",
