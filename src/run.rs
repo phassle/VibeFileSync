@@ -37,6 +37,15 @@ pub(crate) enum RunOutcome {
 
 impl RunOutcome {
     /// Widens to an `i32` process exit code, preserving ADR-0004's taxonomy.
+    ///
+    /// Not called yet. #105 specifies that the CLI's `src/run.rs::run` widens
+    /// the variant back to the integer at the process boundary, but `run` still
+    /// calls `src/run.rs::execute_reviewed_plan` directly, so `RunOutcome` has
+    /// only one consumer — the TUI — and it matches every variant itself.
+    /// `expect` rather than `allow` is deliberate: when #105 wires the CLI
+    /// through here, the attribute becomes an unfulfilled expectation and the
+    /// compiler asks for its removal, instead of quietly outliving its reason.
+    #[expect(dead_code)]
     pub(crate) fn into_exit_code(self) -> Result<i32, AppError> {
         match self {
             RunOutcome::Completed(code) => Ok(code),
@@ -595,7 +604,7 @@ fn dispatch(
         crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
-        let structural_delete = conflicts.find_structural_delete_for(&plan, &action.rel_path);
+        let structural_delete = conflicts.find_structural_delete_for(plan, &action.rel_path);
         let temp_target = structural_delete
             .filter(|_| !destination.parent().is_some_and(Path::is_dir))
             .map(|deletion| pair.destination.join(&deletion.rel_path));
@@ -738,7 +747,7 @@ fn dispatch(
             }
         }
     }
-    for deletion in conflicts.drain_incomplete(&plan) {
+    for deletion in conflicts.drain_incomplete(plan) {
         fail_structural_delete(deletion, journal, reporter, stats)?;
     }
     for action in plan
@@ -1984,7 +1993,9 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         let mut config = crate::config::Config::default();
-        config.pairs.insert("pair-changed-test".to_string(), current_pair);
+        config
+            .pairs
+            .insert("pair-changed-test".to_string(), current_pair);
         crate::config::save(&config_path, &config).unwrap();
 
         let outcome = run_reviewed(

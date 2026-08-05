@@ -30,10 +30,10 @@ use crate::config::{self, Mode};
 use crate::error::{AppError, EXIT_OK};
 use crate::pair;
 use crate::preconditions::{self, VolumeState};
+use crate::run::RunOutcome;
 use crate::structural_conflict;
 use crate::volume;
 use crate::{plan, run as run_engine};
-use crate::run::RunOutcome;
 
 #[derive(Clone)]
 struct PairChoice {
@@ -1171,16 +1171,26 @@ fn run_pair_flow(
                     continue 'recompare;
                 }
                 RunOutcome::Completed(code) => {
-                    let (exit_code, view) =
-                        build_result_view(pair_name, &destination, mode, notices.clone(), Ok(code))?;
+                    let (exit_code, view) = build_result_view(
+                        pair_name,
+                        &destination,
+                        mode,
+                        notices.clone(),
+                        Ok(code),
+                    )?;
                     session.terminal().clear().map_err(tui_error)?;
                     show_result(session.terminal(), &mut events, &view, header_mode)
                         .map_err(tui_error)?;
                     return Ok(exit_code);
                 }
                 RunOutcome::Failed(err) => {
-                    let (exit_code, view) =
-                        build_result_view(pair_name, &destination, mode, notices.clone(), Err(err))?;
+                    let (exit_code, view) = build_result_view(
+                        pair_name,
+                        &destination,
+                        mode,
+                        notices.clone(),
+                        Err(err),
+                    )?;
                     session.terminal().clear().map_err(tui_error)?;
                     show_result(session.terminal(), &mut events, &view, header_mode)
                         .map_err(tui_error)?;
