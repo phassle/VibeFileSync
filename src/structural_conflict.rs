@@ -94,7 +94,7 @@ impl ConflictSet {
             .find(|deletion| deletion.rel_path == *deletion_path)
     }
 
-    /// Records that this structural delete's archive is starting. Returns
+    /// Records that this structural delete lifecycle has started. Returns
     /// `true` the first time, so the caller fires `action_start` exactly
     /// once per structural delete no matter how many dependent copies
     /// reach this point.
@@ -107,7 +107,7 @@ impl ConflictSet {
         self.completed.insert(deletion.rel_path.clone());
     }
 
-    /// Structural deletes that started but never completed — their
+    /// Structural deletes whose lifecycle started but never completed — their
     /// dependent copy failed its publish gate before the archive finished.
     pub(crate) fn drain_incomplete<'a>(&self, plan: &'a Plan) -> Vec<&'a Action> {
         plan.deletes
