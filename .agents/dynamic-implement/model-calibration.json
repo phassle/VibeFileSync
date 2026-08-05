@@ -1,16 +1,17 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-05T12:57:25Z",
+  "updatedAt": "2026-08-05T16:27:22Z",
   "source": "GitHub issue model-telemetry:v1 sections",
   "externalReview": {
-    "lastCheckedAt": "2026-08-05T12:57:25Z",
+    "lastCheckedAt": "2026-08-05T16:27:22Z",
     "outcome": "unchanged",
     "isFirstCheck": false,
     "examined": [
-      "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta against the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
-      "claude:claude-opus-5 route, availability, active status, and pricing delta against the tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
-      "new official cost-per-completed-task benchmark rounds since the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
-      "known advertised claude:claude-fable-5 candidate status; still excluded from the verified code ladder by the existing user decision"
+      "claude:claude-sonnet-5 availability, active status, and the dated 2026-09-01 price change, re-confirmed against Anthropic Pricing on this run",
+      "claude:claude-opus-5 availability, active status, and per-token pricing, re-confirmed against Anthropic Pricing on this run",
+      "new or retired claude routes since 2026-08-02: latest release remains Claude Opus 5 (2026-07-24), already in the verified ladder; no ladder route added or retired",
+      "new cost-per-completed-task or tokens-per-task benchmark rounds for claude-sonnet-5 / claude-opus-5 since 2026-08-02: none found",
+      "known advertised claude:claude-fable-5 and limited-availability claude:claude-mythos-5, both outside the verified code ladder and unchanged in that status"
     ],
     "findings": [
       {
@@ -36,7 +37,7 @@
           "currency": "USD",
           "basis": "standard"
         },
-        "detail": "Known and unchanged: introductory pricing lapses 2026-08-31 and re-prices ladder indices 0-4 by +50% per token on 2026-09-01, with no route change. Still pending, not yet effective.",
+        "detail": "Known and unchanged, re-confirmed 2026-08-05T16:27:22Z: introductory $2/$10 pricing lapses 2026-08-31 and re-prices ladder indices 0-4 to $3/$15 on 2026-09-01, with no route change. effectiveAt is unmoved and the change is still pending, not yet effective.",
         "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing",
         "retrievedAt": "2026-08-02T21:45:45Z"
       },
@@ -51,14 +52,15 @@
           9
         ],
         "localTelemetry": "none",
-        "detail": "Known and unchanged: $5/MTok input and $25/MTok output; still no eligible local implementer observation starting on this route. #111 started and finished on Sonnet 5/low; #113 started on Sonnet 5/low and finished a review-driven correction on Sonnet 5/medium.",
+        "detail": "Known and unchanged, re-confirmed 2026-08-05T16:27:22Z: $5/MTok input and $25/MTok output. Still no eligible local implementer observation that STARTS on this route; #112 reached ladder index 1 (Sonnet 5/medium) as a recovery step only, so the Opus arm remains unmeasured.",
         "source": "Anthropic, Claude Opus 5 documentation, https://platform.claude.com/docs/en/about-claude/models/whats-new-opus-5",
         "retrievedAt": "2026-08-02T21:45:45Z"
       }
     ],
     "implications": [
-      "No external delta: Sonnet 5 remains active with introductory pricing of $2/$10 through 2026-08-31 and $3/$15 scheduled for 2026-09-01; Opus 5 remains active at $5/$25; no new or retired verified ladder route and no newer official cost-per-completed-task benchmark round was found.",
-      "Claude Fable 5 remains an already-known advertised candidate outside the verified code ladder; schema normalization does not change its status or count as capability evidence."
+      "No external delta since 2026-08-05T12:57:25Z: Sonnet 5 remains active on introductory $2/$10 through 2026-08-31 with $3/$15 dated 2026-09-01; Opus 5 remains active at $5/$25.",
+      "No claude route was added to or retired from the verified ladder; the most recent release, Claude Opus 5 (2026-07-24), predates the ladder and is already indices 5-9.",
+      "No new official cost-per-completed-task or tokens-per-task benchmark round was published for either candidate route, so relativeTokensForComparableWork stays null and per-token price alone still ranks nothing."
     ]
   },
   "groups": [
@@ -132,12 +134,13 @@
         "confidence": "low"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-05T12:57:25Z",
+        "lastCheckedAt": "2026-08-05T16:27:22Z",
         "examined": [
-          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
-          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
-          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
-          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
+          "claude:claude-sonnet-5 availability, active status, and the dated 2026-09-01 price change, re-confirmed against Anthropic Pricing on this run",
+          "claude:claude-opus-5 availability, active status, and per-token pricing, re-confirmed against Anthropic Pricing on this run",
+          "new or retired claude routes since 2026-08-02: latest release remains Claude Opus 5 (2026-07-24), already in the verified ladder; no ladder route added or retired",
+          "new cost-per-completed-task or tokens-per-task benchmark rounds for claude-sonnet-5 / claude-opus-5 since 2026-08-02: none found",
+          "known advertised claude:claude-fable-5 and limited-availability claude:claude-mythos-5, both outside the verified code ladder and unchanged in that status"
         ],
         "changesFound": [],
         "outcome": "unchanged",
@@ -258,12 +261,13 @@
         "confidence": "medium"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-05T12:57:25Z",
+        "lastCheckedAt": "2026-08-05T16:27:22Z",
         "examined": [
-          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
-          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
-          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
-          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
+          "claude:claude-sonnet-5 availability, active status, and the dated 2026-09-01 price change, re-confirmed against Anthropic Pricing on this run",
+          "claude:claude-opus-5 availability, active status, and per-token pricing, re-confirmed against Anthropic Pricing on this run",
+          "new or retired claude routes since 2026-08-02: latest release remains Claude Opus 5 (2026-07-24), already in the verified ladder; no ladder route added or retired",
+          "new cost-per-completed-task or tokens-per-task benchmark rounds for claude-sonnet-5 / claude-opus-5 since 2026-08-02: none found",
+          "known advertised claude:claude-fable-5 and limited-availability claude:claude-mythos-5, both outside the verified code ladder and unchanged in that status"
         ],
         "changesFound": [],
         "outcome": "unchanged",
@@ -327,7 +331,12 @@
           "lock-contention",
           "deep-module-refactor",
           "safety-ordering",
-          "cross-module-integration"
+          "cross-module-integration",
+          "refactor-behaviour-preserving",
+          "versioned-schema-contract",
+          "trait-seam-extraction",
+          "snapshot-test",
+          "cli-tui"
         ]
       },
       "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
@@ -351,10 +360,10 @@
         "lastOutcome": null
       },
       "samples": {
-        "eligible": 4,
+        "eligible": 5,
         "cleanSuccess": 2,
         "capabilityEscalation": 0,
-        "materialReReview": 2
+        "materialReReview": 3
       },
       "usage": {
         "inputTokensRange": null,
@@ -367,7 +376,7 @@
         "currency": "USD",
         "durationMsRange": [
           528000,
-          1614000
+          2504000
         ]
       },
       "costToAcceptance": {
@@ -379,7 +388,7 @@
             "route": "claude:claude-sonnet-5",
             "effort": "low",
             "ladderIndex": 0,
-            "units": 4,
+            "units": 5,
             "medianTotal": 13.09,
             "attemptsMedian": 2,
             "includesRetriesAndFixPasses": true
@@ -389,12 +398,13 @@
         "confidence": "low"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-05T12:57:25Z",
+        "lastCheckedAt": "2026-08-05T16:27:22Z",
         "examined": [
-          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
-          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
-          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
-          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
+          "claude:claude-sonnet-5 availability, active status, and the dated 2026-09-01 price change, re-confirmed against Anthropic Pricing on this run",
+          "claude:claude-opus-5 availability, active status, and per-token pricing, re-confirmed against Anthropic Pricing on this run",
+          "new or retired claude routes since 2026-08-02: latest release remains Claude Opus 5 (2026-07-24), already in the verified ladder; no ladder route added or retired",
+          "new cost-per-completed-task or tokens-per-task benchmark rounds for claude-sonnet-5 / claude-opus-5 since 2026-08-02: none found",
+          "known advertised claude:claude-fable-5 and limited-availability claude:claude-mythos-5, both outside the verified code ladder and unchanged in that status"
         ],
         "changesFound": [],
         "outcome": "unchanged",
@@ -429,11 +439,12 @@
         50,
         57,
         58,
+        112,
         113
       ],
-      "calibratedAt": "2026-08-05T12:57:25Z",
-      "sourceCursor": "2026-08-05T12:55:27Z",
-      "notes": "Four eligible units; all started at ladder index 0. Recommendation retained at claude:claude-sonnet-5/low with low confidence because no comparable unit started at a stronger step. Corrected #113 from clean-at-low to material re-review: its final unit route was claude:claude-sonnet-5/medium (ladder index 1), after low-effort work and review-driven correction; root review then added two Spec findings and one aggregated test-only fix pass. Therefore the group has two clean successes and two material re-reviews. #113's first implementer harness failure, planner API-529 failures, nested-PTY evidence, and root-remediation Codex attempts all have capabilityFailure:false or are explicitly non-capability integration evidence; they do not establish a required route escalation. #113 reports null usage, cost, token, and duration values, so it is counted in samples but not in the dollar median, which retains three cost-reporting units. The medium final effort is an observed successful recovery step, not a measured medium starting-step cost, so it is not added as a comparable costToAcceptance arm. No two capability-driven units and no 25%-lower stronger-step median exist; no floor raise is allowed. Index 0 cannot be lowered and no lower boundary probe exists. Cost remains confounded by change/context size."
+      "calibratedAt": "2026-08-05T16:27:22Z",
+      "sourceCursor": "2026-08-05T16:27:22Z",
+      "notes": "Five eligible units (#50, #57, #58, #112, #113); every one started at ladder index 0, still the only starting step this repository has ever measured for this group. Recommendation RETAINED unchanged at claude:claude-sonnet-5/low (index 0), confidence low.\n\n#112 merged this run as a material re-review, not a clean success and not a capability escalation. Its implementer started at index 0 (Sonnet 5/low, outcome retry, capabilityFailure:false) and completed at index 1 (Sonnet 5/medium, purpose recovery, capabilityFailure:false) with review.fixPasses=1. escalations[0] is dimension=effort, raised under the material-non-clean-fix-pass rule in model-routing.md. Per the rubric that is an effort raise on a non-clean review, NOT a model-capability failure, so it increments materialReReview and leaves capabilityEscalation at 0 and observedBoundary.highestCapabilityFailure at null.\n\nBoundary rubric applied at n=5, no change permitted in either direction. Raise ground (a) requires >=2 units needing the same or a stronger step for CAPABILITY reasons: this group has zero such units, every attempt across all five carries capabilityFailure:false. Raise ground (b) requires >=2 units showing a stronger step materially cheaper to acceptance (>=25% lower median costToAcceptance): no unit in this group has ever STARTED above index 0, so there is no stronger-step arm to compare against and the comparison cannot be computed. #112's index-1 finish is an observed successful recovery step, not a measured index-1 starting cost, so it is deliberately not added as a costToAcceptance arm. Lowering is impossible because index 0 is the lowest verified step in the claude ladder; for the same reason boundaryProbe.due stays false, as there is nothing below index 0 to probe. Net ladder steps changed this run: zero.\n\nData-quality caveats that hold confidence at low. (1) Evidence is single-armed: one starting step, no contrast. (2) #50, #57 and #58 are LEGACY pre-schema-2 records carrying costUsd/turns/durationMin but no route, model or effort field. Per the calibrate rubric, legacy records count only as model-level evidence and their unknown effort must never be backfilled or used to infer an effort boundary; only #112 and #113 have verified route-and-effort attribution at index 0. byStep.units=5 therefore counts units observed at this step, while medianTotal 13.09 USD still rests on the three legacy cost-reporting units only (#57 9.28, #58 13.09, #50 17.75, per-unit sums across attempts). (3) #112 and #113 both report null token, credit, cost and currency values because the harnesses expose no usage data on the claude.ai subscription; both are counted in samples and excluded from the dollar median. #112 does report durationMs, so durationMsRange extends to 2504000 ms on the same per-unit convention as the legacy rows (implementer attempts plus merger: 992000 + 890000 + 622000). Planner and reviewer attempts are excluded from that sum to stay comparable with the legacy rows, and reviewer routing is never an input to implementer calibration. (4) Cost remains confounded by change and context size; do not compare this median across groups without normalization."
     }
   ]
 }
