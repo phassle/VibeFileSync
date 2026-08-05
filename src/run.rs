@@ -374,75 +374,52 @@ fn execute_reviewed_plan(
     mut initial_plan: plan::Plan,
     render_plan: bool,
 ) -> Result<i32, AppError> {
-    let RunOptions {
-        yes,
-        permanent_delete,
-        allow_empty_source,
-        ignore_space_check,
-        json_output,
-        full_verify,
-        excludes,
-    } = options;
-
-    let (mut journal, reporter, mut stats) = match review_plan(
-        pair_name,
-        &pair,
-        &mut initial_plan,
-        render_plan,
-        allow_empty_source,
-        ignore_space_check,
-        yes,
-        json_output,
-    )? {
+    let mut session = match review_plan(pair_name, &pair, &mut initial_plan, render_plan, &options)?
+    {
         ReviewOutcome::ExitEarly(code) => return Ok(code),
-        ReviewOutcome::Proceed {
-            journal,
-            reporter,
-            stats,
-        } => (journal, reporter, stats),
+        ReviewOutcome::Proceed(session) => session,
     };
 
     if let CleanupOutcome::Abort = cleanup_stray_temps(
         &pair.source,
         &pair.destination,
         &initial_plan.strays,
-        &mut journal,
-        &reporter,
-        &mut stats,
+        &mut session,
     )? {
-        return finalize(&mut journal, &reporter, &stats);
+        return finalize(&mut session);
     }
     let (pair, plan) = reconcile_plan(
         config_path,
         pair_name,
-        excludes,
+        options.excludes,
         &initial_plan,
-        &mut journal,
-        &reporter,
-        &mut stats,
+        &mut session,
     )?;
 
     dispatch(
         &pair,
         &plan,
-        permanent_delete,
-        full_verify,
-        &mut journal,
-        &reporter,
-        &mut stats,
+        options.permanent_delete,
+        options.full_verify,
+        &mut session,
     )?;
 
-    finalize(&mut journal, &reporter, &stats)
+    finalize(&mut session)
+}
+
+/// The journal, reporter, and run stats a reviewed plan opens together and
+/// every later lifecycle (cleanup, reconcile, dispatch, finalize) threads
+/// through as a unit.
+struct RunSession {
+    journal: Journal,
+    reporter: RunReporter,
+    stats: RunStats,
 }
 
 /// Whether review cleared the plan for execution, or the run must stop
 /// before a journal exists (blocked plan, or the user declined to confirm).
 enum ReviewOutcome {
-    Proceed {
-        journal: Journal,
-        reporter: RunReporter,
-        stats: RunStats,
-    },
+    Proceed(RunSession),
     ExitEarly(i32),
 }
 
@@ -451,18 +428,14 @@ enum ReviewOutcome {
 /// later lifecycle writes through. Runs before cleanup because a blocked
 /// plan or a declined confirmation must never create a journal or touch the
 /// destination.
-#[allow(clippy::too_many_arguments)]
 fn review_plan(
     pair_name: &str,
     pair: &crate::config::Pair,
     initial_plan: &mut plan::Plan,
     render_plan: bool,
-    allow_empty_source: bool,
-    ignore_space_check: bool,
-    yes: bool,
-    json_output: bool,
+    options: &RunOptions<'_>,
 ) -> Result<ReviewOutcome, AppError> {
-    let reporter = RunReporter::new(json_output);
+    let reporter = RunReporter::new(options.json_output);
     plan::drop_orphan_structural_deletions(initial_plan);
     plan::report_unknown_excludes(initial_plan);
     if render_plan {
@@ -476,14 +449,14 @@ fn review_plan(
     let run_warnings = crate::preconditions::check_run(
         pair,
         initial_plan,
-        allow_empty_source,
-        ignore_space_check,
+        options.allow_empty_source,
+        options.ignore_space_check,
     )?;
     reporter.precondition_warnings(&run_warnings);
     let degradations = crate::volume::expected_degradations(&pair.destination);
     reporter.expected_degradations(&degradations);
 
-    if !yes && !reporter.confirm()? {
+    if !options.yes && !reporter.confirm()? {
         reporter.cancelled();
         return Ok(ReviewOutcome::ExitEarly(EXIT_OK));
     }
@@ -524,21 +497,22 @@ fn review_plan(
         },
         ..RunStats::default()
     };
-    Ok(ReviewOutcome::Proceed {
+    Ok(ReviewOutcome::Proceed(RunSession {
         journal,
         reporter,
         stats,
-    })
+    }))
 }
 
 /// Aggregates the run summary and computes the process exit code from the
 /// final counts. Called exactly once, after dispatch (or after an early
 /// cleanup abort), so every path shares one place that writes the summary.
-fn finalize(
-    journal: &mut Journal,
-    reporter: &RunReporter,
-    stats: &RunStats,
-) -> Result<i32, AppError> {
+fn finalize(session: &mut RunSession) -> Result<i32, AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
     journal.summary(stats).map_err(journal_runtime_error)?;
     reporter.summary(journal.run_id(), stats)?;
     if stats.counts.failed == 0 {
@@ -557,10 +531,13 @@ fn dispatch(
     plan: &plan::Plan,
     permanent_delete: bool,
     full_verify: bool,
-    journal: &mut Journal,
-    reporter: &RunReporter,
-    stats: &mut RunStats,
+    session: &mut RunSession,
 ) -> Result<(), AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
     let mut completed_structural_deletes = std::collections::BTreeSet::new();
     let mut started_structural_deletes = std::collections::BTreeSet::new();
     for (operation, action) in plan
@@ -766,10 +743,13 @@ fn cleanup_stray_temps(
     source: &Path,
     destination: &Path,
     strays: &[PathBuf],
-    journal: &mut Journal,
-    reporter: &RunReporter,
-    stats: &mut RunStats,
+    session: &mut RunSession,
 ) -> Result<CleanupOutcome, AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
     for stray in strays {
         crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         let action = Action {
@@ -838,10 +818,13 @@ fn reconcile_plan(
     pair_name: &str,
     excludes: &[String],
     initial_plan: &plan::Plan,
-    journal: &mut Journal,
-    reporter: &RunReporter,
-    stats: &mut RunStats,
+    session: &mut RunSession,
 ) -> Result<(crate::config::Pair, plan::Plan), AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
     let (pair, mut plan) = plan::build(config_path, pair_name, excludes)?;
     stats.discovered_after_review = discovered_after_review(initial_plan, &plan);
     let missing = missing_reviewed_actions(initial_plan, &plan);
@@ -2153,25 +2136,27 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
 
         with_isolated_home_env(home.path(), || {
-            let mut journal =
-                Journal::create("cleanup-success-pair", destination_dir.path()).unwrap();
+            let journal = Journal::create("cleanup-success-pair", destination_dir.path()).unwrap();
             let reporter = RunReporter::new(false);
-            let mut stats = RunStats::default();
+            let stats = RunStats::default();
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
 
             let outcome = cleanup_stray_temps(
                 source_dir.path(),
                 destination_dir.path(),
                 std::slice::from_ref(&stray),
-                &mut journal,
-                &reporter,
-                &mut stats,
+                &mut session,
             )
             .unwrap();
 
             assert!(matches!(outcome, CleanupOutcome::Continue));
             assert!(!destination_dir.path().join(&stray).exists());
-            assert_eq!(stats.counts.done, 1);
-            assert_eq!(stats.counts.failed, 0);
+            assert_eq!(session.stats.counts.done, 1);
+            assert_eq!(session.stats.counts.failed, 0);
         });
     }
 
@@ -2186,23 +2171,25 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
 
         with_isolated_home_env(home.path(), || {
-            let mut journal =
-                Journal::create("cleanup-failure-pair", destination_dir.path()).unwrap();
+            let journal = Journal::create("cleanup-failure-pair", destination_dir.path()).unwrap();
             let reporter = RunReporter::new(false);
-            let mut stats = RunStats::default();
+            let stats = RunStats::default();
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
 
             let outcome = cleanup_stray_temps(
                 source_dir.path(),
                 destination_dir.path(),
                 std::slice::from_ref(&stray),
-                &mut journal,
-                &reporter,
-                &mut stats,
+                &mut session,
             )
             .unwrap();
 
             assert!(matches!(outcome, CleanupOutcome::Abort));
-            assert_eq!(stats.counts.failed, 1);
+            assert_eq!(session.stats.counts.failed, 1);
             assert!(
                 destination_dir.path().join(&stray).exists(),
                 "a failed removal must leave the stray in place"
@@ -2233,23 +2220,26 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
 
         with_isolated_home_env(home.path(), || {
-            let mut journal = Journal::create("reconcile-pair", destination_dir.path()).unwrap();
+            let journal = Journal::create("reconcile-pair", destination_dir.path()).unwrap();
             let reporter = RunReporter::new(false);
-            let mut stats = RunStats::default();
+            let stats = RunStats::default();
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
 
             let (_, plan) = reconcile_plan(
                 &config_path,
                 "reconcile-pair",
                 &[],
                 &initial_plan,
-                &mut journal,
-                &reporter,
-                &mut stats,
+                &mut session,
             )
             .unwrap();
 
             assert_eq!(plan.copies, initial_plan.copies);
-            assert_eq!(stats.discovered_after_review, 1);
+            assert_eq!(session.stats.discovered_after_review, 1);
         });
     }
 
@@ -2273,34 +2263,30 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
 
         with_isolated_home_env(home.path(), || {
-            let mut journal = Journal::create("dispatch-pair", destination_dir.path()).unwrap();
+            let journal = Journal::create("dispatch-pair", destination_dir.path()).unwrap();
             let reporter = RunReporter::new(false);
-            let mut stats = RunStats {
+            let stats = RunStats {
                 counts: Counts {
                     planned: plan.copies.len(),
                     ..Counts::default()
                 },
                 ..RunStats::default()
             };
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
 
-            dispatch(
-                &pair,
-                &plan,
-                false,
-                false,
-                &mut journal,
-                &reporter,
-                &mut stats,
-            )
-            .unwrap();
+            dispatch(&pair, &plan, false, false, &mut session).unwrap();
 
             assert_eq!(
                 fs::read_to_string(destination_dir.path().join("a.txt")).unwrap(),
                 "hello"
             );
-            assert_eq!(stats.counts.done, 1);
-            assert_eq!(stats.counts.copied, 1);
-            assert_eq!(stats.counts.failed, 0);
+            assert_eq!(session.stats.counts.done, 1);
+            assert_eq!(session.stats.counts.copied, 1);
+            assert_eq!(session.stats.counts.failed, 0);
         });
     }
 }
