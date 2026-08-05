@@ -198,3 +198,27 @@ The skill does not fabricate a `restore` command; never invent this invocation.
 ### Resume request ("pick up where it left off" after an interruption)
 
 Refuse the request as asked — there is no mid-file resume in this product, the sense `CONTEXT.md`'s Convergence entry names only to reject. The Journal (ADR-0007) is a forensic, historical record of what happened on past runs; it is never copy authority and never decides what the next run copies. Tell the human the correct next step is to rerun the Folder pair: its own fresh scan converges on the correct destination state — one rerun, nothing replayed from the Journal, no manual repair.
+
+## When a Run cannot start — exit 3 and exit 64
+
+Two ways a Run never reaches the confirmation gate or the stream `## Run — review, confirm, stream` describes: the reviewed plan itself cannot execute, or the invocation was malformed before any command logic ran. Neither is exit 2's Run precondition abort or exit 4's mid-run interruption — the distinction is *when* each check fires, not how "blocked" happens to sound next to "interrupted".
+
+### Exit 3 — blocked plan (`src/error.rs::EXIT_BLOCKED_PLAN`, 3)
+
+`EXIT_BLOCKED_PLAN`'s doc comment: "The reviewed plan contains an included error action and cannot run." `src/run.rs::review_plan` checks the plan's error list before the confirmation gate `## Run` already describes — satisfied there by the human's chat "yes" plus the agent's own `--yes` — is even consulted, and returns early on that check alone while an error action is still included. Per ADR-0003 §5, an included plan error "blocks confirmation while included: the user must exclude the row … or resolve it at the source. No auto-skip-with-warning." Exit 3 is what that blocking looks like from outside: the plan an agent normally runs under `--yes` turned out to contain a row the binary refuses to execute.
+
+Concretely, a plan error arrives as its own `op: "error"` row inside the same `vibefilesync.plan/v1` stream `## Compare` already parses (`src/plan.rs::PlanError`), carrying a `path` and a `reason`. That row is "the new failed action" the acceptance criterion means.
+
+**No Run.** `review_plan`'s error check runs before any journal is opened, so exit 3 means mutation never started — not a partial one. On exit 3, send the human back to `## Compare` with that error row surfaced, so they can exclude it or fix it at the source and re-plan; this section does not re-describe the two-sided table or the confirm step, both of which belong to `## Compare` and `## Run`.
+
+Distinguish from its neighbours, since all three read as "the run didn't happen":
+
+- Exit 2 (sibling #91's) is a Run precondition failing at invocation time — a different check, on different grounds, than an error already sitting in the plan.
+- Exit 4 (sibling #90's) happens only after a journal already exists — a run that started and could not finish reliably.
+- Exit 3 is earlier than both: the check that produces it runs before the journal exists and before the confirmation gate is reached, so it is not a mutation gone wrong — it is a plan that never qualified to run.
+
+### Exit 64 — usage (`src/error.rs::EXIT_USAGE`, 64)
+
+`EXIT_USAGE` covers a malformed invocation: an unparseable CLI invocation caught before any command runs (`src/main.rs`), and `AppError::Usage` cases raised deeper in — a bad, duplicate, or missing pair name, or a non-existent source/destination path.
+
+**Report and stop — no retry, no override offer.** On exit 64, report the usage error text to the human as written and stop there. Do not retry the same invocation unmodified, and do not offer any of the per-run overrides `## Run`'s sibling sections cover (`--permanent-delete`, `--allow-empty-source`, `--ignore-space-check`) — none of them addresses a malformed invocation, and offering one here would wrongly imply exit 64 is a Run precondition that can be bypassed the way exit 2 can be.
