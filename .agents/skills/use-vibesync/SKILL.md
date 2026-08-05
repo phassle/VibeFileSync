@@ -16,7 +16,7 @@ Prefer the `vibesync` binary on `PATH`. Where it is not installed, fall back to 
 
 This skill assumes `CONTEXT.md` and the ADRs below; consult them rather than restating their content here:
 
-- `docs/adr/0002-run-preconditions.md` — abort-by-default run preconditions and volume-identity guards.
+- `docs/adr/0002-run-preconditions.md` — abort-by-default Run preconditions: mount state, volume identity, free space.
 - `docs/adr/0003-dryrun-diff-and-review.md` — review-first Dry-run/Run and the human/NDJSON diff shape.
 - `docs/adr/0004-cli-surface.md` — command grammar and exit-code taxonomy.
 - `docs/adr/0007-journal-design.md` — the Journal as forensic record, not resume authority.
