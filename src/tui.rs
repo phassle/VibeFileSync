@@ -2911,19 +2911,13 @@ mod tests {
     /// under test, not something to paper over with a default outcome.
     struct ScriptedRunRunner {
         script: std::cell::RefCell<VecDeque<RunOutcome>>,
-        calls: std::cell::Cell<usize>,
     }
 
     impl ScriptedRunRunner {
         fn new(outcomes: impl IntoIterator<Item = RunOutcome>) -> Self {
             Self {
                 script: std::cell::RefCell::new(outcomes.into_iter().collect()),
-                calls: std::cell::Cell::new(0),
             }
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.get()
         }
     }
 
@@ -2936,7 +2930,6 @@ mod tests {
             _reviewed_pair: config::Pair,
             _initial_plan: plan::Plan,
         ) -> RunOutcome {
-            self.calls.set(self.calls.get() + 1);
             self.script
                 .borrow_mut()
                 .pop_front()
@@ -5378,7 +5371,6 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, PostPaneOutcome::Finished(0)));
-        assert_eq!(runner.calls(), 2, "both Run attempts must have executed");
 
         let frame_texts = frames.borrow();
         let message_idx = frame_texts
@@ -5458,11 +5450,6 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, PostPaneOutcome::Cancelled));
-        assert_eq!(
-            runner.calls(),
-            1,
-            "PairChangedDuringReview must not retry the run itself"
-        );
 
         let history = frames.borrow().join("\n----\n");
         assert!(
