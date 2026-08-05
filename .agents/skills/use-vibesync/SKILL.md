@@ -24,6 +24,12 @@ This skill assumes `CONTEXT.md` and the ADRs below; consult them rather than res
 - `docs/adr/0010-commander-two-sided-review.md` — the TUI's two-sided action table.
 - `docs/adr/0011-scripted-tui-input-synchronisation.md` — scripted TUI input rendezvous.
 
+An agent that reaches this skill through the installed engineering skill set also has this repository's issue
+tracker to hand. Where a Run's outcome is worth recording — a Run precondition that keeps firing, an action
+that fails on every rerun — follow `docs/agents/issue-tracker.md` for the issue conventions rather than
+inventing a format here. Filing is itself a mutation of something outside the Folder pair, so it takes
+the same explicit human "yes" as a Run: this skill never opens or comments on an issue on its own initiative.
+
 ## Add a Folder pair
 
 Adding a **new** Folder pair does not mutate the destination, so it runs immediately: no review, no
