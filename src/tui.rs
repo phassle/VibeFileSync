@@ -30,6 +30,7 @@ use crate::config::{self, Mode};
 use crate::error::{AppError, EXIT_OK};
 use crate::pair;
 use crate::preconditions::{self, VolumeState};
+use crate::structural_conflict;
 use crate::volume;
 use crate::{plan, run as run_engine};
 
@@ -740,7 +741,7 @@ impl ReviewModel {
             + reviewed.strays.len();
         reviewed.excluded += before - after;
         reviewed.unknown_excludes.clear();
-        plan::drop_orphan_structural_deletions(&mut reviewed);
+        structural_conflict::drop_orphan_structural_deletions(&mut reviewed);
         reviewed
     }
 
@@ -766,7 +767,7 @@ impl ReviewModel {
             }
             row.included = !row.included;
         }
-        self.reconcile_structural_dependencies();
+        self.apply_structural_dependency_rule();
     }
 
     /// `a`/`A` for all/none is the parent spec's own Review key map — despite
@@ -787,7 +788,7 @@ impl ReviewModel {
                 row.included = true;
             }
         }
-        self.reconcile_structural_dependencies();
+        self.apply_structural_dependency_rule();
     }
 
     /// `A`: exclude every row that can be excluded — Cleanup stays included
@@ -798,28 +799,34 @@ impl ReviewModel {
                 row.included = false;
             }
         }
-        self.reconcile_structural_dependencies();
+        self.apply_structural_dependency_rule();
     }
 
     /// A structurally-conflicting delete can only stay included alongside
     /// the copy it depends on; dropping that copy's inclusion (by any of
-    /// `toggle`, `select_all`, `select_none`) must drop the delete too, so
-    /// this is shared by all three instead of duplicated per caller.
-    fn reconcile_structural_dependencies(&mut self) {
+    /// `toggle`, `select_all`, `select_none`) must drop the delete too. The
+    /// rule itself lives in `structural_conflict`, not here (ADR-0010: the
+    /// TUI gains no diff logic of its own) — this just applies its verdict
+    /// to the rows, shared by all three callers instead of duplicated.
+    fn apply_structural_dependency_rule(&mut self) {
         let included_copies: Vec<String> = self
             .rows
             .iter()
             .filter(|row| row.included && row.operation == Operation::Copy)
             .map(|row| row.path.clone())
             .collect();
+        let kept: std::collections::HashSet<String> =
+            structural_conflict::included_structural_deletes(
+                self.rows.iter().filter_map(|row| {
+                    row.structural_conflict
+                        .map(|conflict| (row.path.clone(), conflict))
+                }),
+                &included_copies,
+            )
+            .into_iter()
+            .collect();
         for row in &mut self.rows {
-            let dependency_present = match row.structural_conflict {
-                Some(conflict) => included_copies
-                    .iter()
-                    .any(|copy| conflict.has_dependent_copy(Path::new(&row.path), Path::new(copy))),
-                None => true,
-            };
-            if !dependency_present {
+            if row.structural_conflict.is_some() && !kept.contains(&row.path) {
                 row.included = false;
             }
         }

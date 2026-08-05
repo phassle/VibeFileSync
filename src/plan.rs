@@ -45,15 +45,6 @@ pub enum StructuralConflict {
     DestinationDirectory,
 }
 
-impl StructuralConflict {
-    pub(crate) fn has_dependent_copy(self, deletion: &Path, copy: &Path) -> bool {
-        match self {
-            Self::DestinationDirectory => copy == deletion,
-            Self::DestinationFile => copy.starts_with(deletion),
-        }
-    }
-}
-
 /// Equality is whole-value and field-wise; `Eq` and `Hash` derive from the
 /// same fields, so they agree with the `PartialEq` this type has always had.
 /// Reconciliation depends on that agreement: it indexes whole `Action`
@@ -356,27 +347,6 @@ pub(crate) fn report_unknown_excludes(plan: &Plan) {
     for excluded in &plan.unknown_excludes {
         eprintln!("vibesync: exclude path not found in plan: {excluded}");
     }
-}
-
-fn structural_dependency_satisfied(deletion: &Action, copies: &[Action]) -> bool {
-    match deletion.structural_conflict {
-        Some(conflict) => copies
-            .iter()
-            .any(|copy| conflict.has_dependent_copy(&deletion.rel_path, &copy.rel_path)),
-        None => true,
-    }
-}
-
-/// A structural delete exists only to unblock a reviewed Publish. If review
-/// filtering or reconciliation removes every dependent COPY, the delete must
-/// disappear too so destination content is never archived on its own.
-pub(crate) fn drop_orphan_structural_deletions(plan: &mut Plan) -> usize {
-    let before = plan.deletes.len();
-    plan.deletes
-        .retain(|deletion| structural_dependency_satisfied(deletion, &plan.copies));
-    let removed = before - plan.deletes.len();
-    plan.excluded += removed;
-    removed
 }
 
 /// Classifies and records one source entry for both buffered human plans and
