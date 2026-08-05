@@ -872,6 +872,7 @@ impl ReviewRow {
 pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppError> {
     ensure_interactive()?;
     let cfg = config::load(config_path)?;
+    let runner = EngineRunRunner;
 
     // With a pair named on the command line the working directory is never
     // consulted, so the same invocation behaves identically wherever it is
@@ -880,7 +881,7 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
         if !cfg.pairs.contains_key(name) {
             return Err(AppError::Usage(format!("pair '{name}' not found")));
         }
-        return run_pair_flow(config_path, name, None);
+        return run_pair_flow(config_path, name, None, &runner);
     }
 
     let (seed_dir, seed_notice) = seed_directory();
@@ -897,7 +898,7 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
     match matches.len() {
         0 if cfg.pairs.is_empty() => show_seeded_pane(&seed_dir, seed_notice.as_deref()),
         0 => match select_pair(config_path, &[])? {
-            Some(name) => run_pair_flow(config_path, &name, seed_notice),
+            Some(name) => run_pair_flow(config_path, &name, seed_notice, &runner),
             None => Ok(EXIT_OK),
         },
         1 => {
@@ -910,10 +911,10 @@ pub fn run(config_path: &Path, requested_pair: Option<&str>) -> Result<i32, AppE
                 Some(seed_notice) => format!("{seed_notice} {match_notice}"),
                 None => match_notice,
             };
-            run_pair_flow(config_path, &name, Some(notice))
+            run_pair_flow(config_path, &name, Some(notice), &runner)
         }
         _ => match select_pair(config_path, &matches)? {
-            Some(name) => run_pair_flow(config_path, &name, seed_notice),
+            Some(name) => run_pair_flow(config_path, &name, seed_notice, &runner),
             None => Ok(EXIT_OK),
         },
     }
@@ -1039,6 +1040,34 @@ fn draw_seeded_pane(
     frame.render_widget(Paragraph::new("q quit · ? help"), footer);
 }
 
+/// Injected so `run_pair_flow` drives the reviewed plan through the engine
+/// via a seam, mirroring `Scanner`/`Events` one stage up (issue #114).
+trait RunRunner {
+    fn run_reviewed(
+        &self,
+        config_path: &Path,
+        pair_name: &str,
+        options: run_engine::RunOptions<'_>,
+        reviewed_pair: config::Pair,
+        initial_plan: plan::Plan,
+    ) -> RunOutcome;
+}
+
+struct EngineRunRunner;
+
+impl RunRunner for EngineRunRunner {
+    fn run_reviewed(
+        &self,
+        config_path: &Path,
+        pair_name: &str,
+        options: run_engine::RunOptions<'_>,
+        reviewed_pair: config::Pair,
+        initial_plan: plan::Plan,
+    ) -> RunOutcome {
+        run_engine::run_reviewed(config_path, pair_name, options, reviewed_pair, initial_plan)
+    }
+}
+
 /// Drives Compare, Review, Confirm, Run and Result for one already-chosen
 /// Folder pair inside a single, continuously held alternate-screen session,
 /// so Run-precondition warnings, expected degradations and
@@ -1048,6 +1077,7 @@ fn run_pair_flow(
     config_path: &Path,
     pair_name: &str,
     startup_notice: Option<String>,
+    runner: &impl RunRunner,
 ) -> Result<i32, AppError> {
     let mut session = TerminalSession::start().map_err(tui_error)?;
     let mut events = CrosstermEvents::default();
@@ -1127,7 +1157,7 @@ fn run_pair_flow(
             let reviewed_pair = model.pair.clone();
             let reviewed_plan = model.reviewed_plan(&excludes);
 
-            let run_result = run_engine::run_reviewed(
+            let run_result = runner.run_reviewed(
                 config_path,
                 pair_name,
                 run_engine::RunOptions {
