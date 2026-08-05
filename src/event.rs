@@ -11,6 +11,17 @@ use crate::failure::FailureReason;
 use crate::journal::{Operation, RunStats};
 use crate::plan::{Action, Plan};
 
+/// The public run stream's own schema, versioned per ADR-0004's
+/// additive-only contract. The sole owner of the literal so no other module
+/// needs to repeat it.
+pub const RUN_SCHEMA: &str = "vibefilesync.run/v1";
+
+/// A constructed run/journal event. `serde_json::Value`'s default `Map` is a
+/// `BTreeMap` (this crate does not enable serde_json's `preserve_order`
+/// feature), so any two constructors that emit the same keys serialize those
+/// keys in the same (alphabetical) order regardless of insertion order.
+pub type Event = Value;
+
 #[derive(Clone, Copy)]
 pub struct Context<'a> {
     pub schema: &'a str,
@@ -64,6 +75,33 @@ pub fn run_start(
     })
 }
 
+/// The public run stream's `run_start` additionally records the mode and
+/// the plan being executed (ADR-0004 §4); the retained Journal's
+/// `run_start` does not, so this stays a distinct constructor from the one
+/// above rather than a shared one with optional fields.
+pub fn run_run_start(
+    context: Context<'_>,
+    pair_name: &str,
+    pair: &crate::config::Pair,
+    warnings: &[String],
+    degradations: &[&str],
+    plan: &Plan,
+) -> Value {
+    let mut event = run_start(
+        context,
+        pair_name,
+        &pair.source,
+        &pair.destination,
+        warnings,
+        degradations,
+    );
+    let planned_actions = planned_actions(plan);
+    event["mode"] = json!(pair.mode);
+    event["planned"] = planned_actions.len().into();
+    event["planned_actions"] = planned_actions.into();
+    event
+}
+
 pub fn planned_actions(plan: &Plan) -> Vec<Value> {
     let planned = |operation: Operation, action: &Action| {
         json!({
@@ -108,6 +146,17 @@ pub fn action_start(context: Context<'_>, operation: Operation, action: &Action)
     json!({
         "schema": context.schema, "type": "action_start", "run_id": context.run_id,
         "op": operation, "path": path_text(&action.rel_path), "bytes": action.bytes,
+    })
+}
+
+/// Throttled progress for a large in-flight COPY/UPDATE (`PROGRESS_THRESHOLD`
+/// in `run.rs`). `bytes` is clamped to `action.bytes` so a final callback
+/// racing the last chunk never reports more than the planned total.
+pub fn progress(context: Context<'_>, operation: Operation, action: &Action, bytes: u64) -> Value {
+    json!({
+        "schema": context.schema, "type": "progress", "run_id": context.run_id,
+        "op": operation, "path": path_text(&action.rel_path),
+        "bytes": bytes.min(action.bytes), "total_bytes": action.bytes,
     })
 }
 
@@ -217,6 +266,37 @@ mod tests {
             row["warnings"],
             json!([{"code":"metadata_mismatch","detail":"modified time differs"}])
         );
+    }
+
+    fn run_context() -> Context<'static> {
+        Context {
+            schema: RUN_SCHEMA,
+            run_id: "20260716T120000Z",
+        }
+    }
+
+    #[test]
+    fn progress_matches_the_hand_built_run_stream_literal() {
+        let event = progress(run_context(), Operation::Copy, &action(), 20);
+
+        // The exact literal that lived inline in `run.rs::RunReporter::progress`
+        // before this constructor existed; an independent source of truth for
+        // the shape this function must keep producing.
+        let expected: Value = json!({
+            "schema": "vibefilesync.run/v1", "type": "progress",
+            "run_id": "20260716T120000Z", "op": "copy", "path": "photo.jpg",
+            "bytes": 20, "total_bytes": 42,
+        });
+
+        assert_eq!(event, expected);
+    }
+
+    #[test]
+    fn progress_clamps_bytes_to_the_planned_total() {
+        let event = progress(run_context(), Operation::Copy, &action(), 1_000);
+
+        assert_eq!(event["bytes"], 42);
+        assert_eq!(event["total_bytes"], 42);
     }
 
     #[test]

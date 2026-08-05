@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
-use crate::event::{MetadataWarning, VerificationTier};
+use crate::event::{Context, Event, MetadataWarning, VerificationTier, RUN_SCHEMA};
 use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
@@ -23,7 +23,6 @@ const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 18
 const F_FULLFSYNC: libc::c_int = 51;
 const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-const RUN_SCHEMA: &str = "vibefilesync.run/v1";
 const COPYFILE_STATE_STATUS_CB: u32 = 6;
 const COPYFILE_STATE_STATUS_CTX: u32 = 7;
 const COPYFILE_STATE_COPIED: u32 = 8;
@@ -82,232 +81,250 @@ pub struct RunOptions<'a> {
     pub excludes: &'a [String],
 }
 
-enum RunReporter {
-    Human,
-    Json,
+/// Where a human-facing line goes; chosen by the call site the way the
+/// original per-message methods each hard-coded a stream, not by the
+/// adapter (an adapter that renders text always honours the stream it is
+/// given; one that doesn't render text ignores it either way).
+enum Stream {
+    Stdout,
+    Stderr,
 }
 
-impl RunReporter {
-    fn new(json: bool) -> Self {
-        if json {
-            Self::Json
-        } else {
-            Self::Human
-        }
+/// The narrowed reporter seam (issue #112): every wire event goes through
+/// `emit`, every human-only line through `emit_lines`, and the one seam that
+/// reads from stdin stays `confirm`. `cancelled` and `is_json` are the two
+/// documented exceptions load-bearing on the wire/UX contract:
+/// - `cancelled` is the only line Json ever renders, and it (deliberately)
+///   goes to stderr while Human's goes to stdout, so it cannot be reduced to
+///   an adapter-uniform `emit_lines` call without a caller-chosen stream
+///   changing per adapter, which `emit_lines` does not do.
+/// - `is_json` is not a rendered message at all — the copy loop queries it
+///   to decide whether to report byte-level progress during a copy.
+trait Reporter {
+    fn emit(&self, event: Event) -> Result<(), AppError>;
+    fn emit_lines(&self, stream: Stream, lines: &[String]);
+    fn confirm(&self) -> Result<bool, AppError>;
+    fn cancelled(&self);
+    fn is_json(&self) -> bool;
+}
+
+fn new_reporter(json: bool) -> Box<dyn Reporter> {
+    if json {
+        Box::new(JsonReporter)
+    } else {
+        Box::new(HumanReporter)
+    }
+}
+
+struct HumanReporter;
+
+impl Reporter for HumanReporter {
+    fn emit(&self, _event: Event) -> Result<(), AppError> {
+        Ok(())
     }
 
-    fn is_json(&self) -> bool {
-        matches!(self, Self::Json)
-    }
-
-    fn plan(&self, plan: &plan::Plan, pair: &str, mode: crate::config::Mode) {
-        if matches!(self, Self::Human) {
-            print!("{}", plan::render(plan, pair, mode));
-        }
-    }
-
-    fn precondition_warnings(&self, warnings: &[String]) {
-        if matches!(self, Self::Human) {
-            for warning in warnings {
-                eprintln!("{warning}");
+    fn emit_lines(&self, stream: Stream, lines: &[String]) {
+        match stream {
+            Stream::Stdout => {
+                for line in lines {
+                    println!("{line}");
+                }
             }
-        }
-    }
-
-    fn expected_degradations(&self, degradations: &[&str]) {
-        if matches!(self, Self::Human) && !degradations.is_empty() {
-            eprintln!(
-                "vibesync: expected destination degradations: {}",
-                degradations.join(", ")
-            );
-        }
-    }
-
-    fn blocked(&self, errors: usize) {
-        if matches!(self, Self::Human) {
-            eprintln!("vibesync: run blocked by {errors} plan error(s)");
-        }
-    }
-
-    fn cancelled(&self) {
-        match self {
-            Self::Human => println!("Run cancelled; destination unchanged."),
-            Self::Json => eprintln!("Run cancelled; destination unchanged."),
+            Stream::Stderr => {
+                for line in lines {
+                    eprintln!("{line}");
+                }
+            }
         }
     }
 
     fn confirm(&self) -> Result<bool, AppError> {
-        match self {
-            Self::Json => {
-                eprint!("Proceed with COPY actions? [y/N] ");
-                io::stderr().flush().map_err(io_error)?;
-            }
-            Self::Human => {
-                print!("Proceed with COPY actions? [y/N] ");
-                io::stdout().flush().map_err(io_error)?;
-            }
+        print!("Proceed with COPY actions? [y/N] ");
+        io::stdout().flush().map_err(io_error)?;
+        read_confirmation()
+    }
+
+    fn cancelled(&self) {
+        println!("Run cancelled; destination unchanged.");
+    }
+
+    fn is_json(&self) -> bool {
+        false
+    }
+}
+
+struct JsonReporter;
+
+impl Reporter for JsonReporter {
+    fn emit(&self, event: Event) -> Result<(), AppError> {
+        crate::ndjson::stdout(&event)
+    }
+
+    fn emit_lines(&self, _stream: Stream, _lines: &[String]) {}
+
+    fn confirm(&self) -> Result<bool, AppError> {
+        eprint!("Proceed with COPY actions? [y/N] ");
+        io::stderr().flush().map_err(io_error)?;
+        read_confirmation()
+    }
+
+    fn cancelled(&self) {
+        eprintln!("Run cancelled; destination unchanged.");
+    }
+
+    fn is_json(&self) -> bool {
+        true
+    }
+}
+
+/// In-process test adapter: captures every emitted `Event` in order instead
+/// of writing anywhere, so a test can assert on the reporter seam itself
+/// rather than on process stdout.
+#[cfg(test)]
+struct CaptureReporter {
+    events: std::cell::RefCell<Vec<Event>>,
+}
+
+#[cfg(test)]
+impl CaptureReporter {
+    fn new() -> Self {
+        Self {
+            events: std::cell::RefCell::new(Vec::new()),
         }
-        let mut response = String::new();
-        io::stdin().read_line(&mut response).map_err(io_error)?;
-        Ok(matches!(
-            response.trim().to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        ))
     }
 
-    fn run_start(
-        &self,
-        run_id: &str,
-        pair_name: &str,
-        pair: &crate::config::Pair,
-        warnings: &[String],
-        plan: &plan::Plan,
-    ) -> Result<(), AppError> {
-        let mut event = crate::event::run_start(
-            crate::event::Context {
-                schema: RUN_SCHEMA,
-                run_id,
-            },
-            pair_name,
-            &pair.source,
-            &pair.destination,
-            warnings,
-            &crate::volume::expected_degradations(&pair.destination),
-        );
-        event["mode"] = serde_json::json!(pair.mode);
-        let planned_actions = crate::event::planned_actions(plan);
-        event["planned"] = planned_actions.len().into();
-        event["planned_actions"] = planned_actions.into();
-        self.json(event)
+    fn events(&self) -> Vec<Event> {
+        self.events.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+impl Reporter for CaptureReporter {
+    fn emit(&self, event: Event) -> Result<(), AppError> {
+        self.events.borrow_mut().push(event);
+        Ok(())
     }
 
-    fn action_start(
-        &self,
-        run_id: &str,
-        operation: Operation,
-        action: &Action,
-    ) -> Result<(), AppError> {
-        self.json(crate::event::action_start(
-            crate::event::Context {
-                schema: RUN_SCHEMA,
-                run_id,
-            },
+    fn emit_lines(&self, _stream: Stream, _lines: &[String]) {}
+
+    fn confirm(&self) -> Result<bool, AppError> {
+        Ok(true)
+    }
+
+    fn cancelled(&self) {}
+
+    fn is_json(&self) -> bool {
+        true
+    }
+}
+
+fn read_confirmation() -> Result<bool, AppError> {
+    let mut response = String::new();
+    io::stdin().read_line(&mut response).map_err(io_error)?;
+    Ok(matches!(
+        response.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn context(run_id: &str) -> Context<'_> {
+    Context {
+        schema: RUN_SCHEMA,
+        run_id,
+    }
+}
+
+/// `action_start` chains a zero-progress `progress` event immediately after
+/// for any large COPY/UPDATE (`PROGRESS_THRESHOLD`), matching the pre-#112
+/// `RunReporter::action_start` behaviour; every call site shares this rather
+/// than repeating the threshold check.
+fn emit_action_start(
+    reporter: &dyn Reporter,
+    run_id: &str,
+    operation: Operation,
+    action: &Action,
+) -> Result<(), AppError> {
+    reporter.emit(crate::event::action_start(
+        context(run_id),
+        operation,
+        action,
+    ))?;
+    if action.bytes >= PROGRESS_THRESHOLD
+        && matches!(operation, Operation::Copy | Operation::Update)
+    {
+        reporter.emit(crate::event::progress(
+            context(run_id),
             operation,
             action,
+            0,
         ))?;
-        if action.bytes >= PROGRESS_THRESHOLD
-            && matches!(operation, Operation::Copy | Operation::Update)
-        {
-            self.progress(run_id, operation, action, 0)?;
-        }
-        Ok(())
     }
+    Ok(())
+}
 
-    fn progress(
-        &self,
-        run_id: &str,
-        operation: Operation,
-        action: &Action,
-        bytes: u64,
-    ) -> Result<(), AppError> {
-        self.json(serde_json::json!({"schema":"vibefilesync.run/v1","type":"progress","run_id":run_id,"op":operation,"path":action.rel_path.to_string_lossy(),"bytes":bytes.min(action.bytes),"total_bytes":action.bytes}))
-    }
+fn emit_action_done(
+    reporter: &dyn Reporter,
+    run_id: &str,
+    operation: Operation,
+    action: &Action,
+    safety_net: Option<&Path>,
+    warnings: &[MetadataWarning],
+    full_verify: bool,
+) -> Result<(), AppError> {
+    reporter.emit(crate::event::action_done(
+        context(run_id),
+        operation,
+        action,
+        safety_net,
+        warnings,
+        matches!(operation, Operation::Copy | Operation::Update).then_some(if full_verify {
+            VerificationTier::Full
+        } else {
+            VerificationTier::Standard
+        }),
+        true,
+    ))?;
+    let lines = warnings
+        .iter()
+        .map(|warning| {
+            format!(
+                "vibesync: {} {} warning: {}",
+                operation.as_str().to_ascii_uppercase(),
+                action.rel_path.display(),
+                warning.detail()
+            )
+        })
+        .collect::<Vec<_>>();
+    reporter.emit_lines(Stream::Stderr, &lines);
+    Ok(())
+}
 
-    fn action_done(
-        &self,
-        run_id: &str,
-        operation: Operation,
-        action: &Action,
-        safety_net: Option<&Path>,
-        warnings: &[MetadataWarning],
-        full_verify: bool,
-    ) -> Result<(), AppError> {
-        match self {
-            Self::Json => crate::ndjson::stdout(&crate::event::action_done(
-                crate::event::Context {
-                    schema: RUN_SCHEMA,
-                    run_id,
-                },
-                operation,
-                action,
-                safety_net,
-                warnings,
-                matches!(operation, Operation::Copy | Operation::Update).then_some(
-                    if full_verify {
-                        VerificationTier::Full
-                    } else {
-                        VerificationTier::Standard
-                    },
-                ),
-                true,
-            )),
-            Self::Human => {
-                for warning in warnings {
-                    eprintln!(
-                        "vibesync: {} {} warning: {}",
-                        operation.as_str().to_ascii_uppercase(),
-                        action.rel_path.display(),
-                        warning.detail()
-                    );
-                }
-                Ok(())
-            }
-        }
+fn emit_action_failed(
+    reporter: &dyn Reporter,
+    run_id: &str,
+    operation: Operation,
+    action: &Action,
+    failure: &ActionFailure,
+) -> Result<(), AppError> {
+    reporter.emit(crate::event::action_failed(
+        context(run_id),
+        operation,
+        action,
+        failure.reason(),
+    ))?;
+    let mut lines = vec![format!(
+        "vibesync: {} {} failed: {failure}",
+        operation.as_str().to_ascii_uppercase(),
+        action.rel_path.display()
+    )];
+    if failure.reason() == FailureReason::DestinationFull {
+        lines.push(
+            "vibesync: destination full; stopped after committed files and discarded the in-progress temp"
+                .to_string(),
+        );
     }
-
-    fn action_failed(
-        &self,
-        run_id: &str,
-        operation: Operation,
-        action: &Action,
-        failure: &ActionFailure,
-    ) -> Result<(), AppError> {
-        match self {
-            Self::Json => crate::ndjson::stdout(&crate::event::action_failed(
-                crate::event::Context {
-                    schema: RUN_SCHEMA,
-                    run_id,
-                },
-                operation,
-                action,
-                failure.reason(),
-            )),
-            Self::Human => {
-                eprintln!(
-                    "vibesync: {} {} failed: {failure}",
-                    operation.as_str().to_ascii_uppercase(),
-                    action.rel_path.display()
-                );
-                if failure.reason() == FailureReason::DestinationFull {
-                    eprintln!("vibesync: destination full; stopped after committed files and discarded the in-progress temp");
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn cleaned(&self, path: &Path) {
-        if matches!(self, Self::Human) {
-            println!("Cleaned stray temp: {}", path.display());
-        }
-    }
-
-    fn summary(&self, run_id: &str, stats: &RunStats) -> Result<(), AppError> {
-        self.json(crate::event::summary(
-            crate::event::Context {
-                schema: RUN_SCHEMA,
-                run_id,
-            },
-            stats,
-        ))
-    }
-
-    fn json(&self, value: serde_json::Value) -> Result<(), AppError> {
-        if matches!(self, Self::Json) {
-            crate::ndjson::stdout(&value)?;
-        }
-        Ok(())
-    }
+    reporter.emit_lines(Stream::Stderr, &lines);
+    Ok(())
 }
 
 pub fn run(config_path: &Path, pair_name: &str, options: RunOptions<'_>) -> Result<i32, AppError> {
@@ -383,15 +400,26 @@ fn execute_reviewed_plan(
         full_verify,
         excludes,
     } = options;
-    let reporter = RunReporter::new(json_output);
+    let reporter = new_reporter(json_output);
     plan::drop_orphan_structural_deletions(&mut initial_plan);
     plan::report_unknown_excludes(&initial_plan);
     if render_plan {
-        reporter.plan(&initial_plan, pair_name, pair.mode);
+        // `emit_lines` prints each line through `println!`; `plan::render`
+        // already ends its blob in a single newline, so the trailing
+        // newline is trimmed here to avoid a doubled blank line.
+        let rendered = plan::render(&initial_plan, pair_name, pair.mode);
+        let rendered = rendered.strip_suffix('\n').unwrap_or(&rendered);
+        reporter.emit_lines(Stream::Stdout, &[rendered.to_string()]);
     }
 
     if !initial_plan.errors.is_empty() {
-        reporter.blocked(initial_plan.errors.len());
+        reporter.emit_lines(
+            Stream::Stderr,
+            &[format!(
+                "vibesync: run blocked by {} plan error(s)",
+                initial_plan.errors.len()
+            )],
+        );
         return Ok(EXIT_BLOCKED_PLAN);
     }
     let run_warnings = crate::preconditions::check_run(
@@ -400,9 +428,17 @@ fn execute_reviewed_plan(
         allow_empty_source,
         ignore_space_check,
     )?;
-    reporter.precondition_warnings(&run_warnings);
+    reporter.emit_lines(Stream::Stderr, &run_warnings);
     let degradations = crate::volume::expected_degradations(&pair.destination);
-    reporter.expected_degradations(&degradations);
+    if !degradations.is_empty() {
+        reporter.emit_lines(
+            Stream::Stderr,
+            &[format!(
+                "vibesync: expected destination degradations: {}",
+                degradations.join(", ")
+            )],
+        );
+    }
 
     if !yes && !reporter.confirm()? {
         reporter.cancelled();
@@ -423,13 +459,14 @@ fn execute_reviewed_plan(
             &degradations,
         )
         .map_err(io_error)?;
-    reporter.run_start(
-        journal.run_id(),
+    reporter.emit(crate::event::run_run_start(
+        context(journal.run_id()),
         pair_name,
         &pair,
         &run_warnings,
+        &degradations,
         &initial_plan,
-    )?;
+    ))?;
     install_interrupt_handler()?;
     blocked_signals.restore().map_err(|error| {
         AppError::Interrupted(format!("could not restore interruption signals: {error}"))
@@ -460,14 +497,15 @@ fn execute_reviewed_plan(
         journal
             .action_start(Operation::Cleanup, &action, None, None)
             .map_err(journal_runtime_error)?;
-        reporter.action_start(journal.run_id(), Operation::Cleanup, &action)?;
+        emit_action_start(&*reporter, journal.run_id(), Operation::Cleanup, &action)?;
         match fs::remove_file(pair.destination.join(stray)) {
             Ok(()) => {
                 journal
                     .action_done(Operation::Cleanup, &action, None, &[], None)
                     .map_err(journal_runtime_error)?;
                 stats.counts.done += 1;
-                reporter.action_done(
+                emit_action_done(
+                    &*reporter,
                     journal.run_id(),
                     Operation::Cleanup,
                     &action,
@@ -475,7 +513,10 @@ fn execute_reviewed_plan(
                     &[],
                     false,
                 )?;
-                reporter.cleaned(stray);
+                reporter.emit_lines(
+                    Stream::Stdout,
+                    &[format!("Cleaned stray temp: {}", stray.display())],
+                );
             }
             Err(error) => {
                 let failure = ActionFailure::from(error);
@@ -483,9 +524,15 @@ fn execute_reviewed_plan(
                 journal
                     .action_failed(Operation::Cleanup, &action, failure.reason())
                     .map_err(journal_runtime_error)?;
-                reporter.action_failed(journal.run_id(), Operation::Cleanup, &action, &failure)?;
+                emit_action_failed(
+                    &*reporter,
+                    journal.run_id(),
+                    Operation::Cleanup,
+                    &action,
+                    &failure,
+                )?;
                 journal.summary(&stats).map_err(journal_runtime_error)?;
-                reporter.summary(journal.run_id(), &stats)?;
+                reporter.emit(crate::event::summary(context(journal.run_id()), &stats))?;
                 return Ok(1);
             }
         }
@@ -514,7 +561,7 @@ fn execute_reviewed_plan(
         journal
             .action_start(*operation, action, None, None)
             .map_err(journal_runtime_error)?;
-        reporter.action_start(journal.run_id(), *operation, action)?;
+        emit_action_start(&*reporter, journal.run_id(), *operation, action)?;
         let failure = ActionFailure::new(
             FailureReason::ReconciliationChanged,
             io::Error::other("changed during reconciliation; rerun required"),
@@ -522,7 +569,7 @@ fn execute_reviewed_plan(
         journal
             .action_failed(*operation, action, failure.reason())
             .map_err(journal_runtime_error)?;
-        reporter.action_failed(journal.run_id(), *operation, action, &failure)?;
+        emit_action_failed(&*reporter, journal.run_id(), *operation, action, &failure)?;
         stats.counts.failed += 1;
     }
     for error in &plan.errors {
@@ -570,13 +617,13 @@ fn execute_reviewed_plan(
                 journal
                     .action_start(Operation::Delete, deletion, None, None)
                     .map_err(journal_runtime_error)?;
-                reporter.action_start(journal.run_id(), Operation::Delete, deletion)?;
+                emit_action_start(&*reporter, journal.run_id(), Operation::Delete, deletion)?;
             }
         }
         journal
             .action_start(operation, action, Some(&source), Some(&temp))
             .map_err(journal_runtime_error)?;
-        reporter.action_start(journal.run_id(), operation, action)?;
+        emit_action_start(&*reporter, journal.run_id(), operation, action)?;
         let mut last_progress: Option<Instant> = None;
         let mut progress = |copied: u64| -> io::Result<()> {
             crate::interrupt::check()?;
@@ -586,7 +633,12 @@ fn execute_reviewed_plan(
             };
             if copied == action.bytes || interval_elapsed {
                 reporter
-                    .progress(journal.run_id(), operation, action, copied)
+                    .emit(crate::event::progress(
+                        context(journal.run_id()),
+                        operation,
+                        action,
+                        copied,
+                    ))
                     .map_err(io::Error::other)?;
                 last_progress = Some(Instant::now());
             }
@@ -627,7 +679,8 @@ fn execute_reviewed_plan(
                     stats.counts.done += 1;
                     stats.counts.deleted += 1;
                     stats.bytes += deletion.bytes;
-                    reporter.action_done(
+                    emit_action_done(
+                        &*reporter,
                         journal.run_id(),
                         Operation::Delete,
                         deletion,
@@ -666,7 +719,8 @@ fn execute_reviewed_plan(
                 stats.counts.done += 1;
                 stats.bytes += action.bytes;
                 stats.warnings += outcome.warnings.len();
-                reporter.action_done(
+                emit_action_done(
+                    &*reporter,
                     journal.run_id(),
                     operation,
                     action,
@@ -690,13 +744,13 @@ fn execute_reviewed_plan(
                 journal
                     .action_failed(operation, action, failure.reason())
                     .map_err(journal_runtime_error)?;
-                reporter.action_failed(journal.run_id(), operation, action, &failure)?;
+                emit_action_failed(&*reporter, journal.run_id(), operation, action, &failure)?;
                 if failure.kind() != io::ErrorKind::InvalidData {
                     if let Some(deletion) = structural_delete {
-                        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
+                        fail_structural_delete(deletion, &mut journal, &*reporter, &mut stats)?;
                     }
                     journal.summary(&stats).map_err(journal_runtime_error)?;
-                    reporter.summary(journal.run_id(), &stats)?;
+                    reporter.emit(crate::event::summary(context(journal.run_id()), &stats))?;
                     return Ok(1);
                 }
             }
@@ -706,7 +760,7 @@ fn execute_reviewed_plan(
         started_structural_deletes.contains(&deletion.rel_path)
             && !completed_structural_deletes.contains(&deletion.rel_path)
     }) {
-        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
+        fail_structural_delete(deletion, &mut journal, &*reporter, &mut stats)?;
     }
     for action in plan
         .deletes
@@ -720,14 +774,14 @@ fn execute_reviewed_plan(
             &mut journal,
             permanent_delete,
             plan.directory_deletes.contains(&action.rel_path),
-            &reporter,
+            &*reporter,
             &mut stats,
         )?;
     }
 
     crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
     journal.summary(&stats).map_err(journal_runtime_error)?;
-    reporter.summary(journal.run_id(), &stats)?;
+    reporter.emit(crate::event::summary(context(journal.run_id()), &stats))?;
     if stats.counts.failed == 0 {
         Ok(EXIT_OK)
     } else {
@@ -744,7 +798,7 @@ fn install_interrupt_handler() -> Result<(), AppError> {
 fn fail_structural_delete(
     deletion: &Action,
     journal: &mut Journal,
-    reporter: &RunReporter,
+    reporter: &dyn Reporter,
     stats: &mut RunStats,
 ) -> Result<(), AppError> {
     stats.counts.failed += 1;
@@ -758,7 +812,13 @@ fn fail_structural_delete(
     journal
         .action_failed(Operation::Delete, deletion, FailureReason::DependencyFailed)
         .map_err(journal_runtime_error)?;
-    reporter.action_failed(journal.run_id(), Operation::Delete, deletion, &failure)
+    emit_action_failed(
+        reporter,
+        journal.run_id(),
+        Operation::Delete,
+        deletion,
+        &failure,
+    )
 }
 
 /// Indexes actions by whole value for the reconciliation comparisons below,
@@ -808,14 +868,14 @@ fn execute_delete_action(
     journal: &mut Journal,
     permanent_delete: bool,
     allow_empty_directory: bool,
-    reporter: &RunReporter,
+    reporter: &dyn Reporter,
     stats: &mut RunStats,
 ) -> Result<(), AppError> {
     let destination = pair.destination.join(&action.rel_path);
     journal
         .action_start(Operation::Delete, action, None, None)
         .map_err(journal_runtime_error)?;
-    reporter.action_start(journal.run_id(), Operation::Delete, action)?;
+    emit_action_start(reporter, journal.run_id(), Operation::Delete, action)?;
     match remove_file(
         &pair.destination,
         &destination,
@@ -857,7 +917,8 @@ fn execute_delete_action(
             stats.counts.done += 1;
             stats.counts.deleted += 1;
             stats.bytes += action.bytes;
-            reporter.action_done(
+            emit_action_done(
+                reporter,
                 journal.run_id(),
                 Operation::Delete,
                 action,
@@ -872,7 +933,13 @@ fn execute_delete_action(
             journal
                 .action_failed(Operation::Delete, action, failure.reason())
                 .map_err(journal_runtime_error)?;
-            reporter.action_failed(journal.run_id(), Operation::Delete, action, &failure)?;
+            emit_action_failed(
+                reporter,
+                journal.run_id(),
+                Operation::Delete,
+                action,
+                &failure,
+            )?;
         }
     }
     Ok(())
@@ -1651,6 +1718,66 @@ fn lock_error(error: io::Error) -> AppError {
 mod tests {
     use super::*;
     use crate::plan::StructuralConflict;
+
+    fn sample_action(rel_path: &str, bytes: u64) -> Action {
+        Action {
+            rel_path: PathBuf::from(rel_path),
+            bytes,
+            source_mtime: None,
+            old_bytes: None,
+            reason: "new".to_string(),
+            structural_conflict: None,
+        }
+    }
+
+    #[test]
+    fn capture_reporter_exposes_emitted_events_in_order() {
+        let reporter = CaptureReporter::new();
+
+        emit_action_start(
+            &reporter,
+            "20260716T120000Z",
+            Operation::Copy,
+            &sample_action("a.txt", 1),
+        )
+        .unwrap();
+        emit_action_done(
+            &reporter,
+            "20260716T120000Z",
+            Operation::Copy,
+            &sample_action("a.txt", 1),
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let events = reporter.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "action_start");
+        assert_eq!(events[0]["path"], "a.txt");
+        assert_eq!(events[1]["type"], "action_done");
+        assert_eq!(events[1]["result"], "done");
+    }
+
+    #[test]
+    fn capture_reporter_chains_progress_after_large_action_start() {
+        let reporter = CaptureReporter::new();
+
+        emit_action_start(
+            &reporter,
+            "20260716T120000Z",
+            Operation::Copy,
+            &sample_action("large.bin", PROGRESS_THRESHOLD),
+        )
+        .unwrap();
+
+        let events = reporter.events();
+        assert_eq!(events.len(), 2, "large copy chains a zero-progress event");
+        assert_eq!(events[1]["type"], "progress");
+        assert_eq!(events[1]["bytes"], 0);
+        assert_eq!(events[1]["total_bytes"], PROGRESS_THRESHOLD);
+    }
 
     fn sample_pair(destination: &Path) -> crate::config::Pair {
         crate::config::Pair {

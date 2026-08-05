@@ -2066,6 +2066,57 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
         .is_dir());
 }
 
+/// Pinned against the `vibefilesync.run/v1` stream produced by the
+/// pre-refactor `RunReporter` (issue #112): the reporter's internal seam may
+/// change, but this NDJSON shape must not. `run_id` is the run's only
+/// non-deterministic field, so it is redacted before comparison.
+#[test]
+fn run_json_output_is_byte_identical_to_the_pinned_reporter_baseline() {
+    let fx = Fixture::new();
+    fx.write_source("file.txt", "hello world");
+    fx.write_source("sub/nested.txt", "nested");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+
+    let redact_run_id = |line: &str| -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        value["run_id"] = serde_json::json!("RUN_ID");
+        value
+    };
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(redact_run_id)
+        .collect();
+
+    let source = fx.source.path().to_string_lossy().into_owned();
+    let destination = fx.destination.path().to_string_lossy().into_owned();
+    let expected: Vec<serde_json::Value> = [
+        format!(
+            r#"{{"schema":"vibefilesync.run/v1","type":"run_start","run_id":"RUN_ID","pair":"photos","source":"{source}","destination":"{destination}","warnings":["vibesync: warning: _SafetyNet/ uses 0 bytes"],"degradations":[],"mode":"mirror","planned":2,"planned_actions":[{{"op":"copy","path":"file.txt","bytes":11}},{{"op":"copy","path":"sub/nested.txt","bytes":6}}]}}"#
+        ),
+        r#"{"schema":"vibefilesync.run/v1","type":"action_start","run_id":"RUN_ID","op":"copy","path":"file.txt","bytes":11}"#.to_string(),
+        r#"{"schema":"vibefilesync.run/v1","type":"action_done","run_id":"RUN_ID","op":"copy","path":"file.txt","result":"done","bytes":11,"verified":"standard","safety_net":null,"warnings":[]}"#.to_string(),
+        r#"{"schema":"vibefilesync.run/v1","type":"action_start","run_id":"RUN_ID","op":"copy","path":"sub/nested.txt","bytes":6}"#.to_string(),
+        r#"{"schema":"vibefilesync.run/v1","type":"action_done","run_id":"RUN_ID","op":"copy","path":"sub/nested.txt","result":"done","bytes":6,"verified":"standard","safety_net":null,"warnings":[]}"#.to_string(),
+        r#"{"schema":"vibefilesync.run/v1","type":"summary","run_id":"RUN_ID","result":"success","counts":{"planned":2,"done":2,"copied":2,"updated":0,"deleted":0,"failed":0},"bytes":17,"warnings":0,"discovered_after_review":0}"#.to_string(),
+    ]
+    .iter()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect();
+
+    assert_eq!(
+        rows, expected,
+        "run --json NDJSON stream must stay byte-identical across the reporter refactor"
+    );
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn structural_replacement_gate_failure_leaves_destination_and_safetynet_untouched() {
