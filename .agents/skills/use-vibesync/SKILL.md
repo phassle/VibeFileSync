@@ -198,3 +198,37 @@ The skill does not fabricate a `restore` command; never invent this invocation.
 ### Resume request ("pick up where it left off" after an interruption)
 
 Refuse the request as asked — there is no mid-file resume in this product, the sense `CONTEXT.md`'s Convergence entry names only to reject. The Journal (ADR-0007) is a forensic, historical record of what happened on past runs; it is never copy authority and never decides what the next run copies. Tell the human the correct next step is to rerun the Folder pair: its own fresh scan converges on the correct destination state — one rerun, nothing replayed from the Journal, no manual repair.
+
+## Prune — a gated mutation
+
+Prune deletes archived versions permanently, with nothing left to fall back on afterward, so it goes
+through the same review-first mutation gate the Run section above establishes (ADR-0003, ADR-0010
+re-anchored as a chat gate): list what would be deleted, agent summary, the human's explicit chat "yes",
+then execute. Do not re-derive that gate's rationale here — see the Run section. The one difference from
+Run: Prune has no `--yes`-style flag to lean on, because Prune takes no flags at all. Every command in
+this section's gate therefore happens in chat, before the agent runs anything.
+
+1. **List.** Show the SafetyNet Run folders under the pair's destination that this Prune would delete,
+   each by its Run id. `src/run.rs::prune` walks the pair's `_SafetyNet/` directory and removes exactly the
+   directory entries whose name is a Run id (`src/journal.rs::is_run_id`); a differently named entry there —
+   a manually renamed folder, a stray file — is left alone, and so is everything outside `_SafetyNet/`,
+   including the pair's current destination content (`tests/cli.rs::prune_removes_run_folders_but_nothing_else`
+   asserts both: a `_SafetyNet` entry not shaped like a Run id survives, and destination content outside
+   `_SafetyNet` survives). `prune` has no Compare/Dry-run step of its own; build this list yourself from
+   `_SafetyNet/`'s Run-id-named entries before offering the human anything to confirm.
+2. **Summary.** Name, by Run id, what each Run folder holds — that Run's full archived set, relative paths
+   preserved, the unit Prune deletes. Make the permanence explicit: this is the only way archived versions
+   are ever deleted in v1, there is no `--permanent-delete`-style bypass to offer here (see below), and
+   nothing is recoverable afterward.
+3. **Human "yes".** Only after the human's explicit chat "yes" does the agent invoke `prune` — never on an
+   unconfirmed list.
+4. **Execute.**
+   - Real binary: `vibesync prune <pair>`
+   - Development fallback: `cargo run --locked -- prune <pair>`
+
+`prune` takes the Pair name as its only argument and accepts no flags at all — there is no
+`--permanent-delete` option on this subcommand. That flag exists only on `run`, as a per-run SafetyNet
+bypass for that run's own removals (ADR-0001, ADR-0002); it has no referent here, because everything Prune
+deletes is, by definition, already inside `_SafetyNet/` — there is no un-archived removal on this path for
+a bypass to apply to. Do not offer `--permanent-delete` on `prune` and do not invent an equivalent flag for
+it; there is nothing to bypass.
