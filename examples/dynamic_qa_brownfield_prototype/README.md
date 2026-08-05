@@ -9,7 +9,7 @@ The scenario adopts and extends `tests/cli.rs::update_mode_also_archives_a_repla
 Run from the repository root:
 
 ```sh
-cargo run --example dynamic_qa_brownfield_prototype
+cargo run --locked --example dynamic_qa_brownfield_prototype
 ```
 
 Press the displayed key followed by Return. Every action replaces the frame and exposes the complete relevant state.
