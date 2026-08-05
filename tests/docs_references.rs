@@ -23,7 +23,8 @@
 //! actually implement it. Existence is mechanical; aptness is a reading. Treat a green run
 //! as "no reference is dangling", never as "the docs are accurate".
 
-use std::collections::BTreeSet;
+use assert_cmd::Command;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -478,5 +479,354 @@ fn every_documented_section_exists() {
         missing.is_empty(),
         "documented sections and keys do not exist:\n  {}",
         missing.iter().cloned().collect::<Vec<_>>().join("\n  ")
+    );
+}
+
+/// Whether `token` documents an argument placeholder — `<pair>`, `<PATH>`, or
+/// the bracketed-optional spelling `[<pair>]` — rather than a real subcommand
+/// or flag. A placeholder can appear in its natural position (`status
+/// <pair>`), not only after a flag, so it must be recognised on its own
+/// shape, not merely by where it sits in the token stream.
+fn is_placeholder(token: &str) -> bool {
+    let inner = token
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(token);
+    inner.starts_with('<') && inner.ends_with('>') && inner.len() > 1
+}
+
+/// Whether `token` names several subcommands at once — `add|list|remove` —
+/// rather than one. This is the grammar-sketch spelling an ADR uses to show a
+/// family of siblings in a single line; it names no single invocation, so
+/// none can be resolved against `--help`, the same reasoning `is_pattern`
+/// applies to a path written as a shape rather than a reference. Kept local
+/// to the CLI-span path rather than folded into `is_pattern`, which serves
+/// path resolution from different call sites.
+fn is_alternation(token: &str) -> bool {
+    token.contains('|')
+}
+
+/// The two spellings of "run this binary" the docs use, and the arguments each
+/// carries. `vibesync <args>` is the installed binary; `cargo run --locked --
+/// <args>` is the development fallback the skill documents beside nearly every
+/// command, and the `--` separator means the same arguments follow it verbatim.
+///
+/// Recognising only the first spelling left the second unchecked, which made the
+/// fallback lines the one place in the docs where a typo could ship: they are
+/// prose to this test but a command to whoever pastes them. The prefix is matched
+/// whole and exactly, so the neighbouring `cargo build --locked` and a bare
+/// `cargo run --locked` — real commands that take no vibesync arguments — still
+/// name no invocation.
+const BINARY_SPELLINGS: &[&[&str]] = &[&["vibesync"], &["cargo", "run", "--locked", "--"]];
+
+/// The arguments a span passes to the binary, or `None` if the span does not
+/// invoke it at all. An empty argument list is `None` too: `` `vibesync` `` and
+/// `` `cargo run --locked --` `` name the binary rather than an invocation of it,
+/// and there is nothing in either to resolve.
+fn invocation_arguments(span: &str) -> Option<Vec<&str>> {
+    let tokens: Vec<&str> = span.split_whitespace().collect();
+    let arguments = BINARY_SPELLINGS.iter().find_map(|spelling| {
+        (tokens.len() > spelling.len() && &tokens[..spelling.len()] == *spelling)
+            .then(|| tokens[spelling.len()..].to_vec())
+    })?;
+    Some(arguments)
+}
+
+/// The subcommand path and `--flag`s of a documented invocation, in either
+/// spelling (`BINARY_SPELLINGS`).
+/// Subcommands are the leading run of tokens before the first token that is
+/// either a flag or a placeholder; flags are every later token that itself
+/// starts with `-`. A placeholder is never treated as a subcommand — whether
+/// it sits after a flag (documenting the flag's argument) or in its natural
+/// position (documenting a positional, e.g. `status <pair>`) — and never as a
+/// flag either. `None` for a span that isn't an invocation at all —
+/// most backticked spans are paths or symbols, not commands — and also for a
+/// span whose subcommand position is written as alternation: it names a
+/// grammar shape, not one invocation, so there is nothing here to resolve.
+fn cli_invocation(span: &str) -> Option<(Vec<&str>, Vec<&str>)> {
+    let tokens = invocation_arguments(span)?;
+    let split = tokens
+        .iter()
+        .position(|token| token.starts_with('-') || is_placeholder(token))
+        .unwrap_or(tokens.len());
+    let (subcommands, rest) = tokens.split_at(split);
+    if subcommands.iter().any(|token| is_alternation(token)) {
+        return None;
+    }
+    let flags: Vec<&str> = rest
+        .iter()
+        .copied()
+        .filter(|token| token.starts_with('-'))
+        .collect();
+    Some((subcommands.to_vec(), flags))
+}
+
+/// The two spellings must resolve to the same invocation, or the fallback lines
+/// are documentation this test only appears to check. Pinning the negative half
+/// matters as much: the prefix is `cargo run --locked --` exactly, and the
+/// neighbouring `cargo` commands must keep naming nothing.
+#[test]
+fn cli_invocation_reads_both_spellings_of_the_binary() {
+    let installed = cli_invocation("vibesync pair list --check");
+    let fallback = cli_invocation("cargo run --locked -- pair list --check");
+    assert_eq!(installed, Some((vec!["pair", "list"], vec!["--check"])));
+    assert_eq!(fallback, installed);
+
+    // The placeholder rule travels with the arguments, not with the spelling.
+    assert_eq!(
+        cli_invocation("cargo run --locked -- run <pair> --exclude <PATH>"),
+        Some((vec!["run"], vec!["--exclude"]))
+    );
+    // So does the alternation escape hatch.
+    assert_eq!(
+        cli_invocation("cargo run --locked -- pair add|list|remove"),
+        None
+    );
+
+    // Not this binary, or not an invocation of it.
+    assert_eq!(cli_invocation("cargo build --locked"), None);
+    assert_eq!(cli_invocation("cargo run --locked"), None);
+    assert_eq!(cli_invocation("cargo run -- pair list"), None);
+    assert_eq!(cli_invocation("cargo test --locked -- pair list"), None);
+    assert_eq!(cli_invocation("src/cli.rs::Command"), None);
+    // The binary named rather than invoked: nothing to resolve either way.
+    assert_eq!(cli_invocation("vibesync"), None);
+    assert_eq!(cli_invocation("cargo run --locked --"), None);
+}
+
+/// A fenced block's commands must arrive as one span each, with everything a
+/// shell line carries and an invocation does not stripped off. Without this the
+/// quickstart's whole CLI surface reads as a single opaque span and none of it is
+/// checked.
+#[test]
+fn command_spans_reads_fenced_blocks_line_by_line() {
+    let doc = "\
+Prose naming `docs/quickstart.md`.
+
+```bash
+cargo build --locked          # dev binary
+# a comment-only line
+$ vibesync pair list --check
+cargo run --locked -- pair add <name> \\
+  --source <PATH> \\
+  --mode mirror   # or: update
+```
+
+Prose again.
+";
+    let spans = command_spans(doc);
+    assert!(spans.contains(&"vibesync pair list --check".to_string()));
+    assert!(spans.contains(
+        &"cargo run --locked -- pair add <name> --source <PATH> --mode mirror".to_string()
+    ));
+    assert!(spans.contains(&"cargo build --locked".to_string()));
+    // The inline spans the other checks read are still there, unchanged.
+    assert!(spans.contains(&"docs/quickstart.md".to_string()));
+    // A comment-only line is not a command.
+    assert!(!spans.iter().any(|span| span.starts_with('#')));
+    // Prose outside the fence is not a command line.
+    assert!(!spans.iter().any(|span| span.contains("Prose")));
+}
+
+/// A trailing `# …` comment, removed. Anchored to a `#` that opens a word, so a
+/// `#` inside an argument is left alone; a comment-only line becomes empty and is
+/// dropped by the caller.
+fn without_comment(line: &str) -> &str {
+    match line.find('#') {
+        Some(at) if at == 0 || line[..at].ends_with(char::is_whitespace) => &line[..at],
+        _ => line,
+    }
+}
+
+/// The shell prompt a transcript-style example writes ahead of the command,
+/// removed. `$ vibesync run <pair>` documents the same invocation as
+/// `vibesync run <pair>`, and a parser that saw only the second would treat the
+/// first as prose.
+fn without_prompt(line: &str) -> &str {
+    ["$ ", "% ", "> "]
+        .iter()
+        .find_map(|prompt| line.strip_prefix(prompt))
+        .unwrap_or(line)
+}
+
+/// Every span a document offers as a command line: its inline `` `…` `` spans,
+/// plus each command inside a fenced code block.
+///
+/// A fenced block is where a quickstart naturally writes its commands, and
+/// `backticked` sees a whole block as one opaque span beginning with the language
+/// tag — so `docs/quickstart.md` documented the entire CLI surface without a
+/// single line of it being checked. Reading the block line by line closes that,
+/// at the cost of teaching the parser what a shell line can carry that a
+/// backticked span never does: a prompt, a trailing comment, and a `\`
+/// continuation. Lines are joined across continuations before being handed on, so
+/// a command split over four lines resolves as the one invocation it is; anything
+/// that is not an invocation of this binary falls out in `cli_invocation`.
+///
+/// Deliberately separate from `backticked` rather than folded into it. The path,
+/// symbol and section checks read `backticked` too, and they ask a different
+/// question of a span — feeding them the contents of every fenced Rust and JSON
+/// block would have them resolving code and sample output as if it were prose
+/// naming a file.
+fn command_spans(doc: &str) -> Vec<String> {
+    let mut spans = backticked(doc);
+    let mut in_fence = false;
+    let mut continued = String::new();
+    for line in doc.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continued.clear();
+            continue;
+        }
+        if !in_fence {
+            continue;
+        }
+        let line = without_prompt(without_comment(line).trim()).trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.strip_suffix('\\') {
+            Some(head) => {
+                continued.push_str(head.trim_end());
+                continued.push(' ');
+            }
+            None => {
+                let mut whole = std::mem::take(&mut continued);
+                whole.push_str(line);
+                spans.push(whole);
+            }
+        }
+    }
+    spans
+}
+
+/// `vibesync <path> --help`'s stdout, run against the real built binary —
+/// never a glob engine or a hand-maintained list of flags.
+fn help_output(path: &[&str]) -> String {
+    let mut cmd = Command::cargo_bin("vibesync").expect("binary builds");
+    cmd.args(path).arg("--help");
+    let output = cmd.output().expect("vibesync --help runs");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// One `--help` per distinct subcommand path, not per span that names it. The
+/// docs invoke a handful of paths over and over — once in each spelling for most
+/// commands, and again in the quickstart — and every repeat is a process spawn.
+/// The cache holds output, never a verdict: what `--help` says is still read
+/// fresh for each span, so nothing here can turn a failing span into a passing one.
+#[derive(Default)]
+struct HelpCache(BTreeMap<Vec<String>, String>);
+
+impl HelpCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&mut self, path: &[&str]) -> &str {
+        let key: Vec<String> = path.iter().map(|part| part.to_string()).collect();
+        self.0.entry(key).or_insert_with(|| help_output(path))
+    }
+}
+
+/// Whether `--help`'s `Commands:` block lists `name` as a subcommand.
+fn help_lists_command(help: &str, name: &str) -> bool {
+    let mut in_commands = false;
+    for line in help.lines() {
+        if line.trim_end() == "Commands:" {
+            in_commands = true;
+            continue;
+        }
+        if !in_commands {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        if line.split_whitespace().next() == Some(name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `--help`'s `Options:` block lists `flag` (bare, no `=value`).
+fn help_lists_option(help: &str, flag: &str) -> bool {
+    let mut in_options = false;
+    for line in help.lines() {
+        if line.trim_end() == "Options:" {
+            in_options = true;
+            continue;
+        }
+        if !in_options {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        if line
+            .trim_start()
+            .split(',')
+            .map(str::trim)
+            .any(|part| part == flag || part.starts_with(&format!("{flag} ")))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every documented invocation an agent doc shows — inline-backtick or fenced,
+/// installed binary or development fallback (`BINARY_SPELLINGS`) — must resolve
+/// against the real binary's own `--help`: each subcommand it names must be
+/// listed at that level, and each `--flag` it passes must be listed on that
+/// exact invocation's help. No glob engine, no invented flags, no exit-code
+/// strings the binary doesn't emit — the binary is the only source of truth.
+#[test]
+fn every_documented_cli_invocation_exists() {
+    let mut offenders = BTreeSet::new();
+    let mut helps = HelpCache::new();
+    for doc in &docs() {
+        for span in command_spans(&read(doc)) {
+            let Some((subcommands, flags)) = cli_invocation(&span) else {
+                continue;
+            };
+
+            let mut path: Vec<&str> = Vec::new();
+            let mut chain_broken = false;
+            for subcommand in &subcommands {
+                let help = helps.get(&path);
+                if !help_lists_command(help, subcommand) {
+                    let shown = if path.is_empty() {
+                        "vibesync".to_string()
+                    } else {
+                        format!("vibesync {}", path.join(" "))
+                    };
+                    offenders.insert(format!(
+                        "{doc}: `{span}` — {shown} has no `{subcommand}` subcommand"
+                    ));
+                    chain_broken = true;
+                    break;
+                }
+                path.push(subcommand);
+            }
+            if chain_broken {
+                continue;
+            }
+
+            let help = helps.get(&path);
+            for flag in &flags {
+                let bare = flag.split('=').next().unwrap_or(flag);
+                if !help_lists_option(help, bare) {
+                    offenders.insert(format!(
+                        "{doc}: `{span}` — vibesync {} has no `{bare}` option",
+                        path.join(" ")
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "documented CLI invocations do not match the real binary:\n  {}",
+        offenders.iter().cloned().collect::<Vec<_>>().join("\n  ")
     );
 }
