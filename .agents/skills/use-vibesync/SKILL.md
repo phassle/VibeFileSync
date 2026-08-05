@@ -112,3 +112,20 @@ Compare a Folder pair by running it and parsing the `vibefilesync.plan/v1` NDJSO
 Surface the pair's Sync mode from the opening `plan_start` event's `mode` field as part of the same summary, before any confirm. This is the safety point of the review, and it matters in both modes: by default every removal this table shows goes through SafetyNet on a real run, archived by rename before anything is removed — but that default can be overridden per run, so it must be visible ahead of time regardless. Destination-only removals (an object present on the destination and absent from the source) are Mirror-only; Update never produces these. But a source object structurally replacing a destination object of the other kind (a source file over a destination directory, or a source directory over a destination file) removes that destination object in both modes and is counted in `counts.delete`, so `counts.delete` can be non-zero in Update — the summary is not additive-only.
 
 This is the review surface only: parsing and rendering the summary. Confirming and running the plan is a separate step this skill does not cover here.
+
+## Exclude paths before a Run
+
+After rendering the Compare table from the unfiltered `plan --json` stream above, offer the human the
+chance to drop specific rows before any Run: let them pick one or more of the exact relative paths already
+shown in that stream's `action` events' `path` field, taken verbatim — no glob engine, no invented syntax
+(ADR-0004 §3), on `run` rather than on `plan`. A path either matches one of those printed strings exactly
+or it excludes nothing.
+
+Carry the paths the human picks forward as repeated `--exclude <PATH>` flags on the Run this shapes. Run
+mutates the destination; assembling this flag list is where this section's job ends — Run's own
+confirmation gate and event stream are a separate concern this section does not cover.
+
+- Real binary: `vibesync run <pair> --exclude <PATH> --exclude <PATH>`
+- Development fallback: `cargo run --locked -- run <pair> --exclude <PATH> --exclude <PATH>`
+
+Repeat `--exclude <PATH>` once per chosen path.
