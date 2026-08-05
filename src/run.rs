@@ -553,7 +553,7 @@ fn dispatch(
         crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
-        let structural_delete = conflicts.find_structural_delete_for(&plan, &action.rel_path);
+        let structural_delete = conflicts.find_structural_delete_for(plan, &action.rel_path);
         let temp_target = structural_delete
             .filter(|_| !destination.parent().is_some_and(Path::is_dir))
             .map(|deletion| pair.destination.join(&deletion.rel_path));
@@ -696,7 +696,7 @@ fn dispatch(
             }
         }
     }
-    for deletion in conflicts.drain_incomplete(&plan) {
+    for deletion in conflicts.drain_incomplete(plan) {
         fail_structural_delete(deletion, journal, reporter, stats)?;
     }
     for action in plan
