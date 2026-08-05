@@ -32,6 +32,7 @@ use crate::pair;
 use crate::preconditions::{self, VolumeState};
 use crate::volume;
 use crate::{plan, run as run_engine};
+use crate::run::RunOutcome;
 
 #[derive(Clone)]
 struct PairChoice {
@@ -1059,7 +1060,7 @@ fn run_pair_flow(
 
     // Carries a notice across a re-compare: a plan is read-only, so any
     // definition change discovered under it discards it visibly instead of
-    // silently reusing stale actions (see `is_pair_changed` below).
+    // silently reusing stale actions (RunOutcome::PairChangedDuringReview).
     let mut recompare_notice: Option<String> = None;
 
     'recompare: loop {
@@ -1122,56 +1123,48 @@ fn run_pair_flow(
                 reviewed_plan,
             );
 
-            // The pair lock is taken at execute, not at Compare: a collision
-            // with another run in progress returns to Review with the model's
-            // selections intact rather than tearing down the whole session.
-            if is_lock_contention(&run_result) {
-                model.screen = Screen::Actions;
-                model.message = Some(
-                    "Another run is already in progress for this pair; try again once it finishes."
-                        .to_string(),
-                );
-                continue;
+            match run_result {
+                // The pair lock is taken at execute, not at Compare: a collision
+                // with another run in progress returns to Review with the model's
+                // selections intact rather than tearing down the whole session.
+                RunOutcome::LockContention => {
+                    model.screen = Screen::Actions;
+                    model.message = Some(
+                        "Another run is already in progress for this pair; try again once it finishes."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                // The reviewed plan is read-only; a definition change underneath
+                // it (this TUI's own selector, another process, or a hand edit)
+                // must discard it visibly rather than let a stale plan reach a
+                // run or crash the session. Re-compare instead of failing.
+                RunOutcome::PairChangedDuringReview => {
+                    recompare_notice = Some(
+                        "The Folder pair's definition changed during review; the plan was discarded and re-compared."
+                            .to_string(),
+                    );
+                    continue 'recompare;
+                }
+                RunOutcome::Completed(code) => {
+                    let (exit_code, view) =
+                        build_result_view(pair_name, &destination, mode, notices.clone(), Ok(code))?;
+                    session.terminal().clear().map_err(tui_error)?;
+                    show_result(session.terminal(), &mut events, &view, header_mode)
+                        .map_err(tui_error)?;
+                    return Ok(exit_code);
+                }
+                RunOutcome::Failed(err) => {
+                    let (exit_code, view) =
+                        build_result_view(pair_name, &destination, mode, notices.clone(), Err(err))?;
+                    session.terminal().clear().map_err(tui_error)?;
+                    show_result(session.terminal(), &mut events, &view, header_mode)
+                        .map_err(tui_error)?;
+                    return Ok(exit_code);
+                }
             }
-
-            // The reviewed plan is read-only; a definition change underneath
-            // it (this TUI's own selector, another process, or a hand edit)
-            // must discard it visibly rather than let a stale plan reach a
-            // run or crash the session. Re-compare instead of failing.
-            if is_pair_changed(&run_result) {
-                recompare_notice = Some(
-                    "The Folder pair's definition changed during review; the plan was discarded and re-compared."
-                        .to_string(),
-                );
-                continue 'recompare;
-            }
-
-            let (exit_code, view) =
-                build_result_view(pair_name, &destination, mode, notices.clone(), run_result)?;
-            session.terminal().clear().map_err(tui_error)?;
-            show_result(session.terminal(), &mut events, &view, header_mode).map_err(tui_error)?;
-            return Ok(exit_code);
         }
     }
-}
-
-fn is_lock_contention(run_result: &Result<i32, AppError>) -> bool {
-    matches!(
-        run_result,
-        Err(AppError::Precondition(message)) if message == "run already in progress"
-    )
-}
-
-/// A stale plan must never reach a run: `run_reviewed` re-resolves the pair
-/// at execute time and refuses when it no longer matches what Review saw
-/// (see `run::run_reviewed`). This recognises that refusal so the TUI can
-/// discard the plan and re-compare instead of surfacing it as a crash.
-fn is_pair_changed(run_result: &Result<i32, AppError>) -> bool {
-    matches!(
-        run_result,
-        Err(AppError::Precondition(message))
-            if message == "Folder pair changed during TUI review; reopen the TUI before running"
-    )
 }
 
 fn ensure_interactive() -> Result<(), AppError> {
@@ -3660,28 +3653,6 @@ mod tests {
             Err(AppError::Usage(_)) => {}
             _ => panic!("a non-interrupted run error must propagate, not render a Result screen"),
         }
-    }
-
-    #[test]
-    fn pair_lock_contention_is_recognised_but_other_preconditions_are_not() {
-        assert!(is_lock_contention(&Err(AppError::Precondition(
-            "run already in progress".to_string()
-        ))));
-        assert!(!is_lock_contention(&Err(AppError::Precondition(
-            "destination free space is insufficient".to_string()
-        ))));
-        assert!(!is_lock_contention(&Ok(0)));
-    }
-
-    #[test]
-    fn pair_changed_during_review_is_recognised_but_other_preconditions_are_not() {
-        assert!(is_pair_changed(&Err(AppError::Precondition(
-            "Folder pair changed during TUI review; reopen the TUI before running".to_string()
-        ))));
-        assert!(!is_pair_changed(&Err(AppError::Precondition(
-            "run already in progress".to_string()
-        ))));
-        assert!(!is_pair_changed(&Ok(0)));
     }
 
     #[test]
