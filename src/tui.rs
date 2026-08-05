@@ -341,6 +341,7 @@ impl Events for CrosstermEvents {
 }
 
 /// The outcome of one Compare (a background, cancellable scan).
+#[derive(Clone)]
 struct ScanOutcome {
     pair: config::Pair,
     dry_run: plan::Plan,
@@ -1112,40 +1113,79 @@ fn run_pair_flow(
     }
     session.terminal().clear().map_err(tui_error)?;
 
+    match post_pane_flow(
+        session.terminal(),
+        &mut events,
+        pair_name,
+        header_mode,
+        config_path,
+        runner,
+        |terminal, events, pair_name, header_mode| {
+            compare(terminal, events, config_path, pair_name, header_mode)
+        },
+    )? {
+        PostPaneOutcome::Cancelled => {
+            drop(session);
+            println!("Run cancelled; destination unchanged.");
+            Ok(EXIT_OK)
+        }
+        PostPaneOutcome::Finished(code) => Ok(code),
+    }
+}
+
+/// Discriminates the outcome of `post_pane_flow` so a session-closing print
+/// (which needs the `TerminalSession` dropped first) stays in `run_pair_flow`
+/// rather than inside the extracted, terminal-agnostic loop.
+enum PostPaneOutcome {
+    Cancelled,
+    Finished(i32),
+}
+
+/// The Compare/Review/Confirm/Run/Result loop that follows the pane gate,
+/// extracted from `run_pair_flow` so it is drivable through the
+/// `Terminal`/`Events`/`RunRunner` seams alone — a `TestBackend` and scripted
+/// doubles exercise a full lifecycle (including `RunOutcome::LockContention`
+/// and `RunOutcome::PairChangedDuringReview` recovery) without a PTY.
+/// `do_compare` performs one Compare (production wires it to `compare`, which
+/// spawns a real `BackgroundScanner`; tests wire it to `compare_with_scanner`
+/// over a scripted `Scanner`). `runner` performs each Run attempt (production
+/// passes the real `EngineRunRunner`; tests pass a scripted `RunRunner`).
+fn post_pane_flow<B: Backend, E: Events>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    pair_name: &str,
+    header_mode: HeaderMode,
+    config_path: &Path,
+    runner: &impl RunRunner,
+    mut do_compare: impl FnMut(
+        &mut Terminal<B>,
+        &mut E,
+        &str,
+        HeaderMode,
+    ) -> Result<CompareOutcome, AppError>,
+) -> Result<PostPaneOutcome, AppError> {
     // Carries a notice across a re-compare: a plan is read-only, so any
     // definition change discovered under it discards it visibly instead of
     // silently reusing stale actions (RunOutcome::PairChangedDuringReview).
     let mut recompare_notice: Option<String> = None;
 
     'recompare: loop {
-        let compared = compare(
-            session.terminal(),
-            &mut events,
-            config_path,
-            pair_name,
-            header_mode,
-        )?;
+        let compared = do_compare(terminal, events, pair_name, header_mode)?;
         let (pair, dry_run, notices) = match compared {
-            CompareOutcome::Cancelled => {
-                drop(session);
-                println!("Run cancelled; destination unchanged.");
-                return Ok(EXIT_OK);
-            }
+            CompareOutcome::Cancelled => return Ok(PostPaneOutcome::Cancelled),
             CompareOutcome::Ready(scan) => (scan.pair, scan.dry_run, scan.notices),
         };
 
-        session.terminal().clear().map_err(tui_error)?;
+        terminal.clear().map_err(tui_error)?;
         let mut model = ReviewModel::from_plan(pair_name, &pair, dry_run);
         model.notices = notices.clone();
         model.message = recompare_notice.take();
 
         loop {
-            let outcome = review_loop(session.terminal(), &mut events, &mut model, header_mode)
-                .map_err(tui_error)?;
+            let outcome =
+                review_loop(terminal, events, &mut model, header_mode).map_err(tui_error)?;
             let ReviewOutcome::Execute(excludes) = outcome else {
-                drop(session);
-                println!("Run cancelled; destination unchanged.");
-                return Ok(EXIT_OK);
+                return Ok(PostPaneOutcome::Cancelled);
             };
             let reconciliation_excludes: Vec<String> = excludes
                 .iter()
@@ -1208,10 +1248,9 @@ fn run_pair_flow(
                         notices.clone(),
                         Ok(code),
                     )?;
-                    session.terminal().clear().map_err(tui_error)?;
-                    show_result(session.terminal(), &mut events, &view, header_mode)
-                        .map_err(tui_error)?;
-                    return Ok(exit_code);
+                    terminal.clear().map_err(tui_error)?;
+                    show_result(terminal, events, &view, header_mode).map_err(tui_error)?;
+                    return Ok(PostPaneOutcome::Finished(exit_code));
                 }
                 RunOutcome::Failed(err) => {
                     let (exit_code, view) = build_result_view(
@@ -1221,10 +1260,9 @@ fn run_pair_flow(
                         notices.clone(),
                         Err(err),
                     )?;
-                    session.terminal().clear().map_err(tui_error)?;
-                    show_result(session.terminal(), &mut events, &view, header_mode)
-                        .map_err(tui_error)?;
-                    return Ok(exit_code);
+                    terminal.clear().map_err(tui_error)?;
+                    show_result(terminal, events, &view, header_mode).map_err(tui_error)?;
+                    return Ok(PostPaneOutcome::Finished(exit_code));
                 }
             }
         }
@@ -2864,6 +2902,137 @@ mod tests {
         fn poll(&mut self) -> Option<Result<ScanOutcome, AppError>> {
             self.0.pop_front()?
         }
+    }
+
+    /// Drives `post_pane_flow`'s Run attempts from a fixed script of typed
+    /// `RunOutcome`s (issue #115), mirroring `ScriptedEvents`/`ScriptedScanner`
+    /// one stage further down the pipeline. Panics if exhausted — a flow that
+    /// asks for more Run attempts than the test scripted is itself the bug
+    /// under test, not something to paper over with a default outcome.
+    struct ScriptedRunRunner {
+        script: std::cell::RefCell<VecDeque<RunOutcome>>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ScriptedRunRunner {
+        fn new(outcomes: impl IntoIterator<Item = RunOutcome>) -> Self {
+            Self {
+                script: std::cell::RefCell::new(outcomes.into_iter().collect()),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl RunRunner for ScriptedRunRunner {
+        fn run_reviewed(
+            &self,
+            _config_path: &Path,
+            _pair_name: &str,
+            _options: run_engine::RunOptions<'_>,
+            _reviewed_pair: config::Pair,
+            _initial_plan: plan::Plan,
+        ) -> RunOutcome {
+            self.calls.set(self.calls.get() + 1);
+            self.script
+                .borrow_mut()
+                .pop_front()
+                .expect("ScriptedRunRunner script exhausted")
+        }
+    }
+
+    /// Wraps a `TestBackend`, recording a text snapshot of every frame it
+    /// flushes (issue #115) — the only way to observe a rendered stage
+    /// mid-flight through an opaque multi-stage call like `post_pane_flow`,
+    /// whose `Terminal` is held exclusively for the whole call and cannot
+    /// otherwise be peeked between draws.
+    struct RecordingBackend {
+        inner: TestBackend,
+        width: u16,
+        height: u16,
+        frames: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl RecordingBackend {
+        fn new(
+            width: u16,
+            height: u16,
+            frames: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        ) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                width,
+                height,
+                frames,
+            }
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.inner.clear()
+        }
+
+        fn size(&self) -> io::Result<ratatui::layout::Size> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()?;
+            self.frames.borrow_mut().push(buffer_view(
+                self.inner.buffer(),
+                self.width,
+                self.height,
+            ));
+            Ok(())
+        }
+    }
+
+    /// Renders a `Buffer` to plain text, cell by cell — the same shape as
+    /// `buffer_text_sized`, but standalone so `RecordingBackend::flush` can
+    /// call it without a `Terminal` (its buffer is mid-flush at that point).
+    fn buffer_view(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> String {
+        let mut output = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                output.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            output.push('\n');
+        }
+        output
     }
 
     fn choice(name: &str, mode: Mode, source: &str, destination: &str) -> PairChoice {
@@ -5158,6 +5327,161 @@ mod tests {
                 .iter()
                 .all(|cell| cell.fg == Color::Reset),
             "the focused browse pane's highlight must carry no foreground colour under NO_COLOR"
+        );
+    }
+
+    /// Guards issue #115: a lifecycle regression here must fail in-process,
+    /// with no PTY involved. `post_pane_flow` is driven end to end through a
+    /// scripted `RunRunner` returning `LockContention` then `Completed(0)`:
+    /// the first Run attempt must bounce back to Review with the excluded
+    /// row and the contention message intact, and the retried attempt must
+    /// reach Result.
+    #[test]
+    fn lock_contention_returns_to_review_with_the_contention_message_and_prior_exclusion_then_completes(
+    ) {
+        let frames = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal =
+            Terminal::new(RecordingBackend::new(140, 24, std::rc::Rc::clone(&frames))).unwrap();
+        // Enter starts and completes Compare (the scripted scan is ready with
+        // no polls). Space excludes the row before advancing to Confirm; y
+        // attempts the run — the scripted LockContention sends this back to
+        // Actions with the exclusion untouched. Enter reaches Confirm again,
+        // where the contention message renders; y retries and this time the
+        // scripted run completes; Enter dismisses Result.
+        let mut events = ScriptedEvents::keys([
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Enter,
+        ]);
+        let runner = ScriptedRunRunner::new([RunOutcome::LockContention, RunOutcome::Completed(0)]);
+
+        let mut scan = scan_outcome(Mode::Mirror);
+        scan.dry_run.copies = vec![action("a.txt", 10, "new file")];
+
+        let outcome = post_pane_flow(
+            &mut terminal,
+            &mut events,
+            "issue115-lock-contention",
+            HeaderMode::Full,
+            Path::new("/config.toml"),
+            &runner,
+            |terminal, events, pair_name, header_mode| {
+                compare_with_scanner(terminal, events, pair_name, header_mode, || {
+                    ScriptedScanner::pending(0, Ok(scan.clone()))
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PostPaneOutcome::Finished(0)));
+        assert_eq!(runner.calls(), 2, "both Run attempts must have executed");
+
+        let rendered = frames.borrow().join("\n----\n");
+        assert!(
+            rendered.contains("Another run is already in progress for this pair"),
+            "the contention message must render once Review is reached again: {rendered}"
+        );
+        assert!(
+            rendered.matches("a.txt").count() >= 2,
+            "the excluded row must still be visible after bouncing back to Review: {rendered}"
+        );
+        let last_frame = frames.borrow().last().cloned().unwrap_or_default();
+        assert!(
+            last_frame.contains("Result"),
+            "the lifecycle must reach the Result stage after the retried run completes: {last_frame}"
+        );
+    }
+
+    /// Guards issue #115: a scripted `PairChangedDuringReview` must discard
+    /// the stale plan and re-compare, in-process. A second, distinguishable
+    /// scripted scan (a different action path) proves the plan reaching
+    /// Review afterwards is the new one, not a leftover of the first.
+    #[test]
+    fn pair_changed_during_review_discards_the_stale_plan_and_recompares_with_only_the_new_plan_in_review(
+    ) {
+        let frames = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal =
+            Terminal::new(RecordingBackend::new(140, 24, std::rc::Rc::clone(&frames))).unwrap();
+        // First Enter starts and completes Compare #1 (against "old.txt").
+        // Enter advances Review to Confirm; y attempts the run, which the
+        // scripted RunRunner refuses with PairChangedDuringReview, discarding
+        // the stale plan and looping back into a second Compare. The next
+        // Enter starts and completes Compare #2 (against "new.txt", the
+        // distinguishable second scan); a final Enter advances that Review to
+        // Confirm, where the recompare notice renders, and q cancels out
+        // (Esc would only return to Actions) so the call ends cleanly.
+        let mut events = ScriptedEvents::keys([
+            KeyCode::Enter,
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Enter,
+            KeyCode::Enter,
+            KeyCode::Char('q'),
+        ]);
+        let runner = ScriptedRunRunner::new([RunOutcome::PairChangedDuringReview]);
+
+        let mut first_scan = scan_outcome(Mode::Mirror);
+        first_scan.dry_run.copies = vec![action("old.txt", 10, "new file")];
+        let mut second_scan = scan_outcome(Mode::Mirror);
+        second_scan.dry_run.copies = vec![action("new.txt", 20, "new file")];
+        let mut scans = VecDeque::from([first_scan, second_scan]);
+
+        let outcome = post_pane_flow(
+            &mut terminal,
+            &mut events,
+            "issue115-pair-changed",
+            HeaderMode::Full,
+            Path::new("/config.toml"),
+            &runner,
+            |terminal, events, pair_name, header_mode| {
+                let scan = scans
+                    .pop_front()
+                    .expect("post_pane_flow must Compare at most twice in this script");
+                compare_with_scanner(terminal, events, pair_name, header_mode, || {
+                    ScriptedScanner::pending(0, Ok(scan.clone()))
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PostPaneOutcome::Cancelled));
+        assert_eq!(
+            runner.calls(),
+            1,
+            "PairChangedDuringReview must not retry the run itself"
+        );
+
+        let history = frames.borrow().join("\n----\n");
+        assert!(
+            history.contains("old.txt"),
+            "the first scan's plan must have reached Review before the redefinition: {history}"
+        );
+        assert!(
+            history.contains("new.txt"),
+            "the second scan's distinguishable action must have reached the re-compared Review: {history}"
+        );
+
+        // Confirm summarizes the reviewed plan by total bytes rather than
+        // listing paths, so the 20-byte second action (vs. the first's 10)
+        // is what distinguishes which plan the final Confirm screen holds.
+        let last_frame = frames.borrow().last().cloned().unwrap_or_default();
+        assert!(
+            last_frame.contains(
+                "The Folder pair's definition changed during review; the plan was discarded and re-compared."
+            ),
+            "the recompare notice must render on the re-compared Review: {last_frame}"
+        );
+        assert!(
+            last_frame.contains("Included bytes: 20 B"),
+            "the re-compared plan's totals must be the new scan's, not the stale one's: {last_frame}"
+        );
+        assert!(
+            !last_frame.contains("Included bytes: 10 B"),
+            "the stale plan's totals must not still be in Review: {last_frame}"
         );
     }
 }
