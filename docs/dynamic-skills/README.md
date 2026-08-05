@@ -101,7 +101,7 @@ Remove or replace an older destination directory before copying a new release. D
 
 ## OpenCode command adapters
 
-OpenCode needs explicit custom-command adapters for the two user-entered commands. Install the bundle's `dynamic-implement.md` and `dynamic-skills-setup.md` adapters under:
+OpenCode needs explicit custom-command adapters for the two user-entered commands. Install the bundle's `dynamic-implement` and `dynamic-skills-setup` command adapters under:
 
 ```text
 ~/.config/opencode/commands/
@@ -109,7 +109,7 @@ OpenCode needs explicit custom-command adapters for the two user-entered command
 
 The Dynamic Implement adapter must preserve `DYNAMIC_IMPLEMENT_SLASH_ENTRY=1`; otherwise the root invocation gate rejects the run. Calibration is normally called by the coordinator and does not need a user command adapter.
 
-If a release does not provide the adapters, create `dynamic-implement.md` with:
+If a release does not provide the adapters, create `~/.config/opencode/commands/dynamic-implement.md` with:
 
 ```markdown
 ---
@@ -121,7 +121,7 @@ DYNAMIC_IMPLEMENT_SLASH_ENTRY=1
 Load the installed `dynamic-implement` skill through the native skill tool. With no arguments, run its read-only Wayfinder-based orientation mode and stop. Otherwise execute it for this issue, URL, or smoke-test flag: $ARGUMENTS
 ```
 
-Create `dynamic-skills-setup.md` with:
+Create `~/.config/opencode/commands/dynamic-skills-setup.md` with:
 
 ```markdown
 ---
