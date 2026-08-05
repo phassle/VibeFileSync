@@ -1708,17 +1708,38 @@ mod tests {
     /// (`src/journal.rs::pair_directory`), which is not otherwise injectable.
     /// Serializes the mutation across this module's tests so none observes
     /// another's `$HOME` mid-run, and restores the prior value afterward.
-    fn with_isolated_home_env<T>(home: &Path, run: impl FnOnce() -> T) -> T {
-        static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = HOME_ENV_LOCK.lock().unwrap();
-        let previous = std::env::var_os("HOME");
-        std::env::set_var("HOME", home);
-        let result = run();
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+    struct HomeEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeEnvGuard {
+        fn set(home: &Path) -> Self {
+            static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", home);
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
-        result
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn with_isolated_home_env<T>(home: &Path, run: impl FnOnce() -> T) -> T {
+        let _guard = HomeEnvGuard::set(home);
+        run()
     }
 
     fn sample_pair(destination: &Path) -> crate::config::Pair {
