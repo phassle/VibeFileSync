@@ -18,6 +18,7 @@ use crate::event::{MetadataWarning, VerificationTier};
 use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
+use crate::structural_conflict::{self, ConflictSet};
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 18) | (1 << 19);
 const F_FULLFSYNC: libc::c_int = 51;
@@ -384,7 +385,7 @@ fn execute_reviewed_plan(
         excludes,
     } = options;
     let reporter = RunReporter::new(json_output);
-    plan::drop_orphan_structural_deletions(&mut initial_plan);
+    structural_conflict::drop_orphan_structural_deletions(&mut initial_plan);
     plan::report_unknown_excludes(&initial_plan);
     if render_plan {
         reporter.plan(&initial_plan, pair_name, pair.mode);
@@ -535,9 +536,8 @@ fn execute_reviewed_plan(
         );
     }
     retain_reviewed_actions(&mut plan, &initial_plan);
-    plan::drop_orphan_structural_deletions(&mut plan);
-    let mut completed_structural_deletes = std::collections::BTreeSet::new();
-    let mut started_structural_deletes = std::collections::BTreeSet::new();
+    structural_conflict::drop_orphan_structural_deletions(&mut plan);
+    let mut conflicts = ConflictSet::classify(&plan);
     for (operation, action) in plan
         .copies
         .iter()
@@ -551,13 +551,7 @@ fn execute_reviewed_plan(
         crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         let source = pair.source.join(&action.rel_path);
         let destination = pair.destination.join(&action.rel_path);
-        let structural_delete = plan.deletes.iter().find(|deletion| {
-            deletion.structural_conflict.is_some()
-                && !completed_structural_deletes.contains(&deletion.rel_path)
-                && deletion.structural_conflict.is_some_and(|conflict| {
-                    conflict.has_dependent_copy(&deletion.rel_path, &action.rel_path)
-                })
-        });
+        let structural_delete = conflicts.find_structural_delete_for(&plan, &action.rel_path);
         let temp_target = structural_delete
             .filter(|_| !destination.parent().is_some_and(Path::is_dir))
             .map(|deletion| pair.destination.join(&deletion.rel_path));
@@ -566,7 +560,7 @@ fn execute_reviewed_plan(
             journal.run_id(),
         );
         if let Some(deletion) = structural_delete {
-            if started_structural_deletes.insert(deletion.rel_path.clone()) {
+            if conflicts.begin_structural_delete(deletion) {
                 journal
                     .action_start(Operation::Delete, deletion, None, None)
                     .map_err(journal_runtime_error)?;
@@ -635,7 +629,7 @@ fn execute_reviewed_plan(
                         &[],
                         false,
                     )?;
-                    completed_structural_deletes.insert(deletion.rel_path.clone());
+                    conflicts.complete_structural_delete(deletion);
                 }
                 journal
                     .action_done(
@@ -702,10 +696,7 @@ fn execute_reviewed_plan(
             }
         }
     }
-    for deletion in plan.deletes.iter().filter(|deletion| {
-        started_structural_deletes.contains(&deletion.rel_path)
-            && !completed_structural_deletes.contains(&deletion.rel_path)
-    }) {
+    for deletion in conflicts.drain_incomplete(&plan) {
         fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
     }
     for action in plan
@@ -1820,9 +1811,15 @@ mod tests {
             deletes: vec![deletion],
             ..plan::Plan::default()
         };
-        assert_eq!(plan::drop_orphan_structural_deletions(&mut plan), 0);
+        assert_eq!(
+            structural_conflict::drop_orphan_structural_deletions(&mut plan),
+            0
+        );
         plan.copies.clear();
-        assert_eq!(plan::drop_orphan_structural_deletions(&mut plan), 1);
+        assert_eq!(
+            structural_conflict::drop_orphan_structural_deletions(&mut plan),
+            1
+        );
         assert!(plan.deletes.is_empty());
     }
 
@@ -1850,9 +1847,15 @@ mod tests {
             ..plan::Plan::default()
         };
 
-        assert_eq!(plan::drop_orphan_structural_deletions(&mut plan), 0);
+        assert_eq!(
+            structural_conflict::drop_orphan_structural_deletions(&mut plan),
+            0
+        );
         plan.copies.clear();
-        assert_eq!(plan::drop_orphan_structural_deletions(&mut plan), 1);
+        assert_eq!(
+            structural_conflict::drop_orphan_structural_deletions(&mut plan),
+            1
+        );
         assert!(plan.deletes.is_empty());
     }
 
