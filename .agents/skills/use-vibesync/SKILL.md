@@ -113,6 +113,23 @@ Surface the pair's Sync mode from the opening `plan_start` event's `mode` field 
 
 This is the review surface only: parsing and rendering the summary. Confirming and running the plan is a separate step this skill does not cover here.
 
+## Exclude paths before a Run
+
+After rendering the Compare table from the unfiltered `plan --json` stream above, offer the human the
+chance to drop specific rows before any Run: let them pick one or more of the exact relative paths already
+shown in that stream's `action` events' `path` field, taken verbatim — no glob engine, no invented syntax
+(ADR-0004 §3), on `run` rather than on `plan`. A path either matches one of those printed strings exactly
+or it excludes nothing.
+
+Carry the paths the human picks forward as repeated `--exclude <PATH>` flags on the Run this shapes. Run
+mutates the destination; assembling this flag list is where this section's job ends — Run's own
+confirmation gate and event stream are a separate concern this section does not cover.
+
+- Real binary: `vibesync run <pair> --exclude <PATH> --exclude <PATH>`
+- Development fallback: `cargo run --locked -- run <pair> --exclude <PATH> --exclude <PATH>`
+
+Repeat `--exclude <PATH>` once per chosen path.
+
 ## Steering — TUI, restore, and resume requests
 
 Three requests this skill answers by telling the human what to do, rather than attempting it.
