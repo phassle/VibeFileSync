@@ -17,6 +17,7 @@ mod pair;
 mod plan;
 mod preconditions;
 mod run;
+mod structural_conflict;
 mod tui;
 mod volume;
 

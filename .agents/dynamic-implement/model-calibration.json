@@ -173,7 +173,7 @@
       ],
       "calibratedAt": "2026-08-05T12:57:25Z",
       "sourceCursor": "2026-08-02T21:45:45Z",
-      "notes": "One eligible unit (#60, rust docs). Recommendation retained unchanged at the ladder floor: a single observation cannot support any threshold in the rubric, and index 0 is already the lowest verified step so no floor lowering and no boundary probe below it are possible. The unit needed one fix pass, which is weak evidence toward a stronger start, but the rubric's floor-raise grounds both require at least two comparable units and one of them requires a measured comparison against a stronger step - no stronger step was ever run in this repository, so no raise is permitted. capabilityEscalation is recorded as 0 because the telemetry records no capability failure or route change on any attempt; it is not evidence that escalation was tried and unnecessary."
+      "notes": "One eligible unit (#60, rust docs). Recommendation retained unchanged at the ladder floor: a single observation cannot support any threshold in the rubric, and index 0 is already the lowest verified step so no floor lowering and no boundary probe below it are possible. The unit needed one fix pass, which is weak evidence toward a stronger start, but the rubric's floor-raise grounds both require at least two comparable units and one of them requires a measured comparison against a stronger step - no stronger step was ever run in this repository, so no raise is permitted. capabilityEscalation is recorded as 0 because the telemetry records no capability failure or route change on any attempt; it is not evidence that escalation was tried and unnecessary. Calibration 2026-08-05: no new telemetry for this group this run; only the externalReview refreshed."
     },
     {
       "key": "phassle/VibeFileSync:claude:rust-cli-tui:medium",
@@ -324,7 +324,10 @@
           "pair-crud",
           "config-write",
           "concurrency",
-          "lock-contention"
+          "lock-contention",
+          "deep-module-refactor",
+          "safety-ordering",
+          "cross-module-integration"
         ]
       },
       "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
@@ -376,7 +379,7 @@
             "route": "claude:claude-sonnet-5",
             "effort": "low",
             "ladderIndex": 0,
-            "units": 3,
+            "units": 4,
             "medianTotal": 13.09,
             "attemptsMedian": 2,
             "includesRetriesAndFixPasses": true
