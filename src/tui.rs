@@ -230,7 +230,12 @@ struct ReviewRow {
     path: String,
     bytes: Option<u64>,
     detail: String,
-    structural_conflict: Option<plan::StructuralConflict>,
+    /// The planned action this row projects, when it has one (Copy/Update/
+    /// Delete). Carried so structural-dependency reconciliation reasons over
+    /// the typed action via the Plan interface rather than restating the rule
+    /// over stringified paths. `None` for strays and errors, which never
+    /// participate in a structural dependency.
+    action: Option<plan::Action>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,7 +639,7 @@ impl ReviewModel {
                     .ok()
                     .map(|metadata| metadata.len()),
                 detail: "abandoned temp".to_string(),
-                structural_conflict: None,
+                action: None,
             }
         }));
         rows.extend(dry_run.errors.iter().map(|error| ReviewRow {
@@ -643,7 +648,7 @@ impl ReviewModel {
             path: error.rel_path.to_string_lossy().into_owned(),
             bytes: None,
             detail: error.message.clone(),
-            structural_conflict: None,
+            action: None,
         }));
         Self {
             pair_name: pair_name.to_string(),
@@ -813,20 +818,33 @@ impl ReviewModel {
             .rows
             .iter()
             .filter(|row| row.included && row.operation == Operation::Copy)
-            .map(|row| row.path.clone())
+            .filter_map(|row| {
+                row.action
+                    .as_ref()
+                    .map(|action| action.rel_path.to_string_lossy().into_owned())
+            })
             .collect();
         let kept: std::collections::HashSet<String> =
             structural_conflict::included_structural_deletes(
                 self.rows.iter().filter_map(|row| {
-                    row.structural_conflict
-                        .map(|conflict| (row.path.clone(), conflict))
+                    row.action.as_ref().and_then(|action| {
+                        action
+                            .structural_conflict
+                            .map(|conflict| (row.path.clone(), conflict))
+                    })
                 }),
                 &included_copies,
             )
             .into_iter()
             .collect();
         for row in &mut self.rows {
-            if row.structural_conflict.is_some() && !kept.contains(&row.path) {
+            if row
+                .action
+                .as_ref()
+                .and_then(|a| a.structural_conflict)
+                .is_some()
+                && !kept.contains(&row.path)
+            {
                 row.included = false;
             }
         }
@@ -845,7 +863,7 @@ impl ReviewRow {
             path: action.rel_path.to_string_lossy().into_owned(),
             bytes: Some(action.bytes),
             detail: action.reason.clone(),
-            structural_conflict: action.structural_conflict,
+            action: Some(action.clone()),
         }
     }
 }
@@ -3213,6 +3231,50 @@ mod tests {
         assert_eq!(totals.excluded, 2);
         assert!(reviewed.copies.is_empty());
         assert!(reviewed.deletes.is_empty());
+    }
+
+    #[test]
+    fn reconcile_over_the_action_type_drops_orphan_structural_deletes_for_both_conflicts() {
+        for conflict in [
+            plan::StructuralConflict::DestinationDirectory,
+            plan::StructuralConflict::DestinationFile,
+        ] {
+            let (delete_path, copy_path) = match conflict {
+                plan::StructuralConflict::DestinationDirectory => ("report.txt", "report.txt"),
+                plan::StructuralConflict::DestinationFile => ("docs", "docs/new.txt"),
+            };
+            let mut deletion = action(delete_path, 0, "replaced by source");
+            deletion.structural_conflict = Some(conflict);
+            let dry_run = plan::Plan {
+                copies: vec![action(copy_path, 10, "new")],
+                deletes: vec![deletion],
+                ..plan::Plan::default()
+            };
+            let mut model = ReviewModel::from_plan("photos", &pair(Mode::Mirror), dry_run);
+
+            // Excluding the dependent Publish must orphan-drop its structural
+            // delete: the review model reasons over the planned-action type via
+            // the single Plan-interface rule, so its row-inclusion decision
+            // matches what the engine would reconcile.
+            model.selected = 0;
+            model.toggle();
+
+            let copy_row = model
+                .rows
+                .iter()
+                .find(|row| row.operation == Operation::Copy)
+                .expect("copy row present");
+            let delete_row = model
+                .rows
+                .iter()
+                .find(|row| row.operation == Operation::Delete)
+                .expect("delete row present");
+            assert!(!copy_row.included, "excluded copy for {conflict:?}");
+            assert!(
+                !delete_row.included,
+                "orphan structural delete still included for {conflict:?}"
+            );
+        }
     }
 
     #[test]

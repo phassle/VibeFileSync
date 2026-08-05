@@ -6,10 +6,10 @@ Use these patterns when extending VibeFileSync. ADRs remain authoritative; this 
 
 Keep comparison and presentation deterministic over explicit values. Put filesystem discovery and CLI effects at module edges.
 
-- `src/plan.rs::scan` scans real trees into sorted maps.
-- `src/plan.rs::compute` computes a Plan without I/O.
+- `src/plan.rs::traverse` walks both real trees once in sorted order, streaming decisions to a `PlanSink`.
+- `src/plan.rs::classify_source_entry` decides each entry's diff row without I/O.
 - `src/plan.rs::render` renders a Plan without I/O.
-- `src/plan.rs::run` and `src/plan.rs::run_json` orchestrate config, scan, compute, output.
+- `src/plan.rs::run` and `src/plan.rs::run_json` orchestrate config, traversal, classification, output.
 - Pure seams receive dense unit coverage at `src/plan.rs::tests`; filesystem behavior uses CLI fixtures at `tests/cli.rs::Fixture`.
 
 When adding planning behavior, extend the Plan model/pure computation first; keep scanning, terminal, and mutation concerns outside it.
@@ -19,7 +19,7 @@ When adding planning behavior, extend the Plan model/pure computation first; kee
 Compose safety as ordered gates. Earlier stages may inspect; only the final stage mutates.
 
 1. Strict config load precedes dispatch (`src/main.rs::run`).
-2. Acquire pair lock, resolve pinned volumes, and scan (`src/preconditions.rs::resolve_pair`, `src/plan.rs::scan`).
+2. Acquire pair lock, resolve pinned volumes, and scan (`src/preconditions.rs::resolve_pair`, `src/plan.rs::traverse`).
 3. Render/report the initial reviewed Plan (`src/run.rs::execute_reviewed_plan`).
 4. Block Plan errors, then enforce run-only preconditions (`src/plan.rs::PlanError`, `src/preconditions.rs::check_run`).
 5. Require confirmation or explicit `--yes` (`src/run.rs::execute_reviewed_plan`).
@@ -62,7 +62,7 @@ Keep the append-only Journal as forensic/history output, never planning authorit
 
 Prefer deterministic behavior that scripts and agents can classify without heuristics.
 
-- `BTreeMap` makes config pairs and scan results stable (`src/config.rs::Config`, `src/plan.rs::scan`).
+- `BTreeMap` makes config pairs and scan results stable (`src/config.rs::Config`, `src/plan.rs::traverse`).
 - Strict `deny_unknown_fields` and config version checks abort on drift (`src/config.rs::Config`, `src/config.rs::load`).
 - Machine payloads carry versioned schema ids (`src/config.rs::CURRENT_VERSION`; full policy `docs/adr/0004-cli-surface.md`).
 - Error classes map to stable exit codes at one CLI boundary (`src/error.rs::AppError`, `src/main.rs::main`).

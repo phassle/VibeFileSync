@@ -1,0 +1,4 @@
+{"dry_run":true,"mode":"update","pair":"sync","plan_id":"<plan-id>","schema":"vibefilesync.plan/v1","type":"plan_start"}
+{"op":"error","path":"link","plan_id":"<plan-id>","reason":"symlink not supported on exFAT destination","schema":"vibefilesync.plan/v1","type":"action"}
+{"bytes":5,"op":"copy","path":"safe.txt","plan_id":"<plan-id>","reason":"new","schema":"vibefilesync.plan/v1","type":"action"}
+{"counts":{"cleanup":0,"copy":1,"delete":0,"error":1,"excluded":0,"scanned":2,"unchanged":0,"update":0},"plan_id":"<plan-id>","schema":"vibefilesync.plan/v1","type":"summary"}
