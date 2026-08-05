@@ -112,3 +112,26 @@ Compare a Folder pair by running it and parsing the `vibefilesync.plan/v1` NDJSO
 Surface the pair's Sync mode from the opening `plan_start` event's `mode` field as part of the same summary, before any confirm. This is the safety point of the review, and it matters in both modes: by default every removal this table shows goes through SafetyNet on a real run, archived by rename before anything is removed — but that default can be overridden per run, so it must be visible ahead of time regardless. Destination-only removals (an object present on the destination and absent from the source) are Mirror-only; Update never produces these. But a source object structurally replacing a destination object of the other kind (a source file over a destination directory, or a source directory over a destination file) removes that destination object in both modes and is counted in `counts.delete`, so `counts.delete` can be non-zero in Update — the summary is not additive-only.
 
 This is the review surface only: parsing and rendering the summary. Confirming and running the plan is a separate step this skill does not cover here.
+
+## Steering — TUI, restore, and resume requests
+
+Three requests this skill answers by telling the human what to do, rather than attempting it.
+
+### TUI request
+
+The TUI takes over a real terminal interactively. The agent has no TTY to offer it and never launches or drives the TUI itself — tell the human to run it themselves:
+
+- Real binary: `vibesync tui [<pair>]`
+- Development fallback: `cargo run --locked -- tui [<pair>]`
+
+The Pair name is optional: give it to open the TUI focused on that Folder pair, or omit it to open unfocused. (ADR-0011 records why even a scripted driver with a real pseudo-terminal must rendezvous on the TUI's own terminal output rather than on elapsed time; an agent with no terminal at all has no such surface to synchronize on.)
+
+### Restore request
+
+There is no `restore` subcommand in v1 (ADR-0004 §7). Tell the human that `_SafetyNet/` is deliberately visible and Finder-browsable, and that restoring something is a manual copy back from its Run folder to the original location. This only has something to copy back if that Run folder exists: by default, a removed or replaced destination object is archived into SafetyNet before it is touched, but a run given `--permanent-delete` bypasses SafetyNet for that run, and there is nothing left to restore from afterward.
+
+The skill does not fabricate a `restore` command; never invent this invocation.
+
+### Resume request ("pick up where it left off" after an interruption)
+
+Refuse the request as asked — there is no mid-file resume in this product, the sense `CONTEXT.md`'s Convergence entry names only to reject. The Journal (ADR-0007) is a forensic, historical record of what happened on past runs; it is never copy authority and never decides what the next run copies. Tell the human the correct next step is to rerun the Folder pair: its own fresh scan converges on the correct destination state — one rerun, nothing replayed from the Journal, no manual repair.
