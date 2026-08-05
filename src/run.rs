@@ -2037,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_stray_temps_removes_journals_and_signals_continue() {
+    fn cleanup_stray_temps_removes_stray_file_and_records_journal_entry() {
         let source_dir = tempfile::tempdir().unwrap();
         let destination_dir = tempfile::tempdir().unwrap();
         let stray = PathBuf::from("stray.vibesync-tmp");
