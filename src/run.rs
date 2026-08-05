@@ -375,39 +375,91 @@ fn execute_reviewed_plan(
     mut initial_plan: plan::Plan,
     render_plan: bool,
 ) -> Result<i32, AppError> {
-    let RunOptions {
-        yes,
-        permanent_delete,
-        allow_empty_source,
-        ignore_space_check,
-        json_output,
-        full_verify,
-        excludes,
-    } = options;
-    let reporter = RunReporter::new(json_output);
-    structural_conflict::drop_orphan_structural_deletions(&mut initial_plan);
-    plan::report_unknown_excludes(&initial_plan);
+    let mut session = match review_plan(pair_name, &pair, &mut initial_plan, render_plan, &options)?
+    {
+        ReviewOutcome::ExitEarly(code) => return Ok(code),
+        ReviewOutcome::Proceed(session) => session,
+    };
+
+    if let CleanupOutcome::Abort = cleanup_stray_temps(
+        &pair.source,
+        &pair.destination,
+        &initial_plan.strays,
+        &mut session,
+    )? {
+        return finalize(&mut session);
+    }
+    let (pair, plan) = reconcile_plan(
+        config_path,
+        pair_name,
+        options.excludes,
+        &initial_plan,
+        &mut session,
+    )?;
+
+    dispatch(
+        &pair,
+        &plan,
+        options.permanent_delete,
+        options.full_verify,
+        &mut session,
+    )?;
+
+    finalize(&mut session)
+}
+
+/// The journal, reporter, and run stats a reviewed plan opens together and
+/// every later lifecycle (cleanup, reconcile, dispatch, finalize) threads
+/// through as a unit.
+struct RunSession {
+    journal: Journal,
+    reporter: RunReporter,
+    stats: RunStats,
+}
+
+/// Whether review cleared the plan for execution, or the run must stop
+/// before a journal exists (blocked plan, or the user declined to confirm).
+enum ReviewOutcome {
+    Proceed(RunSession),
+    ExitEarly(i32),
+}
+
+/// Normalizes and (optionally) renders the plan, validates it against
+/// preconditions, gets user confirmation, and opens the journal that every
+/// later lifecycle writes through. Runs before cleanup because a blocked
+/// plan or a declined confirmation must never create a journal or touch the
+/// destination.
+fn review_plan(
+    pair_name: &str,
+    pair: &crate::config::Pair,
+    initial_plan: &mut plan::Plan,
+    render_plan: bool,
+    options: &RunOptions<'_>,
+) -> Result<ReviewOutcome, AppError> {
+    let reporter = RunReporter::new(options.json_output);
+    structural_conflict::drop_orphan_structural_deletions(initial_plan);
+    plan::report_unknown_excludes(initial_plan);
     if render_plan {
-        reporter.plan(&initial_plan, pair_name, pair.mode);
+        reporter.plan(initial_plan, pair_name, pair.mode);
     }
 
     if !initial_plan.errors.is_empty() {
         reporter.blocked(initial_plan.errors.len());
-        return Ok(EXIT_BLOCKED_PLAN);
+        return Ok(ReviewOutcome::ExitEarly(EXIT_BLOCKED_PLAN));
     }
     let run_warnings = crate::preconditions::check_run(
-        &pair,
-        &initial_plan,
-        allow_empty_source,
-        ignore_space_check,
+        pair,
+        initial_plan,
+        options.allow_empty_source,
+        options.ignore_space_check,
     )?;
     reporter.precondition_warnings(&run_warnings);
     let degradations = crate::volume::expected_degradations(&pair.destination);
     reporter.expected_degradations(&degradations);
 
-    if !yes && !reporter.confirm()? {
+    if !options.yes && !reporter.confirm()? {
         reporter.cancelled();
-        return Ok(EXIT_OK);
+        return Ok(ReviewOutcome::ExitEarly(EXIT_OK));
     }
 
     let blocked_signals = crate::interrupt::block().map_err(|error| {
@@ -419,7 +471,7 @@ fn execute_reviewed_plan(
             pair_name,
             &pair.source,
             &pair.destination,
-            &initial_plan,
+            initial_plan,
             &run_warnings,
             &degradations,
         )
@@ -427,16 +479,16 @@ fn execute_reviewed_plan(
     reporter.run_start(
         journal.run_id(),
         pair_name,
-        &pair,
+        pair,
         &run_warnings,
-        &initial_plan,
+        initial_plan,
     )?;
     install_interrupt_handler()?;
     blocked_signals.restore().map_err(|error| {
         AppError::Interrupted(format!("could not restore interruption signals: {error}"))
     })?;
     crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
-    let mut stats = RunStats {
+    let stats = RunStats {
         counts: Counts {
             planned: initial_plan.copies.len()
                 + initial_plan.updates.len()
@@ -446,98 +498,48 @@ fn execute_reviewed_plan(
         },
         ..RunStats::default()
     };
-    for stray in &initial_plan.strays {
-        crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
-        let action = Action {
-            rel_path: stray.clone(),
-            bytes: fs::metadata(pair.destination.join(stray))
-                .map(|metadata| metadata.len())
-                .unwrap_or(0),
-            source_mtime: None,
-            old_bytes: None,
-            reason: "abandoned temp".to_string(),
-            structural_conflict: None,
-        };
-        journal
-            .action_start(Operation::Cleanup, &action, None, None)
-            .map_err(journal_runtime_error)?;
-        reporter.action_start(journal.run_id(), Operation::Cleanup, &action)?;
-        match fs::remove_file(pair.destination.join(stray)) {
-            Ok(()) => {
-                journal
-                    .action_done(Operation::Cleanup, &action, None, &[], None)
-                    .map_err(journal_runtime_error)?;
-                stats.counts.done += 1;
-                reporter.action_done(
-                    journal.run_id(),
-                    Operation::Cleanup,
-                    &action,
-                    None,
-                    &[],
-                    false,
-                )?;
-                reporter.cleaned(stray);
-            }
-            Err(error) => {
-                let failure = ActionFailure::from(error);
-                stats.counts.failed += 1;
-                journal
-                    .action_failed(Operation::Cleanup, &action, failure.reason())
-                    .map_err(journal_runtime_error)?;
-                reporter.action_failed(journal.run_id(), Operation::Cleanup, &action, &failure)?;
-                journal.summary(&stats).map_err(journal_runtime_error)?;
-                reporter.summary(journal.run_id(), &stats)?;
-                return Ok(1);
-            }
-        }
+    Ok(ReviewOutcome::Proceed(RunSession {
+        journal,
+        reporter,
+        stats,
+    }))
+}
+
+/// Aggregates the run summary and computes the process exit code from the
+/// final counts. Called exactly once, after dispatch (or after an early
+/// cleanup abort), so every path shares one place that writes the summary.
+fn finalize(session: &mut RunSession) -> Result<i32, AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
+    journal.summary(stats).map_err(journal_runtime_error)?;
+    reporter.summary(journal.run_id(), stats)?;
+    if stats.counts.failed == 0 {
+        Ok(EXIT_OK)
+    } else {
+        Ok(1)
     }
-    fault_at(
-        FaultTransition::CleanupComplete,
-        FaultContext {
-            relative_path: Path::new(""),
-            source: Some(&pair.source),
-            temp: None,
-            destination: Some(&pair.destination),
-            safety_net: None,
-        },
-    )
-    .map_err(journal_runtime_error)?;
-    // Cleanup changes the destination, so the action set below must come from
-    // a new scan rather than from the scan that discovered the abandoned temp.
-    let (pair, mut plan) = plan::build(config_path, pair_name, excludes)?;
-    // The reconciliation scan is authoritative and correctly drops anything
-    // it finds that was not in the reviewed plan (e.g. a file added to the
-    // source mid-review); this count is what makes that drop visible to the
-    // user and to agents reading the run summary event, instead of silent.
-    stats.discovered_after_review = discovered_after_review(&initial_plan, &plan);
-    let missing = missing_reviewed_actions(&initial_plan, &plan);
-    for (operation, action) in &missing {
-        journal
-            .action_start(*operation, action, None, None)
-            .map_err(journal_runtime_error)?;
-        reporter.action_start(journal.run_id(), *operation, action)?;
-        let failure = ActionFailure::new(
-            FailureReason::ReconciliationChanged,
-            io::Error::other("changed during reconciliation; rerun required"),
-        );
-        journal
-            .action_failed(*operation, action, failure.reason())
-            .map_err(journal_runtime_error)?;
-        reporter.action_failed(journal.run_id(), *operation, action, &failure)?;
-        stats.counts.failed += 1;
-    }
-    for error in &plan.errors {
-        if !reviewed_path(&initial_plan, &error.rel_path) {
-            stats.counts.failed += 1;
-        }
-        eprintln!(
-            "vibesync: {} appeared after review; rerun required",
-            error.rel_path.display()
-        );
-    }
-    retain_reviewed_actions(&mut plan, &initial_plan);
-    structural_conflict::drop_orphan_structural_deletions(&mut plan);
-    let mut conflicts = ConflictSet::classify(&plan);
+}
+
+/// Executes the reconciled plan's copies, updates, and deletes against the
+/// destination. Structural-conflict state (which delete a copy is waiting
+/// on) is local to this lifecycle, per ADR-0003's reviewed-set-never-broadens
+/// rule and ADR-0001's archive-before-publish ordering.
+fn dispatch(
+    pair: &crate::config::Pair,
+    plan: &plan::Plan,
+    permanent_delete: bool,
+    full_verify: bool,
+    session: &mut RunSession,
+) -> Result<(), AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
+    let mut conflicts = ConflictSet::classify(plan);
     for (operation, action) in plan
         .copies
         .iter()
@@ -687,17 +689,15 @@ fn execute_reviewed_plan(
                 reporter.action_failed(journal.run_id(), operation, action, &failure)?;
                 if failure.kind() != io::ErrorKind::InvalidData {
                     if let Some(deletion) = structural_delete {
-                        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
+                        fail_structural_delete(deletion, journal, reporter, stats)?;
                     }
-                    journal.summary(&stats).map_err(journal_runtime_error)?;
-                    reporter.summary(journal.run_id(), &stats)?;
-                    return Ok(1);
+                    return Ok(());
                 }
             }
         }
     }
     for deletion in conflicts.drain_incomplete(&plan) {
-        fail_structural_delete(deletion, &mut journal, &reporter, &mut stats)?;
+        fail_structural_delete(deletion, journal, reporter, stats)?;
     }
     for action in plan
         .deletes
@@ -706,24 +706,146 @@ fn execute_reviewed_plan(
     {
         crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
         execute_delete_action(
-            &pair,
+            pair,
             action,
-            &mut journal,
+            journal,
             permanent_delete,
             plan.directory_deletes.contains(&action.rel_path),
-            &reporter,
-            &mut stats,
+            reporter,
+            stats,
         )?;
     }
 
     crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
-    journal.summary(&stats).map_err(journal_runtime_error)?;
-    reporter.summary(journal.run_id(), &stats)?;
-    if stats.counts.failed == 0 {
-        Ok(EXIT_OK)
-    } else {
-        Ok(1)
+    Ok(())
+}
+
+/// Whether the run may proceed to reconciliation after cleanup, or must
+/// abort because a stray temp could not be removed.
+enum CleanupOutcome {
+    Continue,
+    Abort,
+}
+
+/// Removes abandoned publish temps left by an interrupted prior run before
+/// the reconciliation scan runs, since a stray temp would otherwise shadow
+/// the fresh scan's view of the destination.
+fn cleanup_stray_temps(
+    source: &Path,
+    destination: &Path,
+    strays: &[PathBuf],
+    session: &mut RunSession,
+) -> Result<CleanupOutcome, AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
+    for stray in strays {
+        crate::interrupt::check().map_err(|error| AppError::Interrupted(error.to_string()))?;
+        let action = Action {
+            rel_path: stray.clone(),
+            bytes: fs::metadata(destination.join(stray))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            source_mtime: None,
+            old_bytes: None,
+            reason: "abandoned temp".to_string(),
+            structural_conflict: None,
+        };
+        journal
+            .action_start(Operation::Cleanup, &action, None, None)
+            .map_err(journal_runtime_error)?;
+        reporter.action_start(journal.run_id(), Operation::Cleanup, &action)?;
+        match fs::remove_file(destination.join(stray)) {
+            Ok(()) => {
+                journal
+                    .action_done(Operation::Cleanup, &action, None, &[], None)
+                    .map_err(journal_runtime_error)?;
+                stats.counts.done += 1;
+                reporter.action_done(
+                    journal.run_id(),
+                    Operation::Cleanup,
+                    &action,
+                    None,
+                    &[],
+                    false,
+                )?;
+                reporter.cleaned(stray);
+            }
+            Err(error) => {
+                let failure = ActionFailure::from(error);
+                stats.counts.failed += 1;
+                journal
+                    .action_failed(Operation::Cleanup, &action, failure.reason())
+                    .map_err(journal_runtime_error)?;
+                reporter.action_failed(journal.run_id(), Operation::Cleanup, &action, &failure)?;
+                return Ok(CleanupOutcome::Abort);
+            }
+        }
     }
+    fault_at(
+        FaultTransition::CleanupComplete,
+        FaultContext {
+            relative_path: Path::new(""),
+            source: Some(source),
+            temp: None,
+            destination: Some(destination),
+            safety_net: None,
+        },
+    )
+    .map_err(journal_runtime_error)?;
+    Ok(CleanupOutcome::Continue)
+}
+
+/// Rebuilds the plan from a fresh scan (cleanup changed the destination, so
+/// the reviewed plan's scan is stale), then narrows the fresh scan back down
+/// to what was reviewed: ADR-0007's "reviewed plan never broadens" rule.
+/// Reports what the fresh scan no longer agrees with (`missing_reviewed_actions`)
+/// and what it newly found (`discovered_after_review`) so both are visible to
+/// the user and to agents reading the run summary event, instead of silent.
+fn reconcile_plan(
+    config_path: &Path,
+    pair_name: &str,
+    excludes: &[String],
+    initial_plan: &plan::Plan,
+    session: &mut RunSession,
+) -> Result<(crate::config::Pair, plan::Plan), AppError> {
+    let RunSession {
+        journal,
+        reporter,
+        stats,
+    } = session;
+    let (pair, mut plan) = plan::build(config_path, pair_name, excludes)?;
+    stats.discovered_after_review = discovered_after_review(initial_plan, &plan);
+    let missing = missing_reviewed_actions(initial_plan, &plan);
+    for (operation, action) in &missing {
+        journal
+            .action_start(*operation, action, None, None)
+            .map_err(journal_runtime_error)?;
+        reporter.action_start(journal.run_id(), *operation, action)?;
+        let failure = ActionFailure::new(
+            FailureReason::ReconciliationChanged,
+            io::Error::other("changed during reconciliation; rerun required"),
+        );
+        journal
+            .action_failed(*operation, action, failure.reason())
+            .map_err(journal_runtime_error)?;
+        reporter.action_failed(journal.run_id(), *operation, action, &failure)?;
+        stats.counts.failed += 1;
+    }
+    for error in &plan.errors {
+        if !reviewed_path(initial_plan, &error.rel_path) {
+            stats.counts.failed += 1;
+        }
+        eprintln!(
+            "vibesync: {} appeared after review; rerun required",
+            error.rel_path.display()
+        );
+    }
+    retain_reviewed_actions(&mut plan, initial_plan);
+    structural_conflict::drop_orphan_structural_deletions(&mut plan);
+    Ok((pair, plan))
 }
 
 fn install_interrupt_handler() -> Result<(), AppError> {
@@ -1643,6 +1765,69 @@ mod tests {
     use super::*;
     use crate::plan::StructuralConflict;
 
+    /// `Journal::create` resolves its storage root from `$HOME`
+    /// (`src/journal.rs::pair_directory`), which is not otherwise injectable.
+    /// Serializes the mutation across this module's tests so none observes
+    /// another's `$HOME` mid-run, and restores the prior value afterward.
+    struct HomeEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeEnvGuard {
+        fn set(home: &Path) -> Self {
+            static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", home);
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn with_isolated_home_env<T>(home: &Path, run: impl FnOnce() -> T) -> T {
+        let _guard = HomeEnvGuard::set(home);
+        run()
+    }
+
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     fn sample_pair(destination: &Path) -> crate::config::Pair {
         crate::config::Pair {
             source: PathBuf::from("/source"),
@@ -1968,5 +2153,288 @@ mod tests {
 
         assert_eq!(response, COPYFILE_QUIT);
         assert_eq!(context.error.unwrap().raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    #[test]
+    fn cleanup_stray_temps_removes_stray_file_and_records_journal_entry() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let stray = PathBuf::from("stray.vibesync-tmp");
+        fs::write(destination_dir.path().join(&stray), "leftover").unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        with_isolated_home_env(home.path(), || {
+            let journal = Journal::create("cleanup-success-pair", destination_dir.path()).unwrap();
+            let reporter = RunReporter::new(false);
+            let stats = RunStats::default();
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
+
+            let outcome = cleanup_stray_temps(
+                source_dir.path(),
+                destination_dir.path(),
+                std::slice::from_ref(&stray),
+                &mut session,
+            )
+            .unwrap();
+
+            assert!(matches!(outcome, CleanupOutcome::Continue));
+            assert!(!destination_dir.path().join(&stray).exists());
+            assert_eq!(session.stats.counts.done, 1);
+            assert_eq!(session.stats.counts.failed, 0);
+        });
+    }
+
+    #[test]
+    fn cleanup_failure_finalizes_with_exit_one_and_a_partial_journal_summary() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        // `fs::remove_file` rejects a directory, forcing a deterministic
+        // removal failure without the fault-injection feature.
+        let stray = PathBuf::from("stray-dir.vibesync-tmp");
+        fs::create_dir(destination_dir.path().join(&stray)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        with_isolated_home_env(home.path(), || {
+            let journal = Journal::create("cleanup-failure-pair", destination_dir.path()).unwrap();
+            let reporter = RunReporter::new(false);
+            let stats = RunStats::default();
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
+
+            let outcome = cleanup_stray_temps(
+                source_dir.path(),
+                destination_dir.path(),
+                std::slice::from_ref(&stray),
+                &mut session,
+            )
+            .unwrap();
+
+            assert!(matches!(outcome, CleanupOutcome::Abort));
+            assert_eq!(finalize(&mut session).unwrap(), 1);
+            assert!(
+                destination_dir.path().join(&stray).exists(),
+                "a failed removal must leave the stray in place"
+            );
+
+            let record = crate::journal::latest_record("cleanup-failure-pair")
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.result, "partial");
+            assert_eq!(record.counts.failed, 1);
+            assert_eq!(record.counts.done, 0);
+        });
+    }
+
+    #[test]
+    fn reconcile_plan_retains_reviewed_actions_and_reports_discovered_after_review() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        fs::write(source_dir.path().join("reviewed.txt"), "a").unwrap();
+        crate::pair::add(
+            &config_path,
+            "reconcile-pair",
+            source_dir.path(),
+            destination_dir.path(),
+            crate::config::Mode::Mirror,
+            false,
+        )
+        .unwrap();
+        let (_, initial_plan) = plan::build(&config_path, "reconcile-pair", &[]).unwrap();
+        // Appears after the plan above was reviewed; reconcile must report it
+        // as discovered and must not fold it into the reconciled plan.
+        fs::write(source_dir.path().join("arrived-after-review.txt"), "b").unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        with_isolated_home_env(home.path(), || {
+            let journal = Journal::create("reconcile-pair", destination_dir.path()).unwrap();
+            let reporter = RunReporter::new(false);
+            let stats = RunStats::default();
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
+
+            let (_, plan) = reconcile_plan(
+                &config_path,
+                "reconcile-pair",
+                &[],
+                &initial_plan,
+                &mut session,
+            )
+            .unwrap();
+
+            assert_eq!(plan.copies, initial_plan.copies);
+            assert_eq!(session.stats.discovered_after_review, 1);
+        });
+    }
+
+    #[test]
+    fn dispatch_archives_a_structural_conflict_before_publishing_its_dependent_copy() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        fs::write(source_dir.path().join("album"), "new file").unwrap();
+        fs::create_dir(destination_dir.path().join("album")).unwrap();
+        fs::write(destination_dir.path().join("album/old.txt"), "old file").unwrap();
+        crate::pair::add(
+            &config_path,
+            "dispatch-pair",
+            source_dir.path(),
+            destination_dir.path(),
+            crate::config::Mode::Mirror,
+            false,
+        )
+        .unwrap();
+        let (pair, plan) = plan::build(&config_path, "dispatch-pair", &[]).unwrap();
+        assert_eq!(plan.deletes.len(), 1);
+        assert_eq!(
+            plan.deletes[0].structural_conflict,
+            Some(StructuralConflict::DestinationDirectory)
+        );
+        let home = tempfile::tempdir().unwrap();
+
+        with_isolated_home_env(home.path(), || {
+            #[cfg(all(feature = "fault-injection", debug_assertions))]
+            let archive_observed = {
+                let marker = home.path().join("archive-observed");
+                let _marker_guard =
+                    EnvVarGuard::set("VIBESYNC_TEST_ORDER_MARKER", marker.as_os_str());
+                let _fault_guard = EnvVarGuard::set(
+                    "VIBESYNC_TEST_EXEC_AT",
+                    std::ffi::OsStr::new(
+                        "archived:test ! -e \"$VIBESYNC_TEST_DESTINATION\" && test -e \"$VIBESYNC_TEST_SAFETY_NET\" && printf archived > \"$VIBESYNC_TEST_ORDER_MARKER\"",
+                    ),
+                );
+                (marker, _marker_guard, _fault_guard)
+            };
+            let journal = Journal::create("dispatch-pair", destination_dir.path()).unwrap();
+            let run_id = journal.run_id().to_string();
+            let reporter = RunReporter::new(false);
+            let stats = RunStats {
+                counts: Counts {
+                    planned: plan.copies.len() + plan.deletes.len(),
+                    ..Counts::default()
+                },
+                ..RunStats::default()
+            };
+            let mut session = RunSession {
+                journal,
+                reporter,
+                stats,
+            };
+
+            dispatch(&pair, &plan, false, false, &mut session).unwrap();
+
+            assert_eq!(
+                fs::read_to_string(destination_dir.path().join("album")).unwrap(),
+                "new file"
+            );
+            assert_eq!(
+                fs::read_to_string(
+                    destination_dir
+                        .path()
+                        .join("_SafetyNet")
+                        .join(&run_id)
+                        .join("album/old.txt")
+                )
+                .unwrap(),
+                "old file"
+            );
+            #[cfg(all(feature = "fault-injection", debug_assertions))]
+            assert_eq!(fs::read_to_string(&archive_observed.0).unwrap(), "archived");
+            assert_eq!(session.stats.counts.done, plan.copies.len() + 1);
+            assert_eq!(session.stats.counts.copied, plan.copies.len());
+            assert_eq!(session.stats.counts.deleted, 1);
+            assert_eq!(session.stats.counts.failed, 0);
+
+            drop(session);
+            let journal_path =
+                crate::journal::pair_directory("dispatch-pair").join(format!("{run_id}.ndjson"));
+            let events: Vec<serde_json::Value> = fs::read_to_string(journal_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let structural_delete_done = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "action_done"
+                        && event["op"] == "delete"
+                        && event["path"] == "album"
+                })
+                .unwrap();
+            let dependent_publish_done = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "action_done"
+                        && event["op"] == "copy"
+                        && event["path"] == "album"
+                })
+                .unwrap();
+            assert!(structural_delete_done < dependent_publish_done);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| { event["type"] == "action_done" && event["op"] == "delete" })
+                    .count(),
+                1,
+                "the structural conflict must be archived only once"
+            );
+        });
+    }
+
+    #[test]
+    fn finalize_records_synthetic_stats_and_returns_the_matching_exit_code() {
+        let destination_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        with_isolated_home_env(home.path(), || {
+            for (pair_name, failed, expected_result, expected_exit) in [
+                ("finalize-success-pair", 0, "success", EXIT_OK),
+                ("finalize-partial-pair", 2, "partial", 1),
+            ] {
+                let journal = Journal::create(pair_name, destination_dir.path()).unwrap();
+                let reporter = RunReporter::new(false);
+                let stats = RunStats {
+                    counts: Counts {
+                        planned: 4,
+                        done: 2,
+                        failed,
+                        copied: 1,
+                        updated: 1,
+                        deleted: 0,
+                    },
+                    bytes: 42,
+                    warnings: 3,
+                    discovered_after_review: 1,
+                };
+                let mut session = RunSession {
+                    journal,
+                    reporter,
+                    stats,
+                };
+
+                assert_eq!(finalize(&mut session).unwrap(), expected_exit);
+                let record = crate::journal::latest_record(pair_name).unwrap().unwrap();
+                assert_eq!(record.result, expected_result);
+                assert_eq!(record.counts.planned, 4);
+                assert_eq!(record.counts.done, 2);
+                assert_eq!(record.counts.failed, failed);
+                assert_eq!(record.bytes, 42);
+                assert_eq!(record.warnings, 3);
+                assert_eq!(record.discovered_after_review, 1);
+            }
+        });
     }
 }
