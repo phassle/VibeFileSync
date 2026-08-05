@@ -201,7 +201,7 @@ Refuse the request as asked — there is no mid-file resume in this product, the
 
 ## When a Run cannot start — exit 3 and exit 64
 
-Two ways a Run never reaches the confirmation gate or the stream `## Run — review, confirm, stream` describes: the reviewed plan itself cannot execute, or the invocation was malformed before any command logic ran. Neither is exit 2's Run precondition abort or exit 4's mid-run interruption — the distinction is *when* each check fires, not how "blocked" happens to sound next to "interrupted".
+Two ways a Run never reaches the confirmation gate or the stream `## Run — review, confirm, stream` describes: the reviewed plan itself cannot execute, or the invocation was malformed before any command logic ran. Neither is exit 2's Run preconditions abort or exit 4's mid-run interruption — the distinction is *when* each check fires, not how "blocked" happens to sound next to "interrupted".
 
 ### Exit 3 — blocked plan (`src/error.rs::EXIT_BLOCKED_PLAN`, 3)
 
@@ -213,12 +213,12 @@ Concretely, a plan error arrives as its own `op: "error"` row inside the same `v
 
 Distinguish from its neighbours, since all three read as "the run didn't happen":
 
-- Exit 2 (sibling #91's) is a Run precondition failing at invocation time — a different check, on different grounds, than an error already sitting in the plan.
+- Exit 2 (sibling #91's) is a Run preconditions failure at invocation time — a different check, on different grounds, than an error already sitting in the plan.
 - Exit 4 (sibling #90's) happens only after a journal already exists — a run that started and could not finish reliably.
 - Exit 3 is earlier than both: the check that produces it runs before the journal exists and before the confirmation gate is reached, so it is not a mutation gone wrong — it is a plan that never qualified to run.
 
 ### Exit 64 — usage (`src/error.rs::EXIT_USAGE`, 64)
 
-`EXIT_USAGE` covers a malformed invocation: an unparseable CLI invocation caught before any command runs (`src/main.rs`), and `AppError::Usage` cases raised deeper in — a bad, duplicate, or missing pair name, or a non-existent source/destination path.
+`EXIT_USAGE` covers a malformed invocation: an unparseable CLI invocation caught before any command runs (`src/main.rs::main`), and `AppError::Usage` cases raised deeper in — a bad, duplicate, or missing pair name, or a non-existent source/destination path.
 
-**Report and stop — no retry, no override offer.** On exit 64, report the usage error text to the human as written and stop there. Do not retry the same invocation unmodified, and do not offer any of the per-run overrides `## Run`'s sibling sections cover (`--permanent-delete`, `--allow-empty-source`, `--ignore-space-check`) — none of them addresses a malformed invocation, and offering one here would wrongly imply exit 64 is a Run precondition that can be bypassed the way exit 2 can be.
+**Report and stop — no retry, no override offer.** On exit 64, report the usage error text to the human as written and stop there. Do not retry the same invocation unmodified, and do not offer any of the per-run overrides `## Run`'s sibling sections cover (`--permanent-delete`, `--allow-empty-source`, `--ignore-space-check`) — none of them addresses a malformed invocation, and offering one here would wrongly imply exit 64 is a Run preconditions failure that can be bypassed the way exit 2 can be.
