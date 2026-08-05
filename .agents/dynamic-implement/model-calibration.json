@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-05T12:57:25Z",
+  "updatedAt": "2026-08-05T20:10:00Z",
   "source": "GitHub issue model-telemetry:v1 sections",
   "externalReview": {
-    "lastCheckedAt": "2026-08-05T12:57:25Z",
+    "lastCheckedAt": "2026-08-05T20:10:00Z",
     "outcome": "unchanged",
     "isFirstCheck": false,
     "examined": [
-      "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta against the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
-      "claude:claude-opus-5 route, availability, active status, and pricing delta against the tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
-      "new official cost-per-completed-task benchmark rounds since the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+      "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta against the tracked 2026-08-05T12:57:25Z snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+      "claude:claude-opus-5 route, availability, active status, and pricing delta against the tracked 2026-08-05T12:57:25Z snapshot (Anthropic Opus 5 documentation and model deprecations)",
+      "new official cost-per-completed-task benchmark rounds since the tracked 2026-08-05T12:57:25Z snapshot (Anthropic Sonnet 5 system card and official model documentation)",
       "known advertised claude:claude-fable-5 candidate status; still excluded from the verified code ladder by the existing user decision"
     ],
     "findings": [
@@ -50,8 +50,8 @@
           8,
           9
         ],
-        "localTelemetry": "none",
-        "detail": "Known and unchanged: $5/MTok input and $25/MTok output; still no eligible local implementer observation starting on this route. #111 started and finished on Sonnet 5/low; #113 started on Sonnet 5/low and finished a review-driven correction on Sonnet 5/medium.",
+        "localTelemetry": "one mid-unit escalation, still no starting-route observation",
+        "detail": "Known and unchanged: $5/MTok input and $25/MTok output. #111 started and finished on Sonnet 5/low; #113 started on Sonnet 5/low and finished a review-driven correction on Sonnet 5/medium. This calibration (#82, feature-reviewed telemetry from #83-94) adds one further data point: #85 escalated on the model dimension from claude:claude-sonnet-5/low to claude:claude-opus-5 mid-unit, after two valid material non-clean review passes with the same failure mode, because the Claude adapter exposes no effort control to escalate first. That is one implementer touching this route via escalation, not a starting-route trial, and one comparable unit is short of the two-unit threshold this rubric requires before treating it as a floor-raising ground.",
         "source": "Anthropic, Claude Opus 5 documentation, https://platform.claude.com/docs/en/about-claude/models/whats-new-opus-5",
         "retrievedAt": "2026-08-02T21:45:45Z"
       }
@@ -434,6 +434,246 @@
       "calibratedAt": "2026-08-05T12:57:25Z",
       "sourceCursor": "2026-08-05T12:55:27Z",
       "notes": "Four eligible units; all started at ladder index 0. Recommendation retained at claude:claude-sonnet-5/low with low confidence because no comparable unit started at a stronger step. Corrected #113 from clean-at-low to material re-review: its final unit route was claude:claude-sonnet-5/medium (ladder index 1), after low-effort work and review-driven correction; root review then added two Spec findings and one aggregated test-only fix pass. Therefore the group has two clean successes and two material re-reviews. #113's first implementer harness failure, planner API-529 failures, nested-PTY evidence, and root-remediation Codex attempts all have capabilityFailure:false or are explicitly non-capability integration evidence; they do not establish a required route escalation. #113 reports null usage, cost, token, and duration values, so it is counted in samples but not in the dollar median, which retains three cost-reporting units. The medium final effort is an observed successful recovery step, not a measured medium starting-step cost, so it is not added as a comparable costToAcceptance arm. No two capability-driven units and no 25%-lower stronger-step median exist; no floor raise is allowed. Index 0 cannot be lowered and no lower boundary probe exists. Cost remains confounded by change/context size."
+    },
+    {
+      "key": "phassle/VibeFileSync:claude:rust-agent-skill-docs:small",
+      "match": {
+        "harness": "claude",
+        "plannerSize": "small",
+        "languageOrChangeKind": "rust-agent-skill-docs",
+        "calibrationKeys": [
+          "rust",
+          "agent-skill-authoring",
+          "docs-invariant-test-seam",
+          "exact-path-matching",
+          "sync-mode-vocabulary",
+          "refusal-guidance",
+          "exit-code-taxonomy",
+          "gated-mutation"
+        ]
+      },
+      "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
+      "recommendedStart": {
+        "tier": "T1",
+        "routeId": "claude:claude-sonnet-5",
+        "modelFamily": "anthropic",
+        "modelId": "claude-sonnet-5",
+        "effort": "low",
+        "ladderIndex": 0
+      },
+      "observedBoundary": {
+        "highestCapabilityFailure": null,
+        "lowestCleanSuccess": "claude:claude-sonnet-5@low (ladderIndex 0)"
+      },
+      "boundaryProbe": {
+        "due": false,
+        "lastIssue": null,
+        "lastAt": null,
+        "lastStep": null,
+        "lastOutcome": null
+      },
+      "samples": {
+        "eligible": 6,
+        "cleanSuccess": 6,
+        "capabilityEscalation": 0,
+        "materialReReview": 0
+      },
+      "usage": {
+        "inputTokensRange": null,
+        "outputTokensRange": null,
+        "creditsRange": null,
+        "costRange": null,
+        "currency": null,
+        "durationMsRange": null
+      },
+      "costToAcceptance": {
+        "basis": "measured",
+        "unit": "attempts",
+        "currency": null,
+        "byStep": [
+          {
+            "route": "claude:claude-sonnet-5",
+            "effort": "low",
+            "ladderIndex": 0,
+            "units": 6,
+            "medianTotal": null,
+            "attemptsMedian": 1,
+            "includesRetriesAndFixPasses": true
+          }
+        ],
+        "cheapestObservedStep": "claude:claude-sonnet-5@low",
+        "confidence": "low"
+      },
+      "externalReview": {
+        "lastCheckedAt": "2026-08-05T20:10:00Z",
+        "examined": [
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05T12:57:25Z snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05T12:57:25Z snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05T12:57:25Z snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
+        ],
+        "changesFound": [],
+        "outcome": "unchanged",
+        "notCheckedReason": null
+      },
+      "externalPrior": {
+        "note": "seeds ordering before local telemetry exists; never counted as an observation. No cost-per-completed-task benchmark could be cited for either route, so relativeTokensForComparableWork is null and per-token price alone must not be used to rank these steps.",
+        "models": [
+          {
+            "route": "claude:claude-sonnet-5",
+            "relativeTokensForComparableWork": null,
+            "pricePerMTokenIn": 2.0,
+            "pricePerMTokenOut": 10.0,
+            "currency": "USD",
+            "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing - introductory rate in effect through 2026-08-31; rises to $3/$15 on 2026-09-01",
+            "retrievedAt": "2026-08-02T21:45:45Z"
+          },
+          {
+            "route": "claude:claude-opus-5",
+            "relativeTokensForComparableWork": null,
+            "pricePerMTokenIn": 5.0,
+            "pricePerMTokenOut": 25.0,
+            "currency": "USD",
+            "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing - Claude Opus 5 row: $5/MTok base input, $25/MTok output",
+            "retrievedAt": "2026-08-02T21:45:45Z"
+          }
+        ]
+      },
+      "costBasis": "measured",
+      "confidence": "medium",
+      "evidenceIssues": [
+        84,
+        86,
+        87,
+        88,
+        92,
+        93
+      ],
+      "calibratedAt": "2026-08-05T20:10:00Z",
+      "sourceCursor": "2026-08-05T20:05:00Z",
+      "notes": "First calibration of this group: six eligible small units from root feature #82, all Markdown-authoring work against a shared documentation invariant test seam in a Rust repository (agent-skill documentation, not Rust code implementation) — a narrow work class that must not be generalised to Rust code changes generally. All six started and finished cleanly on claude:claude-sonnet-5/low (ladderIndex 0): zero capability escalations, zero material review-driven fix passes. #84's one fix pass was excluded from materialReReview because its own notes record it as ordinary TDD self-correction found by the unit's own test step, not review-driven. #88's first review pass was discarded as an invalidated dispatch (stdin-blocked reviewer leaves), not a review result; its recorded pass (r1b) was clean. #93 shows acceptancePassed:false, but its own notes attribute this to two acceptance criteria that were unsatisfiable by construction (documenting a CLI flag the real binary variant does not accept) — a defect in the issue, not in the model's capability — so it is counted as a clean model-routing success. Recommendation retained at claude:claude-sonnet-5/low: index 0 is already the verified floor, so no further lowering or boundary probe below it is possible, and six-of-six clean at the floor is exactly the kind of evidence the lowering threshold asks for, it just has nowhere lower to go. The Claude subagent adapter exposes model but not effort, so effort reads 'unknown' on every attempt here; this group's evidence is model-axis only and must not be read as saying anything about effort steps. No usage/cost/token/duration figures were reported by the harness for any attempt in any of the twelve #83-94 units, so costToAcceptance falls back to attempt count (unit: attempts) with confidence low, per the rubric's fallback order."
+    },
+    {
+      "key": "phassle/VibeFileSync:claude:rust-agent-skill-docs:medium",
+      "match": {
+        "harness": "claude",
+        "plannerSize": "medium",
+        "languageOrChangeKind": "rust-agent-skill-docs",
+        "calibrationKeys": [
+          "rust",
+          "agent-skill-authoring",
+          "docs-invariant-test-seam",
+          "front-matter",
+          "ndjson-contract",
+          "safety-invariant-prose",
+          "confirmation-gate",
+          "exit-code-taxonomy",
+          "convergence",
+          "precondition-overrides",
+          "gated-mutation",
+          "context-vocabulary"
+        ]
+      },
+      "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
+      "recommendedStart": {
+        "tier": "T1",
+        "routeId": "claude:claude-sonnet-5",
+        "modelFamily": "anthropic",
+        "modelId": "claude-sonnet-5",
+        "effort": "low",
+        "ladderIndex": 0
+      },
+      "observedBoundary": {
+        "highestCapabilityFailure": null,
+        "lowestCleanSuccess": "claude:claude-sonnet-5@low (ladderIndex 0)"
+      },
+      "boundaryProbe": {
+        "due": false,
+        "lastIssue": null,
+        "lastAt": null,
+        "lastStep": null,
+        "lastOutcome": null
+      },
+      "samples": {
+        "eligible": 6,
+        "cleanSuccess": 1,
+        "capabilityEscalation": 1,
+        "materialReReview": 5
+      },
+      "usage": {
+        "inputTokensRange": null,
+        "outputTokensRange": null,
+        "creditsRange": null,
+        "costRange": null,
+        "currency": null,
+        "durationMsRange": null
+      },
+      "costToAcceptance": {
+        "basis": "measured",
+        "unit": "attempts",
+        "currency": null,
+        "byStep": [
+          {
+            "route": "claude:claude-sonnet-5",
+            "effort": "low",
+            "ladderIndex": 0,
+            "units": 6,
+            "medianTotal": null,
+            "attemptsMedian": 2,
+            "includesRetriesAndFixPasses": true
+          }
+        ],
+        "cheapestObservedStep": "claude:claude-sonnet-5@low",
+        "confidence": "low"
+      },
+      "externalReview": {
+        "lastCheckedAt": "2026-08-05T20:10:00Z",
+        "examined": [
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05T12:57:25Z snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05T12:57:25Z snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05T12:57:25Z snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
+        ],
+        "changesFound": [],
+        "outcome": "unchanged",
+        "notCheckedReason": null
+      },
+      "externalPrior": {
+        "note": "seeds ordering before local telemetry exists; never counted as an observation. No cost-per-completed-task benchmark could be cited for either route, so relativeTokensForComparableWork is null and per-token price alone must not be used to rank these steps.",
+        "models": [
+          {
+            "route": "claude:claude-sonnet-5",
+            "relativeTokensForComparableWork": null,
+            "pricePerMTokenIn": 2.0,
+            "pricePerMTokenOut": 10.0,
+            "currency": "USD",
+            "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing - introductory rate in effect through 2026-08-31; rises to $3/$15 on 2026-09-01",
+            "retrievedAt": "2026-08-02T21:45:45Z"
+          },
+          {
+            "route": "claude:claude-opus-5",
+            "relativeTokensForComparableWork": null,
+            "pricePerMTokenIn": 5.0,
+            "pricePerMTokenOut": 25.0,
+            "currency": "USD",
+            "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing - Claude Opus 5 row: $5/MTok base input, $25/MTok output",
+            "retrievedAt": "2026-08-02T21:45:45Z"
+          }
+        ]
+      },
+      "costBasis": "measured",
+      "confidence": "low",
+      "evidenceIssues": [
+        83,
+        85,
+        89,
+        90,
+        91,
+        94
+      ],
+      "calibratedAt": "2026-08-05T20:10:00Z",
+      "sourceCursor": "2026-08-05T20:05:00Z",
+      "notes": "First calibration of this group: six eligible medium units from root feature #82, the same narrow Markdown-authoring-against-a-shared-test-seam work class as the sibling small group, not general Rust code implementation. Only #89 was clean on the first pass. #85 is the run's one model-dimension escalation: after two valid material non-clean review passes with the same failure mode (unqualified safety absolutes in prose), the implementer moved from claude:claude-sonnet-5/low to claude:claude-opus-5, skipping the usual same-model effort escalation step because the Claude subagent adapter exposes no effort control to raise first (effort reads 'unknown' on every attempt in this run) — so this is model-axis evidence only, and no effort-axis conclusion can be drawn from it. One escalated unit is short of the rubric's two-comparable-unit threshold for raising the floor, so the recommendation is retained at claude:claude-sonnet-5/low rather than raised to opus-5; this is recorded as evidence to watch, not as a floor change. #83, #90, #91, and #94 each required one or more review-driven fix passes without any route escalation: #90, #91, and #94 had findings the reviewer upheld and the implementer fixed at the same route; #83's two Spec findings were themselves adjudicated as a rejected interpretive claim (a maintainer-reversible reading, not a code defect) even though the unit still consumed two review passes and a fix pass, so #83 is counted toward materialReReview's attempt cost but is explicitly not capability-escalation evidence — separating the code fact from the interpretive spec reading per this team's own review practice. Net signal: this work class shows a materially higher re-review rate than its small-sized sibling group (5 of 6 vs 0 of 6), but because only one of those five re-reviews actually required a stronger route, the evidence supports 'expect more turns at this size' rather than 'start higher for this size'. No usage/cost/token/duration figures were reported by the harness for any attempt in any of the twelve #83-94 units, so costToAcceptance falls back to attempt count (unit: attempts) with confidence low."
     }
   ]
 }
