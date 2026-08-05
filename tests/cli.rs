@@ -2066,6 +2066,67 @@ fn reviewed_structural_conflicts_preserve_unreviewed_directories() {
         .is_dir());
 }
 
+/// Pinned against the `vibefilesync.run/v1` stream produced by the
+/// pre-refactor `RunReporter` (issue #112): the reporter's internal seam may
+/// change, but this NDJSON shape must not. `run_id` is the run's only
+/// non-deterministic field, so it is redacted before comparison.
+#[test]
+fn run_json_output_is_byte_identical_to_the_pinned_reporter_baseline() {
+    let fx = Fixture::new();
+    fx.write_source("file.txt", "hello world");
+    fx.write_source("sub/nested.txt", "nested");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .args(["run", "photos", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+
+    let raw = String::from_utf8(output.stdout).unwrap();
+    let run_id = find_run_id(&raw);
+    let redacted: Vec<String> = raw
+        .lines()
+        .map(|line| line.replace(run_id, "RUN_ID"))
+        .collect();
+
+    let source = fx.source.path().to_string_lossy().into_owned();
+    let destination = fx.destination.path().to_string_lossy().into_owned();
+    // `serde_json::Value`'s default `Map` is a `BTreeMap` (this crate does
+    // not enable serde_json's `preserve_order` feature), so every object's
+    // keys serialize in the same alphabetical order regardless of the
+    // insertion order in `src/event.rs`'s `json!()` literals. These
+    // expectations are literal bytes, not re-parsed JSON, so a field-order
+    // regression in `src/event.rs` fails this assertion directly.
+    let expected: Vec<String> = vec![
+        format!(
+            r#"{{"degradations":[],"destination":"{destination}","mode":"mirror","pair":"photos","planned":2,"planned_actions":[{{"bytes":11,"op":"copy","path":"file.txt"}},{{"bytes":6,"op":"copy","path":"sub/nested.txt"}}],"run_id":"RUN_ID","schema":"vibefilesync.run/v1","source":"{source}","type":"run_start","warnings":["vibesync: warning: _SafetyNet/ uses 0 bytes"]}}"#
+        ),
+        r#"{"bytes":11,"op":"copy","path":"file.txt","run_id":"RUN_ID","schema":"vibefilesync.run/v1","type":"action_start"}"#.to_string(),
+        r#"{"bytes":11,"op":"copy","path":"file.txt","result":"done","run_id":"RUN_ID","safety_net":null,"schema":"vibefilesync.run/v1","type":"action_done","verified":"standard","warnings":[]}"#.to_string(),
+        r#"{"bytes":6,"op":"copy","path":"sub/nested.txt","run_id":"RUN_ID","schema":"vibefilesync.run/v1","type":"action_start"}"#.to_string(),
+        r#"{"bytes":6,"op":"copy","path":"sub/nested.txt","result":"done","run_id":"RUN_ID","safety_net":null,"schema":"vibefilesync.run/v1","type":"action_done","verified":"standard","warnings":[]}"#.to_string(),
+        r#"{"bytes":17,"counts":{"copied":2,"deleted":0,"done":2,"failed":0,"planned":2,"updated":0},"discovered_after_review":0,"result":"success","run_id":"RUN_ID","schema":"vibefilesync.run/v1","type":"summary","warnings":0}"#.to_string(),
+    ];
+
+    assert_eq!(
+        redacted, expected,
+        "run --json NDJSON stream must stay byte-identical (including field order) across the reporter refactor"
+    );
+}
+
+/// Locates the run's `run_id` value by a raw substring search rather than a
+/// JSON parse, so the byte-identity assertion above never routes through
+/// `serde_json::Value` (which would silently re-normalize field order).
+fn find_run_id(raw: &str) -> &str {
+    let key = "\"run_id\":\"";
+    let key_start = raw.find(key).expect("a run_id field is present");
+    let rest = &raw[key_start + key.len()..];
+    let end = rest.find('"').expect("run_id value is quoted");
+    &rest[..end]
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn structural_replacement_gate_failure_leaves_destination_and_safetynet_untouched() {
