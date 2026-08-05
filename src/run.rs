@@ -13,12 +13,39 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK};
+use crate::error::{AppError, EXIT_BLOCKED_PLAN, EXIT_OK, EXIT_PRECONDITION};
 use crate::event::{MetadataWarning, VerificationTier};
 use crate::failure::{ActionFailure, FailureReason};
 use crate::journal::{Counts, Journal, Operation, PairLock, RunStats};
 use crate::plan::{self, Action};
 use crate::structural_conflict::{self, ConflictSet};
+
+/// Typed outcome returned by `run_reviewed`. The two refusal classes the TUI
+/// branches on are named variants so callers can match without string-matching
+/// `AppError::Precondition` prose. All other errors surface as `Failed`.
+#[derive(Debug)]
+pub(crate) enum RunOutcome {
+    /// The run completed (or was cleanly skipped) with the given exit code.
+    Completed(i32),
+    /// Another run is already in progress for this pair (pair-lock contention).
+    LockContention,
+    /// The Folder pair's definition changed between Review and execution.
+    PairChangedDuringReview,
+    /// Any other error; callers should surface or propagate it.
+    Failed(AppError),
+}
+
+impl RunOutcome {
+    /// Widens to an `i32` process exit code, preserving ADR-0004's taxonomy.
+    pub(crate) fn into_exit_code(self) -> Result<i32, AppError> {
+        match self {
+            RunOutcome::Completed(code) => Ok(code),
+            RunOutcome::LockContention => Ok(EXIT_PRECONDITION),
+            RunOutcome::PairChangedDuringReview => Ok(EXIT_PRECONDITION),
+            RunOutcome::Failed(err) => Err(err),
+        }
+    }
+}
 
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 18) | (1 << 19);
 const F_FULLFSYNC: libc::c_int = 51;
@@ -327,17 +354,32 @@ pub(crate) fn run_reviewed(
     options: RunOptions<'_>,
     reviewed_pair: crate::config::Pair,
     initial_plan: plan::Plan,
-) -> Result<i32, AppError> {
-    let configured = configured_pair(config_path, pair_name)?;
-    let _pair_lock = PairLock::acquire(pair_name).map_err(lock_error)?;
-    let (pair, notices) = crate::preconditions::resolve_pair(&configured)?;
+) -> RunOutcome {
+    let configured = match configured_pair(config_path, pair_name) {
+        Ok(p) => p,
+        Err(e) => return RunOutcome::Failed(e),
+    };
+    let _pair_lock = match PairLock::acquire(pair_name) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            return RunOutcome::LockContention;
+        }
+        Err(e) => return RunOutcome::Failed(io_error(e)),
+    };
+    let (pair, notices) = match crate::preconditions::resolve_pair(&configured) {
+        Ok(r) => r,
+        Err(e) => return RunOutcome::Failed(e),
+    };
     for notice in notices {
         eprintln!("{notice}");
     }
-    if let Some(error) = stale_pair_error(&pair, &reviewed_pair) {
-        return Err(error);
+    if stale_pair_error(&pair, &reviewed_pair).is_some() {
+        return RunOutcome::PairChangedDuringReview;
     }
-    execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, false)
+    match execute_reviewed_plan(config_path, pair_name, options, pair, initial_plan, false) {
+        Ok(code) => RunOutcome::Completed(code),
+        Err(e) => RunOutcome::Failed(e),
+    }
 }
 
 /// A plan is read-only, per ADR-0010's lifecycle: once Review has captured a
@@ -1856,6 +1898,114 @@ mod tests {
             stale_pair_error(&redefined, &reviewed)
         );
         assert!(stale_pair_error(&reviewed, &reviewed).is_none());
+    }
+
+    #[test]
+    fn run_reviewed_returns_lock_contention_when_pair_lock_is_already_held() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_uuid = crate::volume::volume_uuid(source.path()).unwrap();
+        let destination_uuid = crate::volume::volume_uuid(destination.path()).unwrap();
+
+        let pair_name = "lock-contention-test";
+        let pair = crate::config::Pair {
+            source: source.path().to_path_buf(),
+            source_volume_uuid: source_uuid,
+            source_volume_name: None,
+            source_volume_relative_path: Some(PathBuf::new()),
+            destination: destination.path().to_path_buf(),
+            destination_volume_uuid: destination_uuid,
+            destination_volume_name: None,
+            destination_volume_relative_path: Some(PathBuf::new()),
+            mode: crate::config::Mode::Mirror,
+        };
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut config = crate::config::Config::default();
+        config.pairs.insert(pair_name.to_string(), pair.clone());
+        crate::config::save(&config_path, &config).unwrap();
+
+        // Acquire the lock before calling run_reviewed so the second
+        // acquisition inside run_reviewed returns LockContention.
+        let _held = PairLock::acquire(pair_name).expect("first acquire must succeed");
+
+        let outcome = run_reviewed(
+            &config_path,
+            pair_name,
+            RunOptions {
+                yes: true,
+                permanent_delete: false,
+                allow_empty_source: false,
+                ignore_space_check: false,
+                json_output: false,
+                full_verify: false,
+                excludes: &[],
+            },
+            pair,
+            plan::Plan::default(),
+        );
+        assert!(
+            matches!(outcome, RunOutcome::LockContention),
+            "expected LockContention, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn run_reviewed_returns_pair_changed_when_definition_differs_from_reviewed_pair() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_uuid = crate::volume::volume_uuid(source.path()).unwrap();
+        let destination_uuid = crate::volume::volume_uuid(destination.path()).unwrap();
+
+        let current_pair = crate::config::Pair {
+            source: source.path().to_path_buf(),
+            source_volume_uuid: source_uuid.clone(),
+            source_volume_name: None,
+            source_volume_relative_path: Some(PathBuf::new()),
+            destination: destination.path().to_path_buf(),
+            destination_volume_uuid: destination_uuid.clone(),
+            destination_volume_name: None,
+            destination_volume_relative_path: Some(PathBuf::new()),
+            mode: crate::config::Mode::Mirror,
+        };
+
+        // reviewed_pair uses a different destination path, simulating a
+        // definition change that happened between Compare and the execute step.
+        let other_destination = tempfile::tempdir().unwrap();
+        let other_dest_uuid = crate::volume::volume_uuid(other_destination.path()).unwrap();
+        let reviewed_pair = crate::config::Pair {
+            destination: other_destination.path().to_path_buf(),
+            destination_volume_uuid: other_dest_uuid,
+            ..current_pair.clone()
+        };
+
+        // Write a config that has the current (post-change) pair definition.
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut config = crate::config::Config::default();
+        config.pairs.insert("pair-changed-test".to_string(), current_pair);
+        crate::config::save(&config_path, &config).unwrap();
+
+        let outcome = run_reviewed(
+            &config_path,
+            "pair-changed-test",
+            RunOptions {
+                yes: true,
+                permanent_delete: false,
+                allow_empty_source: false,
+                ignore_space_check: false,
+                json_output: false,
+                full_verify: false,
+                excludes: &[],
+            },
+            reviewed_pair,
+            plan::Plan::default(),
+        );
+        assert!(
+            matches!(outcome, RunOutcome::PairChangedDuringReview),
+            "expected PairChangedDuringReview, got {outcome:?}"
+        );
     }
 
     #[test]
