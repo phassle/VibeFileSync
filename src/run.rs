@@ -84,28 +84,25 @@ pub struct RunOptions<'a> {
 /// Where a human-facing line goes; chosen by the call site the way the
 /// original per-message methods each hard-coded a stream, not by the
 /// adapter (an adapter that renders text always honours the stream it is
-/// given; one that doesn't render text ignores it either way).
+/// given; one that doesn't render text ignores it either way). `Notice` is
+/// the one exception: it is the cancellation line, the single message every
+/// adapter renders even though `JsonReporter` otherwise suppresses
+/// `emit_lines` entirely, so each adapter still picks its own channel for it
+/// (Human's copy goes to stdout, Json's to stderr, since Json's stdout is
+/// reserved for the event stream).
 enum Stream {
     Stdout,
     Stderr,
+    Notice,
 }
 
 /// The narrowed reporter seam (issue #112): every wire event goes through
 /// `emit`, every human-only line through `emit_lines`, and the one seam that
-/// reads from stdin stays `confirm`. `cancelled` and `is_json` are the two
-/// documented exceptions load-bearing on the wire/UX contract:
-/// - `cancelled` is the only line Json ever renders, and it (deliberately)
-///   goes to stderr while Human's goes to stdout, so it cannot be reduced to
-///   an adapter-uniform `emit_lines` call without a caller-chosen stream
-///   changing per adapter, which `emit_lines` does not do.
-/// - `is_json` is not a rendered message at all — the copy loop queries it
-///   to decide whether to report byte-level progress during a copy.
+/// reads from stdin stays `confirm`.
 trait Reporter {
     fn emit(&self, event: Event) -> Result<(), AppError>;
     fn emit_lines(&self, stream: Stream, lines: &[String]);
     fn confirm(&self) -> Result<bool, AppError>;
-    fn cancelled(&self);
-    fn is_json(&self) -> bool;
 }
 
 fn new_reporter(json: bool) -> Box<dyn Reporter> {
@@ -125,7 +122,7 @@ impl Reporter for HumanReporter {
 
     fn emit_lines(&self, stream: Stream, lines: &[String]) {
         match stream {
-            Stream::Stdout => {
+            Stream::Stdout | Stream::Notice => {
                 for line in lines {
                     println!("{line}");
                 }
@@ -143,14 +140,6 @@ impl Reporter for HumanReporter {
         io::stdout().flush().map_err(io_error)?;
         read_confirmation()
     }
-
-    fn cancelled(&self) {
-        println!("Run cancelled; destination unchanged.");
-    }
-
-    fn is_json(&self) -> bool {
-        false
-    }
 }
 
 struct JsonReporter;
@@ -160,20 +149,18 @@ impl Reporter for JsonReporter {
         crate::ndjson::stdout(&event)
     }
 
-    fn emit_lines(&self, _stream: Stream, _lines: &[String]) {}
+    fn emit_lines(&self, stream: Stream, lines: &[String]) {
+        if let Stream::Notice = stream {
+            for line in lines {
+                eprintln!("{line}");
+            }
+        }
+    }
 
     fn confirm(&self) -> Result<bool, AppError> {
         eprint!("Proceed with COPY actions? [y/N] ");
         io::stderr().flush().map_err(io_error)?;
         read_confirmation()
-    }
-
-    fn cancelled(&self) {
-        eprintln!("Run cancelled; destination unchanged.");
-    }
-
-    fn is_json(&self) -> bool {
-        true
     }
 }
 
@@ -209,12 +196,6 @@ impl Reporter for CaptureReporter {
 
     fn confirm(&self) -> Result<bool, AppError> {
         Ok(true)
-    }
-
-    fn cancelled(&self) {}
-
-    fn is_json(&self) -> bool {
-        true
     }
 }
 
@@ -441,7 +422,10 @@ fn execute_reviewed_plan(
     }
 
     if !yes && !reporter.confirm()? {
-        reporter.cancelled();
+        reporter.emit_lines(
+            Stream::Notice,
+            &["Run cancelled; destination unchanged.".to_string()],
+        );
         return Ok(EXIT_OK);
     }
 
@@ -459,7 +443,7 @@ fn execute_reviewed_plan(
             &degradations,
         )
         .map_err(io_error)?;
-    reporter.emit(crate::event::run_run_start(
+    reporter.emit(crate::event::public_run_start(
         context(journal.run_id()),
         pair_name,
         &pair,
@@ -648,7 +632,6 @@ fn execute_reviewed_plan(
             run_id: journal.run_id(),
             permanent_delete,
             full_verify,
-            report_progress: reporter.is_json(),
             structural_delete,
         };
         let result = if plan.directory_copies.contains(&action.rel_path) {
@@ -1005,7 +988,6 @@ fn copy_file(
         run_id,
         permanent_delete,
         full_verify,
-        report_progress,
         structural_delete,
     } = options;
     let planned_source_mtime = match action.source_mtime {
@@ -1031,10 +1013,7 @@ fn copy_file(
             #[cfg(all(feature = "fault-injection", debug_assertions))]
             fs::remove_file(temp)?;
             copyfile_all_but_acls(source, temp)?;
-        } else if report_progress
-            && action.bytes >= PROGRESS_THRESHOLD
-            && fs::symlink_metadata(source)?.is_file()
-        {
+        } else if action.bytes >= PROGRESS_THRESHOLD && fs::symlink_metadata(source)?.is_file() {
             copyfile_all_but_acls_with_progress(source, temp, action.bytes, progress)?;
         } else {
             copyfile_all_but_acls(source, temp)?;
@@ -1136,7 +1115,6 @@ struct CopyOptions<'a> {
     run_id: &'a str,
     permanent_delete: bool,
     full_verify: bool,
-    report_progress: bool,
     structural_delete: Option<&'a Action>,
 }
 
@@ -2010,7 +1988,6 @@ mod tests {
                 run_id: "20260716T120000Z",
                 permanent_delete: false,
                 full_verify: false,
-                report_progress: false,
                 structural_delete: None,
             },
             &mut |_| Ok(()),
@@ -2055,7 +2032,6 @@ mod tests {
                 run_id: "20260716T120000Z",
                 permanent_delete: false,
                 full_verify: false,
-                report_progress: false,
                 structural_delete: None,
             },
             &mut |_| Ok(()),

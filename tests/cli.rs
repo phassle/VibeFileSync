@@ -2084,37 +2084,47 @@ fn run_json_output_is_byte_identical_to_the_pinned_reporter_baseline() {
         .unwrap();
     assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
 
-    let redact_run_id = |line: &str| -> serde_json::Value {
-        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
-        value["run_id"] = serde_json::json!("RUN_ID");
-        value
-    };
-    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
-        .unwrap()
+    let raw = String::from_utf8(output.stdout).unwrap();
+    let run_id = find_run_id(&raw);
+    let redacted: Vec<String> = raw
         .lines()
-        .map(redact_run_id)
+        .map(|line| line.replace(run_id, "RUN_ID"))
         .collect();
 
     let source = fx.source.path().to_string_lossy().into_owned();
     let destination = fx.destination.path().to_string_lossy().into_owned();
-    let expected: Vec<serde_json::Value> = [
+    // `serde_json::Value`'s default `Map` is a `BTreeMap` (this crate does
+    // not enable serde_json's `preserve_order` feature), so every object's
+    // keys serialize in the same alphabetical order regardless of the
+    // insertion order in `src/event.rs`'s `json!()` literals. These
+    // expectations are literal bytes, not re-parsed JSON, so a field-order
+    // regression in `src/event.rs` fails this assertion directly.
+    let expected: Vec<String> = vec![
         format!(
-            r#"{{"schema":"vibefilesync.run/v1","type":"run_start","run_id":"RUN_ID","pair":"photos","source":"{source}","destination":"{destination}","warnings":["vibesync: warning: _SafetyNet/ uses 0 bytes"],"degradations":[],"mode":"mirror","planned":2,"planned_actions":[{{"op":"copy","path":"file.txt","bytes":11}},{{"op":"copy","path":"sub/nested.txt","bytes":6}}]}}"#
+            r#"{{"degradations":[],"destination":"{destination}","mode":"mirror","pair":"photos","planned":2,"planned_actions":[{{"bytes":11,"op":"copy","path":"file.txt"}},{{"bytes":6,"op":"copy","path":"sub/nested.txt"}}],"run_id":"RUN_ID","schema":"vibefilesync.run/v1","source":"{source}","type":"run_start","warnings":["vibesync: warning: _SafetyNet/ uses 0 bytes"]}}"#
         ),
-        r#"{"schema":"vibefilesync.run/v1","type":"action_start","run_id":"RUN_ID","op":"copy","path":"file.txt","bytes":11}"#.to_string(),
-        r#"{"schema":"vibefilesync.run/v1","type":"action_done","run_id":"RUN_ID","op":"copy","path":"file.txt","result":"done","bytes":11,"verified":"standard","safety_net":null,"warnings":[]}"#.to_string(),
-        r#"{"schema":"vibefilesync.run/v1","type":"action_start","run_id":"RUN_ID","op":"copy","path":"sub/nested.txt","bytes":6}"#.to_string(),
-        r#"{"schema":"vibefilesync.run/v1","type":"action_done","run_id":"RUN_ID","op":"copy","path":"sub/nested.txt","result":"done","bytes":6,"verified":"standard","safety_net":null,"warnings":[]}"#.to_string(),
-        r#"{"schema":"vibefilesync.run/v1","type":"summary","run_id":"RUN_ID","result":"success","counts":{"planned":2,"done":2,"copied":2,"updated":0,"deleted":0,"failed":0},"bytes":17,"warnings":0,"discovered_after_review":0}"#.to_string(),
-    ]
-    .iter()
-    .map(|line| serde_json::from_str(line).unwrap())
-    .collect();
+        r#"{"bytes":11,"op":"copy","path":"file.txt","run_id":"RUN_ID","schema":"vibefilesync.run/v1","type":"action_start"}"#.to_string(),
+        r#"{"bytes":11,"op":"copy","path":"file.txt","result":"done","run_id":"RUN_ID","safety_net":null,"schema":"vibefilesync.run/v1","type":"action_done","verified":"standard","warnings":[]}"#.to_string(),
+        r#"{"bytes":6,"op":"copy","path":"sub/nested.txt","run_id":"RUN_ID","schema":"vibefilesync.run/v1","type":"action_start"}"#.to_string(),
+        r#"{"bytes":6,"op":"copy","path":"sub/nested.txt","result":"done","run_id":"RUN_ID","safety_net":null,"schema":"vibefilesync.run/v1","type":"action_done","verified":"standard","warnings":[]}"#.to_string(),
+        r#"{"bytes":17,"counts":{"copied":2,"deleted":0,"done":2,"failed":0,"planned":2,"updated":0},"discovered_after_review":0,"result":"success","run_id":"RUN_ID","schema":"vibefilesync.run/v1","type":"summary","warnings":0}"#.to_string(),
+    ];
 
     assert_eq!(
-        rows, expected,
-        "run --json NDJSON stream must stay byte-identical across the reporter refactor"
+        redacted, expected,
+        "run --json NDJSON stream must stay byte-identical (including field order) across the reporter refactor"
     );
+}
+
+/// Locates the run's `run_id` value by a raw substring search rather than a
+/// JSON parse, so the byte-identity assertion above never routes through
+/// `serde_json::Value` (which would silently re-normalize field order).
+fn find_run_id(raw: &str) -> &str {
+    let key = "\"run_id\":\"";
+    let key_start = raw.find(key).expect("a run_id field is present");
+    let rest = &raw[key_start + key.len()..];
+    let end = rest.find('"').expect("run_id value is quoted");
+    &rest[..end]
 }
 
 #[cfg(feature = "fault-injection")]

@@ -75,11 +75,13 @@ pub fn run_start(
     })
 }
 
-/// The public run stream's `run_start` additionally records the mode and
-/// the plan being executed (ADR-0004 §4); the retained Journal's
-/// `run_start` does not, so this stays a distinct constructor from the one
-/// above rather than a shared one with optional fields.
-pub fn run_run_start(
+/// Both the public run stream's `run_start` and the retained Journal's
+/// `run_start` (`Journal::run_start`, which calls the base constructor above
+/// and then injects `planned_actions` itself) record the plan being executed
+/// (ADR-0007 §3). The public-stream variant additionally records `mode` at
+/// the top level (ADR-0004 §4); that is the real reason this stays a
+/// distinct constructor rather than a shared one with optional fields.
+pub fn public_run_start(
     context: Context<'_>,
     pair_name: &str,
     pair: &crate::config::Pair,
