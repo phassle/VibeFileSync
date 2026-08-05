@@ -88,7 +88,7 @@ entry per past Run id: its Run id, result, action counts, bytes, and warning cou
 ### Filtered pair list
 
 `pair list --check` classifies each side of every Folder pair's volume state — advisory only, per the Run
-preconditions ADR-0002 — so a missing drive is visible before a sync is attempted, not after.
+preconditions ADR-0002 — so a missing drive is visible before a Run is attempted, not after.
 
 - Real binary: `vibesync pair list --check`
 - Development fallback: `cargo run --locked -- pair list --check`

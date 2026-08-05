@@ -594,7 +594,7 @@ fn help_lists_option(help: &str, flag: &str) -> bool {
     false
 }
 
-/// Every fenced `vibesync ...` invocation an agent doc shows must resolve
+/// Every inline-backtick `vibesync ...` invocation an agent doc shows must resolve
 /// against the real binary's own `--help`: each subcommand it names must be
 /// listed at that level, and each `--flag` it passes must be listed on that
 /// exact invocation's help. No glob engine, no invented flags, no exit-code
