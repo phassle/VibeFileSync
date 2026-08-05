@@ -258,6 +258,30 @@ Offer only the override that matches the Run precondition actually named in the 
 
 `--permanent-delete` does not belong in the mapping above. No Run precondition fires for it, and no exit 2 ever names it — it is not a Run precondition at all, but a SafetyNet bypass. By default, a replaced or removed destination object is archived by rename before removal; a run given `--permanent-delete` removes the object directly instead (`src/run.rs::remove_file`), and `tests/cli.rs::permanent_delete_bypasses_safetynet_for_this_run` asserts the object is gone afterward with no `_SafetyNet` left behind at all — that default-vs-bypass is conditional, never state it as an unqualified guarantee either way. Never offer `--permanent-delete` in response to an exit 2 abort, and never bundle it with `--allow-empty-source` or `--ignore-space-check`. If the human wants to skip SafetyNet for a run, that is its own separate explicit yes/no question, asked on its own terms, subject to the same never-auto-applied, never-silent rule as the two precondition overrides above.
 
+## When a Run cannot start — exit 3 and exit 64
+
+Two ways a Run never reaches the confirmation gate or the stream `## Run — review, confirm, stream` describes: the reviewed plan itself cannot execute, or the invocation was malformed before any command logic ran. Neither is exit 2's Run preconditions abort or exit 4's mid-run interruption — the distinction is *when* each check fires, not how "blocked" happens to sound next to "interrupted".
+
+### Exit 3 — blocked plan (`src/error.rs::EXIT_BLOCKED_PLAN`, 3)
+
+`EXIT_BLOCKED_PLAN`'s doc comment: "The reviewed plan contains an included error action and cannot run." `src/run.rs::review_plan` checks the plan's error list before the confirmation gate `## Run` already describes — satisfied there by the human's chat "yes" plus the agent's own `--yes` — is even consulted, and returns early on that check alone while an error action is still included. Per ADR-0003 §5, an included plan error "blocks confirmation while included: the user must exclude the row … or resolve it at the source. No auto-skip-with-warning." Exit 3 is what that blocking looks like from outside: the plan an agent normally runs under `--yes` turned out to contain a row the binary refuses to execute.
+
+Concretely, a plan error arrives as its own `op: "error"` row inside the same `vibefilesync.plan/v1` stream `## Compare` already parses (`src/plan.rs::PlanError`), carrying a `path` and a `reason`. That row is "the new failed action" the acceptance criterion means.
+
+**No Run.** `review_plan`'s error check runs before any journal is opened, so exit 3 means mutation never started — not a partial one. On exit 3, send the human back to `## Compare` with that error row surfaced, so they can exclude it or fix it at the source and re-plan; this section does not re-describe the two-sided table or the confirm step, both of which belong to `## Compare` and `## Run`.
+
+Distinguish from its neighbours, since all three read as "the run didn't happen":
+
+- Exit 2 (sibling #91's) is a Run preconditions failure at invocation time — a different check, on different grounds, than an error already sitting in the plan.
+- Exit 4 (sibling #90's) happens only after a journal already exists — a run that started and could not finish reliably.
+- Exit 3 is earlier than both: the check that produces it runs before the journal exists and before the confirmation gate is reached, so it is not a mutation gone wrong — it is a plan that never qualified to run.
+
+### Exit 64 — usage (`src/error.rs::EXIT_USAGE`, 64)
+
+`EXIT_USAGE` covers a malformed invocation: an unparseable CLI invocation caught before any command runs (`src/main.rs::main`), and `AppError::Usage` cases raised deeper in — a bad, duplicate, or missing pair name, or a non-existent source/destination path.
+
+**Report and stop — no retry, no override offer.** On exit 64, report the usage error text to the human as written and stop there. Do not retry the same invocation unmodified, and do not offer any of the per-run overrides `## Run`'s sibling sections cover (`--permanent-delete`, `--allow-empty-source`, `--ignore-space-check`) — none of them addresses a malformed invocation, and offering one here would wrongly imply exit 64 is a Run preconditions failure that can be bypassed the way exit 2 can be.
+
 ## Steering — TUI, restore, and resume requests
 
 Three requests this skill answers by telling the human what to do, rather than attempting it.
