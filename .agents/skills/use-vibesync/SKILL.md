@@ -247,10 +247,10 @@ the next step.
 Issue #90's own acceptance criterion 4 says failed actions are read from `action_done` stream events. That
 is not what the source does: `action_done`'s `result` field is hardcoded to the literal string `"done"` and
 never carries a failure value, so a failed action can never appear as an `action_done` row — it always
-arrives as the separate `action_failed` row this section documents above (`src/event.rs`, both
-constructors; `src/run.rs` chooses between them per action). ADR-0004 §4's run-stream event list
-(`run_start`, `action_start`, `progress`, `action_done`, `summary`) is also incomplete for the same reason:
-it omits `action_failed` entirely. Issue #90's text and ADR-0004 §4 agree with each other and both disagree
-with the implementation; this section documents what the source actually emits rather than the issue's
-wording, and the discrepancy against both issue #90 criterion 4 and ADR-0004 §4 is reported in this unit's
-handoff rather than corrected here.
+arrives as the separate `action_failed` row this section documents above (`src/event.rs::action_done` and
+`src/event.rs::action_failed`; `src/run.rs::dispatch` chooses between them per action). ADR-0004 §4's
+run-stream event list (`run_start`, `action_start`, `progress`, `action_done`, `summary`) is also incomplete
+for the same reason: it omits `action_failed` entirely. Issue #90's text and ADR-0004 §4 agree with each
+other and both disagree with the implementation; this section documents what the source actually emits
+rather than the issue's wording, and the discrepancy against both issue #90 criterion 4 and ADR-0004 §4 is
+reported in this unit's handoff rather than corrected here.
