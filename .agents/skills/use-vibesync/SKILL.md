@@ -168,11 +168,18 @@ at the end:
 - `progress` rows for large files in flight. The binary throttles these itself — only for Copy and Update
   actions at or above its own size threshold, and at its own fixed time interval thereafter — so surface
   each one as it arrives rather than batching or re-throttling them further.
-- a trailing `summary` event once the Run finishes: action and byte counts, a warning count, and how many
-  actions the fresh scan discovered after the reviewed plan was fixed. Read it, but do not print it verbatim.
+- a trailing `summary` event once the Run finishes (`src/event.rs::summary`): `counts` (action counts),
+  `bytes`, a `warnings` count, and `discovered_after_review` — how many actions the fresh scan discovered
+  after the reviewed plan was fixed.
 
-On exit 0, report "done" and stop. Do not dump the `summary` event's JSON to the human — they already saw
-the reviewed plan in the Compare table; the live `action_done` rows and the final "done" are enough.
+What happens to that trailing `summary` event splits by audience:
+
+- To the human in chat, on exit 0: report "done" and stop, plus one short result line rendered from the
+  summary's own fields — action counts, bytes, the warning count, and `discovered_after_review`. Do not
+  dump the `summary` event's JSON to the human — they already saw the reviewed plan in the Compare table,
+  and the live `action_done` rows plus that one rendered line are enough.
+- To a cron-style, non-interactive consumer: pass the `summary` event through unmodified, exactly as it
+  arrived on the stream. Never swallow it — it is that consumer's only terminating signal for the Run.
 
 Fault exits are a separate concern this section does not cover.
 
