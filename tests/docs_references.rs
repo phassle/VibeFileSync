@@ -495,6 +495,17 @@ fn is_placeholder(token: &str) -> bool {
     inner.starts_with('<') && inner.ends_with('>') && inner.len() > 1
 }
 
+/// Whether `token` names several subcommands at once — `add|list|remove` —
+/// rather than one. This is the grammar-sketch spelling an ADR uses to show a
+/// family of siblings in a single line; it names no single invocation, so
+/// none can be resolved against `--help`, the same reasoning `is_pattern`
+/// applies to a path written as a shape rather than a reference. Kept local
+/// to the CLI-span path rather than folded into `is_pattern`, which serves
+/// path resolution from different call sites.
+fn is_alternation(token: &str) -> bool {
+    token.contains('|')
+}
+
 /// The subcommand path and `--flag`s of a documented `vibesync ...` invocation.
 /// Subcommands are the leading run of tokens before the first token that is
 /// either a flag or a placeholder; flags are every later token that itself
@@ -502,7 +513,9 @@ fn is_placeholder(token: &str) -> bool {
 /// it sits after a flag (documenting the flag's argument) or in its natural
 /// position (documenting a positional, e.g. `status <pair>`) — and never as a
 /// flag either. `None` for a span that isn't a `vibesync` invocation at all —
-/// most backticked spans are paths or symbols, not commands.
+/// most backticked spans are paths or symbols, not commands — and also for a
+/// span whose subcommand position is written as alternation: it names a
+/// grammar shape, not one invocation, so there is nothing here to resolve.
 fn cli_invocation(span: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     let mut tokens = span.split_whitespace();
     if tokens.next()? != "vibesync" {
@@ -514,6 +527,9 @@ fn cli_invocation(span: &str) -> Option<(Vec<&str>, Vec<&str>)> {
         .position(|token| token.starts_with('-') || is_placeholder(token))
         .unwrap_or(tokens.len());
     let (subcommands, rest) = tokens.split_at(split);
+    if subcommands.iter().any(|token| is_alternation(token)) {
+        return None;
+    }
     let flags: Vec<&str> = rest
         .iter()
         .copied()
