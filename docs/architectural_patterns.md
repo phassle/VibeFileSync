@@ -46,6 +46,8 @@ Config rewrites reuse the same temp → sync → rename → parent-sync idiom (`
 
 Route every replacement/deletion through one helper. Default behavior renames the prior destination into `_SafetyNet/<run-id>/<relative-path>` on the same volume (`src/run.rs::archive_by_rename`). A permanent delete is an explicit per-run branch, never stored config (`src/main.rs::Command`, `src/config.rs::Config`).
 
+A destination object that blocks a copy (a file where source now wants a directory, or vice versa) is archived once before that copy Publishes. The rule that decides *when* — classification, the one-shot ordering invariant, and the review-subset derivation — lives entirely in `src/structural_conflict.rs::ConflictSet`; `src/run.rs::archive_by_rename` remains the sole *how*.
+
 Protect tool-owned objects at both ends:
 
 - Scanner excludes SafetyNet, Publish temps, and Run locks (`src/plan.rs::is_machinery`).
