@@ -774,6 +774,59 @@ fn help_lists_option(help: &str, flag: &str) -> bool {
     false
 }
 
+/// Every invocation `text` shows that the real binary does not expose, reported
+/// as `doc` named it.
+///
+/// Taking the document's text as an argument rather than reading it from `doc` is
+/// what makes this check's own ability to fail testable: a sabotaged document can
+/// be handed to it in memory, with no file to mutate and revert. That was
+/// previously an out-of-tree shell script, which meant the one guarantee standing
+/// between the docs and a flag the binary does not expose was itself unguarded —
+/// and a refactor that quietly made the check unable to fail would have passed
+/// the suite.
+fn unresolved_invocations(doc: &str, text: &str, helps: &mut HelpCache) -> BTreeSet<String> {
+    let mut offenders = BTreeSet::new();
+    for span in command_spans(text) {
+        let Some((subcommands, flags)) = cli_invocation(&span) else {
+            continue;
+        };
+
+        let mut path: Vec<&str> = Vec::new();
+        let mut chain_broken = false;
+        for subcommand in &subcommands {
+            let help = helps.get(&path);
+            if !help_lists_command(help, subcommand) {
+                let shown = if path.is_empty() {
+                    "vibesync".to_string()
+                } else {
+                    format!("vibesync {}", path.join(" "))
+                };
+                offenders.insert(format!(
+                    "{doc}: `{span}` — {shown} has no `{subcommand}` subcommand"
+                ));
+                chain_broken = true;
+                break;
+            }
+            path.push(subcommand);
+        }
+        if chain_broken {
+            continue;
+        }
+
+        let help = helps.get(&path);
+        for flag in &flags {
+            let bare = flag.split('=').next().unwrap_or(flag);
+            if !help_lists_option(help, bare) {
+                offenders.insert(format!(
+                    "{doc}: `{span}` — vibesync {} has no `{bare}` option",
+                    path.join(" ")
+                ));
+            }
+        }
+    }
+    offenders
+}
+
 /// Every documented invocation an agent doc shows — inline-backtick or fenced,
 /// installed binary or development fallback (`BINARY_SPELLINGS`) — must resolve
 /// against the real binary's own `--help`: each subcommand it names must be
@@ -785,48 +838,122 @@ fn every_documented_cli_invocation_exists() {
     let mut offenders = BTreeSet::new();
     let mut helps = HelpCache::new();
     for doc in &docs() {
-        for span in command_spans(&read(doc)) {
-            let Some((subcommands, flags)) = cli_invocation(&span) else {
-                continue;
-            };
-
-            let mut path: Vec<&str> = Vec::new();
-            let mut chain_broken = false;
-            for subcommand in &subcommands {
-                let help = helps.get(&path);
-                if !help_lists_command(help, subcommand) {
-                    let shown = if path.is_empty() {
-                        "vibesync".to_string()
-                    } else {
-                        format!("vibesync {}", path.join(" "))
-                    };
-                    offenders.insert(format!(
-                        "{doc}: `{span}` — {shown} has no `{subcommand}` subcommand"
-                    ));
-                    chain_broken = true;
-                    break;
-                }
-                path.push(subcommand);
-            }
-            if chain_broken {
-                continue;
-            }
-
-            let help = helps.get(&path);
-            for flag in &flags {
-                let bare = flag.split('=').next().unwrap_or(flag);
-                if !help_lists_option(help, bare) {
-                    offenders.insert(format!(
-                        "{doc}: `{span}` — vibesync {} has no `{bare}` option",
-                        path.join(" ")
-                    ));
-                }
-            }
-        }
+        offenders.extend(unresolved_invocations(doc, &read(doc), &mut helps));
     }
     assert!(
         offenders.is_empty(),
         "documented CLI invocations do not match the real binary:\n  {}",
         offenders.iter().cloned().collect::<Vec<_>>().join("\n  ")
+    );
+}
+
+/// A green `every_documented_cli_invocation_exists` must mean the docs match the
+/// binary, not that the check stopped looking. Each case below is a way the docs
+/// could name something the binary does not expose, in each spelling and from
+/// each span source, and each must be reported — so widening the parser, adding a
+/// skip rule, or teaching a helper to swallow a token cannot silently make the
+/// check unable to fail.
+///
+/// This runs against the real binary's `--help`, exactly as the check does; only
+/// the document is synthetic.
+#[test]
+fn the_cli_check_still_reports_what_the_binary_does_not_expose() {
+    // (case, document text, the offender it must name)
+    let sabotage = [
+        (
+            "misspelled top-level subcommand",
+            "Run `vibesync stauts <pair>` afterwards.",
+            "vibesync has no `stauts` subcommand",
+        ),
+        (
+            "unknown flag",
+            "Run `vibesync run <pair> --nope` afterwards.",
+            "vibesync run has no `--nope` option",
+        ),
+        (
+            // `pair list`/`pair add`/`pair remove` are genuine two-token
+            // subcommands, so the chain has to resolve level by level.
+            "misspelled nested subcommand",
+            "Run `vibesync pair lst` afterwards.",
+            "vibesync pair has no `lst` subcommand",
+        ),
+        (
+            "fallback: misspelled top-level subcommand",
+            "Development fallback: `cargo run --locked -- stauts <pair>`",
+            "vibesync has no `stauts` subcommand",
+        ),
+        (
+            "fallback: unknown flag",
+            "Development fallback: `cargo run --locked -- run <pair> --nope`",
+            "vibesync run has no `--nope` option",
+        ),
+        (
+            "fallback: misspelled nested subcommand",
+            "Development fallback: `cargo run --locked -- pair lst`",
+            "vibesync pair has no `lst` subcommand",
+        ),
+        (
+            "fenced, with a prompt",
+            "```bash\n$ vibesync pair lst\n```",
+            "vibesync pair has no `lst` subcommand",
+        ),
+        (
+            "fenced fallback, with a trailing comment",
+            "```bash\ncargo run --locked -- run <pair> --nope   # trailing comment\n```",
+            "vibesync run has no `--nope` option",
+        ),
+        (
+            "fenced, split over a continuation",
+            "```bash\ncargo run --locked -- pair add <pair> \\\n  --source <PATH> \\\n  --nope\n```",
+            "vibesync pair add has no `--nope` option",
+        ),
+    ];
+
+    let mut helps = HelpCache::new();
+    for (case, text, expected) in sabotage {
+        let offenders = unresolved_invocations("sabotage.md", text, &mut helps);
+        assert!(
+            offenders.iter().any(|offender| offender.contains(expected)),
+            "the CLI check no longer reports {case}: expected an offender naming \
+             \"{expected}\", got {offenders:?}"
+        );
+    }
+
+    // The other half of the guarantee: a check that fails on everything is no
+    // check either. The real spellings, the placeholders and the alternation
+    // sketch must all stay silent.
+    let legitimate = "\
+`vibesync pair list --check` and `cargo run --locked -- pair list --check`,
+`vibesync run <pair> --yes --exclude <PATH>`, `vibesync tui [<pair>]`,
+the grammar sketch `vibesync pair add|list|remove`, the bare `vibesync`,
+and a fenced block:
+
+```bash
+cargo build --locked          # not this binary
+$ vibesync history <pair> --json
+```
+";
+    let offenders = unresolved_invocations("control.md", legitimate, &mut helps);
+    assert!(
+        offenders.is_empty(),
+        "the CLI check reports legitimate documentation: {offenders:?}"
+    );
+
+    // And the check must still be pointed at real documents. Everything above
+    // holds on synthetic text, so it would keep passing if `docs()` stopped
+    // discovering anything or the repository's own invocations stopped parsing —
+    // leaving `every_documented_cli_invocation_exists` green over nothing.
+    let documents_naming_an_invocation = docs()
+        .iter()
+        .filter(|doc| {
+            command_spans(&read(doc))
+                .iter()
+                .any(|span| cli_invocation(span).is_some())
+        })
+        .count();
+    assert!(
+        documents_naming_an_invocation >= 2,
+        "only {documents_naming_an_invocation} governed document(s) parse as naming an \
+         invocation — the CLI check has nothing left to resolve"
     );
 }
