@@ -55,7 +55,6 @@ impl RunOutcome {
         }
     }
 }
-
 const COPYFILE_ALL_WITHOUT_ACLS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 18) | (1 << 19);
 const F_FULLFSYNC: libc::c_int = 51;
 const PROGRESS_THRESHOLD: u64 = 8 * 1024 * 1024;
