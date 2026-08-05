@@ -32,3 +32,16 @@ This skill assumes `CONTEXT.md` and the ADRs below; consult them rather than res
 - Development fallback: `cargo run --locked -- pair list`
 
 Report back the Folder pairs it returns.
+
+## Compare — plan with a two-sided action table
+
+`plan --json` never mutates the destination, so it runs immediately: no review, no confirmation gate.
+
+- Real binary: `vibesync plan --json <pair>`
+- Development fallback: `cargo run --locked -- plan --json <pair>`
+
+Compare a Folder pair by running it and parsing the `vibefilesync.plan/v1` NDJSON stream it emits, then rendering a two-sided action-table summary in chat — copies on one side, replacements and removals on the other, each with its own count (e.g. "12 copy, 3 replace, 1 remove"). This is the chat rendering of ADR-0010's two-sided review, which supersedes ADR-0003 §3 for the review surface; do not re-derive its rationale here. Read the counts from the closing `summary` event's `counts` object rather than tallying `action` rows yourself, and report them by the plain labels above rather than the raw field names: `counts.copy` is "copy" (the addition side); `counts.update` (an existing destination file's content replaced — note this is the action-level field name, distinct from the Sync mode also called Update) is "replace"; `counts.delete` (a destination object archived and removed) is "remove". "Replace" and "remove" together are the other side.
+
+Surface the pair's Sync mode from the opening `plan_start` event's `mode` field as part of the same summary, before any confirm. This is the safety point of the review: in Mirror, the replacements and removals this table shows are real — each goes through SafetyNet on a real run before anything is archived and removed — so they must be visible ahead of time; in Update, `counts.delete` is always `0` and nothing on the destination is ever removed, so the summary reads as additive-only.
+
+This is the review surface only: parsing and rendering the summary. Confirming and running the plan is a separate step this skill does not cover here.
