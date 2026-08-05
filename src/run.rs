@@ -1812,6 +1812,31 @@ mod tests {
         run()
     }
 
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(all(feature = "fault-injection", debug_assertions))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     fn sample_pair(destination: &Path) -> crate::config::Pair {
         crate::config::Pair {
             source: PathBuf::from("/source"),
@@ -2161,7 +2186,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_stray_temps_aborts_and_leaves_the_stray_when_removal_fails() {
+    fn cleanup_failure_finalizes_with_exit_one_and_a_partial_journal_summary() {
         let source_dir = tempfile::tempdir().unwrap();
         let destination_dir = tempfile::tempdir().unwrap();
         // `fs::remove_file` rejects a directory, forcing a deterministic
@@ -2189,11 +2214,18 @@ mod tests {
             .unwrap();
 
             assert!(matches!(outcome, CleanupOutcome::Abort));
-            assert_eq!(session.stats.counts.failed, 1);
+            assert_eq!(finalize(&mut session).unwrap(), 1);
             assert!(
                 destination_dir.path().join(&stray).exists(),
                 "a failed removal must leave the stray in place"
             );
+
+            let record = crate::journal::latest_record("cleanup-failure-pair")
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.result, "partial");
+            assert_eq!(record.counts.failed, 1);
+            assert_eq!(record.counts.done, 0);
         });
     }
 
@@ -2244,12 +2276,14 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_copies_planned_action_and_updates_stats() {
+    fn dispatch_archives_a_structural_conflict_before_publishing_its_dependent_copy() {
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         let source_dir = tempfile::tempdir().unwrap();
         let destination_dir = tempfile::tempdir().unwrap();
-        fs::write(source_dir.path().join("a.txt"), "hello").unwrap();
+        fs::write(source_dir.path().join("album"), "new file").unwrap();
+        fs::create_dir(destination_dir.path().join("album")).unwrap();
+        fs::write(destination_dir.path().join("album/old.txt"), "old file").unwrap();
         crate::pair::add(
             &config_path,
             "dispatch-pair",
@@ -2260,14 +2294,33 @@ mod tests {
         )
         .unwrap();
         let (pair, plan) = plan::build(&config_path, "dispatch-pair", &[]).unwrap();
+        assert_eq!(plan.deletes.len(), 1);
+        assert_eq!(
+            plan.deletes[0].structural_conflict,
+            Some(StructuralConflict::DestinationDirectory)
+        );
         let home = tempfile::tempdir().unwrap();
 
         with_isolated_home_env(home.path(), || {
+            #[cfg(all(feature = "fault-injection", debug_assertions))]
+            let archive_observed = {
+                let marker = home.path().join("archive-observed");
+                let _marker_guard =
+                    EnvVarGuard::set("VIBESYNC_TEST_ORDER_MARKER", marker.as_os_str());
+                let _fault_guard = EnvVarGuard::set(
+                    "VIBESYNC_TEST_EXEC_AT",
+                    std::ffi::OsStr::new(
+                        "archived:test ! -e \"$VIBESYNC_TEST_DESTINATION\" && test -e \"$VIBESYNC_TEST_SAFETY_NET\" && printf archived > \"$VIBESYNC_TEST_ORDER_MARKER\"",
+                    ),
+                );
+                (marker, _marker_guard, _fault_guard)
+            };
             let journal = Journal::create("dispatch-pair", destination_dir.path()).unwrap();
+            let run_id = journal.run_id().to_string();
             let reporter = RunReporter::new(false);
             let stats = RunStats {
                 counts: Counts {
-                    planned: plan.copies.len(),
+                    planned: plan.copies.len() + plan.deletes.len(),
                     ..Counts::default()
                 },
                 ..RunStats::default()
@@ -2281,12 +2334,104 @@ mod tests {
             dispatch(&pair, &plan, false, false, &mut session).unwrap();
 
             assert_eq!(
-                fs::read_to_string(destination_dir.path().join("a.txt")).unwrap(),
-                "hello"
+                fs::read_to_string(destination_dir.path().join("album")).unwrap(),
+                "new file"
             );
-            assert_eq!(session.stats.counts.done, 1);
-            assert_eq!(session.stats.counts.copied, 1);
+            assert_eq!(
+                fs::read_to_string(
+                    destination_dir
+                        .path()
+                        .join("_SafetyNet")
+                        .join(&run_id)
+                        .join("album/old.txt")
+                )
+                .unwrap(),
+                "old file"
+            );
+            #[cfg(all(feature = "fault-injection", debug_assertions))]
+            assert_eq!(fs::read_to_string(&archive_observed.0).unwrap(), "archived");
+            assert_eq!(session.stats.counts.done, plan.copies.len() + 1);
+            assert_eq!(session.stats.counts.copied, plan.copies.len());
+            assert_eq!(session.stats.counts.deleted, 1);
             assert_eq!(session.stats.counts.failed, 0);
+
+            drop(session);
+            let journal_path =
+                crate::journal::pair_directory("dispatch-pair").join(format!("{run_id}.ndjson"));
+            let events: Vec<serde_json::Value> = fs::read_to_string(journal_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let structural_delete_done = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "action_done"
+                        && event["op"] == "delete"
+                        && event["path"] == "album"
+                })
+                .unwrap();
+            let dependent_publish_done = events
+                .iter()
+                .position(|event| {
+                    event["type"] == "action_done"
+                        && event["op"] == "copy"
+                        && event["path"] == "album"
+                })
+                .unwrap();
+            assert!(structural_delete_done < dependent_publish_done);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| { event["type"] == "action_done" && event["op"] == "delete" })
+                    .count(),
+                1,
+                "the structural conflict must be archived only once"
+            );
+        });
+    }
+
+    #[test]
+    fn finalize_records_synthetic_stats_and_returns_the_matching_exit_code() {
+        let destination_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        with_isolated_home_env(home.path(), || {
+            for (pair_name, failed, expected_result, expected_exit) in [
+                ("finalize-success-pair", 0, "success", EXIT_OK),
+                ("finalize-partial-pair", 2, "partial", 1),
+            ] {
+                let journal = Journal::create(pair_name, destination_dir.path()).unwrap();
+                let reporter = RunReporter::new(false);
+                let stats = RunStats {
+                    counts: Counts {
+                        planned: 4,
+                        done: 2,
+                        failed,
+                        copied: 1,
+                        updated: 1,
+                        deleted: 0,
+                    },
+                    bytes: 42,
+                    warnings: 3,
+                    discovered_after_review: 1,
+                };
+                let mut session = RunSession {
+                    journal,
+                    reporter,
+                    stats,
+                };
+
+                assert_eq!(finalize(&mut session).unwrap(), expected_exit);
+                let record = crate::journal::latest_record(pair_name).unwrap().unwrap();
+                assert_eq!(record.result, expected_result);
+                assert_eq!(record.counts.planned, 4);
+                assert_eq!(record.counts.done, 2);
+                assert_eq!(record.counts.failed, failed);
+                assert_eq!(record.bytes, 42);
+                assert_eq!(record.warnings, 3);
+                assert_eq!(record.discovered_after_review, 1);
+            }
         });
     }
 }
