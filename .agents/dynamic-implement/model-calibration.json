@@ -1,7 +1,66 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-08-02T21:45:45Z",
+  "updatedAt": "2026-08-05T12:57:25Z",
   "source": "GitHub issue model-telemetry:v1 sections",
+  "externalReview": {
+    "lastCheckedAt": "2026-08-05T12:57:25Z",
+    "outcome": "unchanged",
+    "isFirstCheck": false,
+    "examined": [
+      "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta against the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+      "claude:claude-opus-5 route, availability, active status, and pricing delta against the tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+      "new official cost-per-completed-task benchmark rounds since the tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+      "known advertised claude:claude-fable-5 candidate status; still excluded from the verified code ladder by the existing user decision"
+    ],
+    "findings": [
+      {
+        "kind": "dated-price-change",
+        "route": "claude:claude-sonnet-5",
+        "ladderIndices": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "effectiveAt": "2026-09-01",
+        "from": {
+          "inPerMToken": 2.0,
+          "outPerMToken": 10.0,
+          "currency": "USD",
+          "basis": "introductory"
+        },
+        "to": {
+          "inPerMToken": 3.0,
+          "outPerMToken": 15.0,
+          "currency": "USD",
+          "basis": "standard"
+        },
+        "detail": "Known and unchanged: introductory pricing lapses 2026-08-31 and re-prices ladder indices 0-4 by +50% per token on 2026-09-01, with no route change. Still pending, not yet effective.",
+        "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing",
+        "retrievedAt": "2026-08-02T21:45:45Z"
+      },
+      {
+        "kind": "untested-route",
+        "route": "claude:claude-opus-5",
+        "ladderIndices": [
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "localTelemetry": "none",
+        "detail": "Known and unchanged: $5/MTok input and $25/MTok output; still no eligible local implementer observation starting on this route. #111 started and finished on Sonnet 5/low; #113 started on Sonnet 5/low and finished a review-driven correction on Sonnet 5/medium.",
+        "source": "Anthropic, Claude Opus 5 documentation, https://platform.claude.com/docs/en/about-claude/models/whats-new-opus-5",
+        "retrievedAt": "2026-08-02T21:45:45Z"
+      }
+    ],
+    "implications": [
+      "No external delta: Sonnet 5 remains active with introductory pricing of $2/$10 through 2026-08-31 and $3/$15 scheduled for 2026-09-01; Opus 5 remains active at $5/$25; no new or retired verified ladder route and no newer official cost-per-completed-task benchmark round was found.",
+      "Claude Fable 5 remains an already-known advertised candidate outside the verified code ladder; schema normalization does not change its status or count as capability evidence."
+    ]
+  },
   "groups": [
     {
       "key": "phassle/VibeFileSync:claude:rust-cli-tui:small",
@@ -18,7 +77,7 @@
       "recommendedStart": {
         "tier": "T1",
         "routeId": "claude:claude-sonnet-5",
-        "modelFamily": "claude",
+        "modelFamily": "anthropic",
         "modelId": "claude-sonnet-5",
         "effort": "low",
         "ladderIndex": 0
@@ -73,31 +132,15 @@
         "confidence": "low"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-02T21:45:45Z",
+        "lastCheckedAt": "2026-08-05T12:57:25Z",
         "examined": [
-          "claude:claude-sonnet-5 - ladder indices 0-4 - published pricing (platform.claude.com model overview and pricing pages)",
-          "claude:claude-opus-5 - ladder indices 5-9 - existence, availability and published pricing (platform.claude.com model overview and pricing pages)",
-          "cost-per-completed-task benchmarks for claude-opus-5 and claude-sonnet-5 - web search for SWE-bench / agentic cost-per-solved-task figures; no citable dollar-per-completed-task measurement located"
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
         ],
-        "changesFound": [
-          {
-            "kind": "new-route",
-            "route": "claude:claude-opus-5",
-            "summary": "claude-opus-5 is a generally available Claude API model (1M context, 128k max output, $5/MTok input and $25/MTok output) and occupies ladder indices 5-9 of this harness's escalation ladder. It has no local telemetry in this run: every implementer session ran claude:claude-sonnet-5, so the ladder's model step was never reached. External evidence only; no measured observation exists for it.",
-            "effectiveAt": null,
-            "source": "Anthropic, Models overview, https://platform.claude.com/docs/en/about-claude/models/overview.md (latest models comparison table: Claude API ID claude-opus-5, $5 / input MTok, $25 / output MTok)",
-            "retrievedAt": "2026-08-02T21:45:45Z"
-          },
-          {
-            "kind": "price-change",
-            "route": "claude:claude-sonnet-5",
-            "summary": "Dated future price change. Introductory pricing of $2/MTok input and $10/MTok output applies through 2026-08-31; standard pricing of $3/MTok input and $15/MTok output takes effect 2026-09-01. This re-prices ladder indices 0-4 - every step this run measured - by +50% per token on the effective date, without any change to the route.",
-            "effectiveAt": "2026-09-01T00:00:00Z",
-            "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing (model pricing table rows 'Claude Sonnet 5 through August 31, 2026' $2/$10 and 'Claude Sonnet 5 starting September 1, 2026' $3/$15; note: 'Introductory pricing of $2/$10 per million input/output tokens is in effect through August 31, 2026, after which the standard pricing of $3/$15 per million input/output tokens will take effect.')",
-            "retrievedAt": "2026-08-02T21:45:45Z"
-          }
-        ],
-        "outcome": "changed",
+        "changesFound": [],
+        "outcome": "unchanged",
         "notCheckedReason": null
       },
       "externalPrior": {
@@ -128,9 +171,9 @@
       "evidenceIssues": [
         60
       ],
-      "calibratedAt": "2026-08-02T21:45:45Z",
+      "calibratedAt": "2026-08-05T12:57:25Z",
       "sourceCursor": "2026-08-02T21:45:45Z",
-      "notes": "One eligible unit (#60, rust docs). Recommendation retained unchanged at the ladder floor: a single observation cannot support any threshold in the rubric, and index 0 is already the lowest verified step so no floor lowering and no boundary probe below it are possible. The unit needed one fix pass, which is weak evidence toward a stronger start, but the rubric's floor-raise grounds both require at least two comparable units and one of them requires a measured comparison against a stronger step - no stronger step was ever run in this repository, so no raise is permitted. capabilityEscalation is recorded as 0 because the telemetry records no capability failure or route change on any attempt; it is not evidence that escalation was tried and unnecessary."
+      "notes": "One eligible unit (#60, rust docs). Recommendation retained unchanged at the ladder floor: a single observation cannot support any threshold in the rubric, and index 0 is already the lowest verified step so no floor lowering and no boundary probe below it are possible. The unit needed one fix pass, which is weak evidence toward a stronger start, but the rubric's floor-raise grounds both require at least two comparable units and one of them requires a measured comparison against a stronger step - no stronger step was ever run in this repository, so no raise is permitted. capabilityEscalation is recorded as 0 because the telemetry records no capability failure or route change on any attempt; it is not evidence that escalation was tried and unnecessary. Calibration 2026-08-05: no new telemetry for this group this run; only the externalReview refreshed."
     },
     {
       "key": "phassle/VibeFileSync:claude:rust-cli-tui:medium",
@@ -160,7 +203,7 @@
       "recommendedStart": {
         "tier": "T1",
         "routeId": "claude:claude-sonnet-5",
-        "modelFamily": "claude",
+        "modelFamily": "anthropic",
         "modelId": "claude-sonnet-5",
         "effort": "low",
         "ladderIndex": 0
@@ -177,10 +220,10 @@
         "lastOutcome": null
       },
       "samples": {
-        "eligible": 9,
+        "eligible": 10,
         "cleanSuccess": 3,
         "capabilityEscalation": 0,
-        "materialReReview": 6
+        "materialReReview": 7
       },
       "usage": {
         "inputTokensRange": null,
@@ -215,31 +258,15 @@
         "confidence": "medium"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-02T21:45:45Z",
+        "lastCheckedAt": "2026-08-05T12:57:25Z",
         "examined": [
-          "claude:claude-sonnet-5 - ladder indices 0-4 - published pricing (platform.claude.com model overview and pricing pages)",
-          "claude:claude-opus-5 - ladder indices 5-9 - existence, availability and published pricing (platform.claude.com model overview and pricing pages)",
-          "cost-per-completed-task benchmarks for claude-opus-5 and claude-sonnet-5 - web search for SWE-bench / agentic cost-per-solved-task figures; no citable dollar-per-completed-task measurement located"
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
         ],
-        "changesFound": [
-          {
-            "kind": "new-route",
-            "route": "claude:claude-opus-5",
-            "summary": "claude-opus-5 is a generally available Claude API model (1M context, 128k max output, $5/MTok input and $25/MTok output) and occupies ladder indices 5-9 of this harness's escalation ladder. It has no local telemetry in this run: every implementer session ran claude:claude-sonnet-5, so the ladder's model step was never reached. External evidence only; no measured observation exists for it.",
-            "effectiveAt": null,
-            "source": "Anthropic, Models overview, https://platform.claude.com/docs/en/about-claude/models/overview.md (latest models comparison table: Claude API ID claude-opus-5, $5 / input MTok, $25 / output MTok)",
-            "retrievedAt": "2026-08-02T21:45:45Z"
-          },
-          {
-            "kind": "price-change",
-            "route": "claude:claude-sonnet-5",
-            "summary": "Dated future price change. Introductory pricing of $2/MTok input and $10/MTok output applies through 2026-08-31; standard pricing of $3/MTok input and $15/MTok output takes effect 2026-09-01. This re-prices ladder indices 0-4 - every step this run measured - by +50% per token on the effective date, without any change to the route.",
-            "effectiveAt": "2026-09-01T00:00:00Z",
-            "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing (model pricing table rows 'Claude Sonnet 5 through August 31, 2026' $2/$10 and 'Claude Sonnet 5 starting September 1, 2026' $3/$15; note: 'Introductory pricing of $2/$10 per million input/output tokens is in effect through August 31, 2026, after which the standard pricing of $3/$15 per million input/output tokens will take effect.')",
-            "retrievedAt": "2026-08-02T21:45:45Z"
-          }
-        ],
-        "outcome": "changed",
+        "changesFound": [],
+        "outcome": "unchanged",
         "notCheckedReason": null
       },
       "externalPrior": {
@@ -276,11 +303,12 @@
         54,
         55,
         56,
-        59
+        59,
+        111
       ],
-      "calibratedAt": "2026-08-02T21:45:45Z",
-      "sourceCursor": "2026-08-02T21:45:45Z",
-      "notes": "Nine eligible units, all integrated, all started at ladder index 0 - the only step this repository has ever measured. Recommendation retained unchanged. Group confidence is low despite n=9 because the sample is single-armed: costToAcceptance can rank units against each other but cannot rank steps against each other, which is what a start recommendation requires. Three of nine were accepted on the first review with no fix pass; six required at least one fix pass and re-review. That re-review rate is a hint that a stronger start might be cheaper, but the rubric's floor-raise grounds are not met: no capability failure was recorded on any unit, and no stronger step was ever run, so the required 25%-lower-median comparison cannot be computed. No floor lowering is possible either - index 0 is the lowest verified step - and for the same reason no boundary probe is schedulable below it. CONFOUND, stated explicitly rather than controlled: costToAcceptance here is driven jointly by attempt count and by context size, and the two are not separable in this telemetry. Issue #50 (large group) is the clearest illustration - accepted on the first review with zero findings and still the second most expensive unit in the run at $17.75 - and the same effect is present inside this group (#59 cost $24.32 across 3 attempts on a 1235-line single-file change, while #49 cost $7.30 across 3 attempts on a 187-line change). Any future ranking of steps by median costToAcceptance in this group must normalise for change size or it will attribute context cost to route quality. capabilityEscalation is recorded as 0 because the telemetry records no capability failure or route change on any attempt; it is not evidence that escalation was tried and unnecessary."
+      "calibratedAt": "2026-08-05T12:57:25Z",
+      "sourceCursor": "2026-08-05T12:55:26Z",
+      "notes": "Ten eligible units; all started at ladder index 0, the only starting step this repository has measured. Recommendation retained at claude:claude-sonnet-5/low with low confidence because evidence remains single-armed. Three units were accepted without a material fix/re-review; seven required one or more. #111 is correctly counted as material re-review: one Standards finding, one Spec finding, and two fix passes (unit fix plus root test-evidence remediation). Its implementation started and finished at Sonnet 5/low. Two planner API-529 failures, one reviewer sandbox failure, the nested-PTY row, and the root-remediation Codex attempts all carry capabilityFailure:false or are environment/integration evidence, so none support a route floor increase. #111 reports null usage, cost, token, and duration values; it is included in sample counts but excluded from dollar medians, which retain nine cost-reporting units. No capability failure exists and no comparable unit started at a stronger step, so neither the two-unit capability ground nor a 25%-cheaper stronger-step comparison can be established. Index 0 cannot be lowered and no lower boundary probe exists. Cost remains confounded by change/context size and attempt count; do not compare this median across groups without normalization."
     },
     {
       "key": "phassle/VibeFileSync:claude:rust-cli-tui:large",
@@ -296,14 +324,17 @@
           "pair-crud",
           "config-write",
           "concurrency",
-          "lock-contention"
+          "lock-contention",
+          "deep-module-refactor",
+          "safety-ordering",
+          "cross-module-integration"
         ]
       },
       "catalogFingerprint": "dc9d1b7861d811a27dfa4e8171fd261dcf01bb4a58740a6bf3279661277b1517",
       "recommendedStart": {
         "tier": "T1",
         "routeId": "claude:claude-sonnet-5",
-        "modelFamily": "claude",
+        "modelFamily": "anthropic",
         "modelId": "claude-sonnet-5",
         "effort": "low",
         "ladderIndex": 0
@@ -320,10 +351,10 @@
         "lastOutcome": null
       },
       "samples": {
-        "eligible": 3,
+        "eligible": 4,
         "cleanSuccess": 2,
         "capabilityEscalation": 0,
-        "materialReReview": 1
+        "materialReReview": 2
       },
       "usage": {
         "inputTokensRange": null,
@@ -348,7 +379,7 @@
             "route": "claude:claude-sonnet-5",
             "effort": "low",
             "ladderIndex": 0,
-            "units": 3,
+            "units": 4,
             "medianTotal": 13.09,
             "attemptsMedian": 2,
             "includesRetriesAndFixPasses": true
@@ -358,31 +389,15 @@
         "confidence": "low"
       },
       "externalReview": {
-        "lastCheckedAt": "2026-08-02T21:45:45Z",
+        "lastCheckedAt": "2026-08-05T12:57:25Z",
         "examined": [
-          "claude:claude-sonnet-5 - ladder indices 0-4 - published pricing (platform.claude.com model overview and pricing pages)",
-          "claude:claude-opus-5 - ladder indices 5-9 - existence, availability and published pricing (platform.claude.com model overview and pricing pages)",
-          "cost-per-completed-task benchmarks for claude-opus-5 and claude-sonnet-5 - web search for SWE-bench / agentic cost-per-solved-task figures; no citable dollar-per-completed-task measurement located"
+          "claude:claude-sonnet-5 route, availability, active status, and scheduled pricing delta vs tracked 2026-08-05 snapshot (Anthropic Sonnet 5 documentation and model deprecations)",
+          "claude:claude-opus-5 route, availability, active status, and pricing delta vs tracked 2026-08-05 snapshot (Anthropic Opus 5 documentation and model deprecations)",
+          "new official cost-per-completed-task benchmark rounds since tracked 2026-08-05 snapshot (Anthropic Sonnet 5 system card and official model documentation)",
+          "known advertised claude:claude-fable-5 candidate status outside the verified code ladder"
         ],
-        "changesFound": [
-          {
-            "kind": "new-route",
-            "route": "claude:claude-opus-5",
-            "summary": "claude-opus-5 is a generally available Claude API model (1M context, 128k max output, $5/MTok input and $25/MTok output) and occupies ladder indices 5-9 of this harness's escalation ladder. It has no local telemetry in this run: every implementer session ran claude:claude-sonnet-5, so the ladder's model step was never reached. External evidence only; no measured observation exists for it.",
-            "effectiveAt": null,
-            "source": "Anthropic, Models overview, https://platform.claude.com/docs/en/about-claude/models/overview.md (latest models comparison table: Claude API ID claude-opus-5, $5 / input MTok, $25 / output MTok)",
-            "retrievedAt": "2026-08-02T21:45:45Z"
-          },
-          {
-            "kind": "price-change",
-            "route": "claude:claude-sonnet-5",
-            "summary": "Dated future price change. Introductory pricing of $2/MTok input and $10/MTok output applies through 2026-08-31; standard pricing of $3/MTok input and $15/MTok output takes effect 2026-09-01. This re-prices ladder indices 0-4 - every step this run measured - by +50% per token on the effective date, without any change to the route.",
-            "effectiveAt": "2026-09-01T00:00:00Z",
-            "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing (model pricing table rows 'Claude Sonnet 5 through August 31, 2026' $2/$10 and 'Claude Sonnet 5 starting September 1, 2026' $3/$15; note: 'Introductory pricing of $2/$10 per million input/output tokens is in effect through August 31, 2026, after which the standard pricing of $3/$15 per million input/output tokens will take effect.')",
-            "retrievedAt": "2026-08-02T21:45:45Z"
-          }
-        ],
-        "outcome": "changed",
+        "changesFound": [],
+        "outcome": "unchanged",
         "notCheckedReason": null
       },
       "externalPrior": {
@@ -413,75 +428,12 @@
       "evidenceIssues": [
         50,
         57,
-        58
+        58,
+        113
       ],
-      "calibratedAt": "2026-08-02T21:45:45Z",
-      "sourceCursor": "2026-08-02T21:45:45Z",
-      "notes": "Three eligible units, all integrated at ladder index 0. Recommendation retained unchanged; three units cannot carry a per-size threshold and, as with the other groups, no stronger step was ever run so no comparison is available. #50 and #57 were accepted on their first review with no fix pass (#57's second session is a merger, not a fix pass); #58 required one fix pass. CONFOUND: this group is where the cost/context confound is most visible. #50 is the second most expensive unit in the entire run at $17.75 despite one attempt and one clean review, purely because its context was large - a grouping that reads costToAcceptance as a proxy for route quality would rank #50's step as poor when the step in fact landed it first time. The median recorded here ($13.09) should therefore not be compared against another group's median or against a future step's median without normalising for change size. capabilityEscalation is recorded as 0 because the telemetry records no capability failure or route change on any attempt; it is not evidence that escalation was tried and unnecessary."
+      "calibratedAt": "2026-08-05T12:57:25Z",
+      "sourceCursor": "2026-08-05T12:55:27Z",
+      "notes": "Four eligible units; all started at ladder index 0. Recommendation retained at claude:claude-sonnet-5/low with low confidence because no comparable unit started at a stronger step. Corrected #113 from clean-at-low to material re-review: its final unit route was claude:claude-sonnet-5/medium (ladder index 1), after low-effort work and review-driven correction; root review then added two Spec findings and one aggregated test-only fix pass. Therefore the group has two clean successes and two material re-reviews. #113's first implementer harness failure, planner API-529 failures, nested-PTY evidence, and root-remediation Codex attempts all have capabilityFailure:false or are explicitly non-capability integration evidence; they do not establish a required route escalation. #113 reports null usage, cost, token, and duration values, so it is counted in samples but not in the dollar median, which retains three cost-reporting units. The medium final effort is an observed successful recovery step, not a measured medium starting-step cost, so it is not added as a comparable costToAcceptance arm. No two capability-driven units and no 25%-lower stronger-step median exist; no floor raise is allowed. Index 0 cannot be lowered and no lower boundary probe exists. Cost remains confounded by change/context size."
     }
-  ],
-  "externalReview": {
-    "lastCheckedAt": "2026-08-02T21:45:45Z",
-    "outcome": "changed",
-    "isFirstCheck": true,
-    "examined": [
-      "untested routes in the verified ladder",
-      "published pricing including dated future changes",
-      "cost-per-completed-task benchmarks for candidate routes"
-    ],
-    "findings": [
-      {
-        "kind": "untested-route",
-        "route": "claude:claude-opus-5",
-        "ladderIndices": [
-          5,
-          6,
-          7,
-          8,
-          9
-        ],
-        "localTelemetry": "none",
-        "detail": "Generally available; $5/MTok in, $25/MTok out; 1M context. Occupies the upper half of the verified ladder and has never been run as an implementer in this repository, so it can only enter the candidate order on external evidence.",
-        "source": "Anthropic, Models overview, https://platform.claude.com/docs/en/about-claude/models/overview.md",
-        "retrievedAt": "2026-08-02T21:45:45Z"
-      },
-      {
-        "kind": "dated-price-change",
-        "route": "claude:claude-sonnet-5",
-        "ladderIndices": [
-          0,
-          1,
-          2,
-          3,
-          4
-        ],
-        "effectiveAt": "2026-09-01",
-        "from": {
-          "inPerMToken": 2.0,
-          "outPerMToken": 10.0,
-          "currency": "USD",
-          "basis": "introductory"
-        },
-        "to": {
-          "inPerMToken": 3.0,
-          "outPerMToken": 15.0,
-          "currency": "USD",
-          "basis": "standard"
-        },
-        "detail": "Introductory pricing lapses 2026-08-31. This silently re-prices every ladder step this repository has ever measured by +50% per token with no change to the route itself. Recorded with effectiveAt so the next run treats it as already-known rather than as news.",
-        "source": "Anthropic, Pricing, https://platform.claude.com/docs/en/about-claude/pricing",
-        "retrievedAt": "2026-08-02T21:45:45Z"
-      },
-      {
-        "kind": "benchmark-search",
-        "result": "none-citable",
-        "detail": "No cost-per-completed-task or tokens-per-task benchmark could be cited for either candidate route. relativeTokensForComparableWork is left null in every externalPrior; per-token price alone must not be used to rank these steps.",
-        "retrievedAt": "2026-08-02T21:45:45Z"
-      }
-    ],
-    "implications": [
-      "All measured costToAcceptance figures in this file were incurred at claude-sonnet-5 introductory pricing and are not directly comparable to observations recorded after 2026-09-01.",
-      "The +50% applies to the whole ladder bottom, so it narrows the price gap to claude-opus-5 without providing any evidence about its quality. It is a reason to re-run the comparison, not a reason to change the floor."
-    ]
-  }
+  ]
 }

@@ -20,14 +20,14 @@ Compose safety as ordered gates. Earlier stages may inspect; only the final stag
 
 1. Strict config load precedes dispatch (`src/main.rs::run`).
 2. Acquire pair lock, resolve pinned volumes, and scan (`src/preconditions.rs::resolve_pair`, `src/plan.rs::traverse`).
-3. Render/report the initial reviewed Plan (`src/run.rs::execute_reviewed_plan`).
+3. Render/report the initial reviewed Plan (`src/run.rs::review_plan`).
 4. Block Plan errors, then enforce run-only preconditions (`src/plan.rs::PlanError`, `src/preconditions.rs::check_run`).
-5. Require confirmation or explicit `--yes` (`src/run.rs::execute_reviewed_plan`).
+5. Require confirmation or explicit `--yes` (`src/run.rs::review_plan`).
 6. Persist the reviewed action set in the Journal (`src/journal.rs::Journal`).
-7. Clean strays, rescan, and retain only reviewed work (`src/run.rs::execute_reviewed_plan`, `src/run.rs::discovered_after_review`, `src/run.rs::retain_reviewed_actions`).
-8. Execute the reconciled reviewed actions (`src/run.rs::execute_reviewed_plan`).
+7. Clean strays, rescan, and retain only reviewed work (`src/run.rs::cleanup_stray_temps`, `src/run.rs::reconcile_plan`, `src/run.rs::discovered_after_review`, `src/run.rs::retain_reviewed_actions`).
+8. Execute the reconciled reviewed actions (`src/run.rs::dispatch`).
 
-Place new abort-before-mutation checks before Journal creation at `src/run.rs::execute_reviewed_plan`. Keep Dry-run useful unless the check is required for safe enumeration.
+Place new abort-before-mutation checks before Journal creation at `src/run.rs::review_plan`. Keep Dry-run useful unless the check is required for safe enumeration.
 
 ## Verified atomic Publish
 
@@ -45,6 +45,8 @@ Config rewrites reuse the same temp → sync → rename → parent-sync idiom (`
 ## SafetyNet is the removal boundary
 
 Route every replacement/deletion through one helper. Default behavior renames the prior destination into `_SafetyNet/<run-id>/<relative-path>` on the same volume (`src/run.rs::archive_by_rename`). A permanent delete is an explicit per-run branch, never stored config (`src/main.rs::Command`, `src/config.rs::Config`).
+
+A destination object that blocks a copy (a file where source now wants a directory, or vice versa) is archived once before that copy Publishes. The rule that decides *when* — classification, the one-shot ordering invariant, and the review-subset derivation — lives entirely in `src/structural_conflict.rs::ConflictSet`; `src/run.rs::archive_by_rename` remains the sole *how*.
 
 Protect tool-owned objects at both ends:
 
@@ -114,7 +116,7 @@ Reach for the pty only when the assertion needs a real terminal; prefer `TestBac
 Use dependency injection for pure lookup seams and a compile-time feature for OS failures.
 
 - Mount relocation accepts a lookup function for deterministic unit tests (`src/preconditions.rs::resolve_path_with_lookup`, `src/preconditions.rs::classify_side_with_lookup`).
-- `fault-injection` gates free-space and ENOSPC controls (`Cargo.toml [features]`, `src/preconditions.rs::available_space`, `src/run.rs::execute_reviewed_plan`).
+- `fault-injection` gates free-space and ENOSPC controls (`Cargo.toml [features]`, `src/preconditions.rs::available_space`, `src/run.rs::review_plan`).
 - Integration tests assert the externally visible invariant, not helper calls (`tests/cli.rs::bad_config_aborts_before_an_unimplemented_verb_runs`, `tests/cli.rs::run_accepts_the_adr_0004_per_run_flags`).
 
 Keep production defaults free of test behavior; expose injections only under the feature.
