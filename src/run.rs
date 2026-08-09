@@ -1795,8 +1795,12 @@ fn verify_temp(
     // macOS preserves extended attributes on exFAT through AppleDouble
     // sidecars. Compare the file-facing name set on every filesystem; the
     // scanner keeps the backing `._*` machinery out of sync content.
-    if xattr_names(source)? != xattr_names(temp)? {
-        warnings.push(MetadataWarning::mismatch("xattr names differ"));
+    let dropped = dropped_xattr_names(&xattr_names(source)?, &xattr_names(temp)?);
+    if !dropped.is_empty() {
+        warnings.push(MetadataWarning::mismatch(format!(
+            "xattrs not preserved: {}",
+            dropped.join(", ")
+        )));
     }
     Ok(TempVerification {
         warnings,
@@ -1835,6 +1839,30 @@ fn file_hash(path: &Path) -> io::Result<[u8; 32]> {
         }
         hasher.update(&buffer[..read]);
     }
+}
+
+/// The source xattr names the copy failed to carry across — empty when
+/// every one of them landed on the temp.
+///
+/// The comparison is deliberately one-directional. Verification asks
+/// whether the copy preserved what the source had; a name present only on
+/// the temp was not produced by the copy, because `copyfile` only ever
+/// writes attributes it read from the source. macOS adds its own after the
+/// file lands — `com.apple.provenance` appears on every file written to an
+/// external exFAT volume — so treating a destination-only name as a
+/// mismatch reported an OS behaviour as a per-file copy defect and drowned
+/// real drops in noise (ADR-0008 §1, amended).
+///
+/// Blanket-excusing xattrs on exFAT via `volume::expected_degradations` was
+/// rejected instead: exFAT *does* preserve them through AppleDouble
+/// sidecars, so that would have hidden genuine drops on the one filesystem
+/// most likely to produce them.
+fn dropped_xattr_names(source: &[Vec<u8>], temp: &[Vec<u8>]) -> Vec<String> {
+    source
+        .iter()
+        .filter(|name| !temp.contains(name))
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect()
 }
 
 fn xattr_names(path: &Path) -> io::Result<Vec<Vec<u8>>> {
@@ -1895,6 +1923,63 @@ fn lock_error(error: io::Error) -> AppError {
 mod tests {
     use super::*;
     use crate::plan::StructuralConflict;
+
+    fn xattrs(names: &[&str]) -> Vec<Vec<u8>> {
+        names.iter().map(|name| name.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn no_xattrs_are_dropped_when_the_temp_carries_every_source_name() {
+        assert!(dropped_xattr_names(
+            &xattrs(&["com.apple.ResourceFork", "com.vibesync.tag"]),
+            &xattrs(&["com.apple.ResourceFork", "com.vibesync.tag"]),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_source_xattr_missing_from_the_temp_is_reported_as_dropped() {
+        assert_eq!(
+            dropped_xattr_names(
+                &xattrs(&["com.apple.ResourceFork", "com.vibesync.tag"]),
+                &xattrs(&["com.apple.ResourceFork"]),
+            ),
+            vec!["com.vibesync.tag".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_os_applied_destination_only_xattr_is_not_a_drop() {
+        // macOS stamps `com.apple.provenance` on files it writes to an
+        // external volume, after the copy. The source of the run that
+        // exposed this carried no xattrs at all, yet every published file
+        // warned (ADR-0008 §1, amended).
+        assert!(dropped_xattr_names(&[], &xattrs(&["com.apple.provenance"])).is_empty());
+        assert!(dropped_xattr_names(
+            &xattrs(&["com.vibesync.tag"]),
+            &xattrs(&["com.apple.provenance", "com.vibesync.tag"]),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_drop_alongside_an_os_applied_addition_still_reports_only_the_drop() {
+        assert_eq!(
+            dropped_xattr_names(
+                &xattrs(&["com.vibesync.tag"]),
+                &xattrs(&["com.apple.provenance"]),
+            ),
+            vec!["com.vibesync.tag".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_dropped_xattr_name_is_rendered_lossily_rather_than_lost() {
+        assert_eq!(
+            dropped_xattr_names(&[vec![0xff, b'a']], &[]),
+            vec!["\u{fffd}a".to_string()]
+        );
+    }
 
     fn sample_action(rel_path: &str, bytes: u64) -> Action {
         Action {
