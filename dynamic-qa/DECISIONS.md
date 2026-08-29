@@ -1856,3 +1856,64 @@ coordination note); the existing repair-mode placeholder text in
 repair, negative-control gate, and quarantine validation") is unchanged.
 Failure Evidence Bundle modeling is #159's territory and is not
 duplicated here — `originatingFailureRef` is only a stable pointer.
+
+## 28. Failure Evidence Bundle (#159)
+
+**Repair is explicitly invoked with a strict Failure Evidence Bundle;
+scraped prose logs cannot authorize a code change — this is structural, not
+a convention.** `shared/schemas/dynamic-qa-failure-evidence-v1.schema.json`
+and `shared/scripts/failure-evidence.mjs` define the only artifact
+`qa-generate repair --evidence <bundle>` may accept. Every field is an
+enum, a `sha256:` digest, a full 40-character commit SHA, an ISO-8601
+timestamp, or a string bounded to `MAX_TEXT_FIELD_LENGTH` (500) characters
+and passed through `secret-detection.mjs`'s `detectSecretValue`. There is
+no `rawLog`/`logExcerpt`/`notes`/any other unbounded free-text field
+anywhere in the schema, and `assertKnownKeys` is fail-closed on every
+nested object — a bare string or a free-text blob fails
+`validateFailureEvidenceBundle`'s very first check, and an overlong or
+secret-shaped value in one of the few bounded text fields
+(`junitFacts[].message`, `expectedVsObserved[].expected/.observed`,
+`fixtureBoundaryEnforcement.fixtureIsolation`,
+`approvedDiagnostics[].label`) is rejected by name.
+
+**Immutable.** `bundleDigest` is `canonical-digest.mjs`'s `contentDigest`
+over every other field. `computeBundleDigest` / `checkBundleImmutability`
+recompute and compare; any post-hoc edit — including one that "improves"
+evidence to fit a conclusion — is detected and refused.
+
+**Named run, tied to a source commit.** `repository` / `sourceCommit` /
+`workflow` mirror `result-envelope.mjs`'s identity fields exactly (the
+shape `github-actions-adapter.mjs`'s `resolveRunReference` already produces
+from a real run). The embedded `diagnosisRecord`'s own
+`sourceCommit`/`flowId`/`bindingId` must agree with the bundle's own —
+cross-checked explicitly, so a bundle cannot be recycled across an
+unrelated commit, flow, or Binding by mixing old and new identity.
+
+**Eligibility reuses #158's `isRepairEligible` exactly — never
+re-derived.** The bundle embeds exactly one already-produced Diagnosis
+Record, validated with `diagnosis.mjs`'s own `validateDiagnosisRecord`.
+`isBundleRepairEligible` composes shape validation, immutability, then
+`isRepairEligible(bundle.diagnosisRecord)` unchanged.
+`explainRepairIneligibility` names the exact reason for every ineligible
+category: malformed, safety-blocked, provisional, product, environment,
+unresolved, and confirmed-binding-but-intermittent (test-flake) all get
+their own message; only confirmed + binding + binding-defect returns
+eligible with no reason. Every one of the 12 Owner x Repeatability
+combinations is covered by fixtures.
+
+**One causal hypothesis is a structural bundle property, but pursuing only
+one during repair is #160's job.** `diagnosisRecord.causalChain` is a
+single non-empty string, never an array, and the bundle's closed key set
+has no second field (e.g. an `alternativeHypotheses` list) where a caller
+could attach a second hypothesis beside it — both are rejected by
+`validateFailureEvidenceBundle`. Actually stopping a repair attempt after
+one causal theory fails (DESIGN-dynamic-qa-spec.md §7 step 6: "a second
+causal theory or failed candidate stops; no repair loop") is
+repair-execution behavior, not a bundle-shape property, and belongs to
+#160.
+
+**Seams for #160:** `isBundleRepairEligible(bundle)` is the single function
+`qa-generate repair`'s gate (step 4) should call. `qa-generate/SKILL.md` is
+unedited per coordination — see `shared/references/failure-evidence.md`
+for the exact repair-mode step 1 / step 4 placeholder text this ticket
+leaves in place.
