@@ -1389,3 +1389,82 @@ measured runtime data justifies it) but nothing here adds one.
   for the placeholder pointer.
 - Action-pin SHAs (`CHECKOUT_ACTION_SHA`, `SETUP_NODE_ACTION_SHA`) need
   re-verification against real upstream tags before first real rollout.
+
+## 24. Low-trust hardening and diagnostics scrubbing (#155)
+
+**Completes #153's hardening with allowlisting, and adds the diagnostics
+scrub/suppress gate the spec's §11 "Safe execution" requires.** Two new
+modules, both reusing rather than duplicating what #144/#151/#153 already
+built: `shared/scripts/diagnostics-scrub.mjs` and
+`shared/scripts/workflow-hardening.mjs`. No edit was needed to
+`github-actions-workflow.mjs` — the new module imports only its
+already-exported `CHECKOUT_ACTION_SHA`/`SETUP_NODE_ACTION_SHA` constants, so
+concurrent work on that file (#154) is untouched.
+
+**Diagnostics scrubbing reuses #144's secret detector, not a second one.**
+`secret-detection.mjs` gained two free-text variants of its existing
+patterns — `redactSecretsInText` (finds and replaces every secret-shaped
+substring in a blob) and `textStillContainsSecretShapedValue` (re-scans for
+verification) — because `detectSecretValue` only judges one anchored
+scalar, and a log/DOM/trace/JUnit body is prose containing many values.
+Every pattern mirrored down is the exact same rule, never a new one.
+
+**The five diagnostic kinds this ticket names split into exactly two
+buckets, matching the spec's two retention windows:** rich (log, dom,
+trace, screenshot — off by default, failure-only when enabled, 7-day
+retention) and bundle (junit — always produced, scrubbed, 30-day
+retention). `prepareDiagnosticForUpload(kind, diagnostic, opts)` is the
+single entry point; `buildDiagnosticsManifest` turns a caller's list into
+an exact (never globbed) artifact manifest plus a withheld list with named
+reasons.
+
+**Scrub failure suppresses upload — structurally, not by convention.**
+`prepareDiagnosticForUpload` is the only function that can return
+`{ upload: true, artifact }`, and every text-kind path reaches that only
+after `redactSecretsInText` runs AND `textStillContainsSecretShapedValue`
+re-scans the redacted output and returns `false`. No branch skips the
+re-scan; no other exported function hands back raw or redacted content, so
+there is no side door to an unscrubbed upload. Screenshots (the one binary
+kind) have no in-process scrub at all — no image parser exists or will be
+added — so they are suppressed outright absent an explicit,
+externally-verified `verifiedRedacted: true`; suppression is their only
+possible outcome from this module, never redaction. An oversized artifact
+is likewise suppressed rather than truncated, since truncation could cut a
+redaction placeholder in half. The one dependency-injection seam
+(`opts.verify`) exists solely so this ticket's own tests can force the
+"cannot trust this scrub" branch deterministically; production callers
+never override it.
+
+**Action/reusable-workflow allowlisting completes #153's SHA-pinning.**
+`checkActionAndReusableWorkflowAllowlist` scans every `uses:` reference
+(action step or reusable-workflow call — identical YAML shape) and names,
+individually: `action.not-pinned`, `action.not-allowlisted`, and
+`action.sha-mismatch` (an allowlisted identity re-pinned to an unapproved
+SHA needs fresh approval, not silent acceptance).
+`DEFAULT_ALLOWLISTED_ACTIONS` names exactly #153's two actions; growing it
+is an explicit caller choice, never assumed.
+
+**A privileged lane refuses low-trust code and artifacts, on both the
+YAML-shape and the data axis.** `checkPrivilegedLaneRefusesLowTrustBridge`
+detects the "pwn request" bridge shape in workflow text: a privileged job
+(secrets/OIDC/protected-environment/write-permission) declared alongside a
+`pull_request_target`/`workflow_run` trigger, or downloading an artifact
+with no visible Result Envelope validation reference.
+`assertPrivilegedJobRefusesArtifact` is the structured-data form, composing
+trust-zones.mjs's `checkPrivilegedLaneArtifact` (#151) directly — the sole
+gate, never re-implemented. The advisory PR lane itself is proven, by this
+ticket's test, to carry none of the six privileged identities an unreviewed
+PR job must never receive, reusing `checkWorkflowHardening` rather than a
+hand-rolled re-scan.
+
+**Seams for #156/#170:** no required/quarantine lane renderer exists yet to
+wire the bridge check against beyond this ticket's own fixtures; no caller
+wires `prepareDiagnosticForUpload`/`buildDiagnosticsManifest` into a real
+generated workflow step, the Failure Evidence Bundle schema (§5.6), or
+`retention-days` on a rendered `actions/upload-artifact` step; no real
+Playwright trace/DOM/screenshot capture pipeline feeds this module's
+`{ text }`/`{ bytes, verifiedRedacted }` shape yet. Per the run brief,
+`qa-generate/SKILL.md` was deliberately not edited — see
+`shared/references/diagnostics-and-hardening.md`'s closing section for the
+exact placeholder text a later coordinated edit should add to that
+skill's step 5.

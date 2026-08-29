@@ -124,3 +124,131 @@ export function detectSecretValue(value) {
 
   return null;
 }
+
+// --- free-text scrubbing (ticket #155) --------------------------------------
+//
+// Everything above judges one scalar string value (a Named Data Set field).
+// Diagnostics — a log stream, a serialized DOM snapshot, a trace's event
+// text, JUnit XML — are prose/markup blobs containing many values, not a
+// single scalar. This is deliberately NOT a second detector: every pattern
+// below is the exact same rule already named above, rewritten as a global
+// (non-anchored) variant so it can find a secret-shaped substring anywhere
+// inside a larger blob, then redact just that substring. Keep any new secret
+// shape added above mirrored down here — the two lists are one detector,
+// read twice.
+
+const REDACTED_PLACEHOLDER = "[REDACTED]";
+
+const GLOBAL_PRIVATE_KEY_HEADER_RE =
+  /-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END\s+[A-Z0-9 ]*PRIVATE KEY-----/g;
+
+const GLOBAL_VENDOR_TOKEN_PATTERNS = [
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bASIA[0-9A-Z]{16}\b/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+  /\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,}\b/g,
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
+];
+
+// scheme://user:pass@host, unanchored: matches the credentialed portion
+// wherever it appears in a larger line, up to the next whitespace/quote.
+const GLOBAL_CREDENTIALED_URI_RE = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s@"'<>]+:[^/\s@"'<>]+@[^\s"'<>]*/g;
+
+const GLOBAL_BEARER_RE = /\bBearer\s+\S+/gi;
+
+const GLOBAL_JWT_SHAPE_RE = /\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+
+// Candidate long opaque runs (no whitespace/prose punctuation), re-tested
+// with the exact same entropy backstop `detectSecretValue` uses.
+const OPAQUE_TOKEN_CANDIDATE_RE = /[A-Za-z0-9+/_.=-]{20,}/g;
+
+const ALL_GLOBAL_EXACT_PATTERNS = [GLOBAL_PRIVATE_KEY_HEADER_RE, ...GLOBAL_VENDOR_TOKEN_PATTERNS, GLOBAL_CREDENTIALED_URI_RE, GLOBAL_BEARER_RE];
+
+function countAndReset(re, text) {
+  re.lastIndex = 0;
+  const matches = text.match(re);
+  re.lastIndex = 0;
+  return matches ? matches.length : 0;
+}
+
+function redactAndReset(text, re) {
+  re.lastIndex = 0;
+  const out = text.replace(re, REDACTED_PLACEHOLDER);
+  re.lastIndex = 0;
+  return out;
+}
+
+/**
+ * Finds and redacts every secret-shaped substring in a free-text blob,
+ * reusing the exact patterns `detectSecretValue` judges a single scalar
+ * against. Never throws. Returns `{ text, redactionCount }` — `text` is the
+ * redacted output (or the original text/"" unchanged when nothing matched),
+ * `redactionCount` is how many substrings were replaced.
+ *
+ * This function alone is *not* the fail-safe guarantee — see
+ * `textStillContainsSecretShapedValue`, which a caller must run against the
+ * output before trusting it. A scrub is "verified", never merely
+ * "attempted".
+ */
+export function redactSecretsInText(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return { text: typeof text === "string" ? text : "", redactionCount: 0 };
+  }
+
+  let out = text;
+  let count = 0;
+
+  for (const re of ALL_GLOBAL_EXACT_PATTERNS) {
+    count += countAndReset(re, out);
+    out = redactAndReset(out, re);
+  }
+
+  count += countAndReset(GLOBAL_JWT_SHAPE_RE, out);
+  out = redactAndReset(out, GLOBAL_JWT_SHAPE_RE);
+
+  out = out.replace(OPAQUE_TOKEN_CANDIDATE_RE, (m) => {
+    if (m.length >= HIGH_ENTROPY_MIN_LENGTH && shannonEntropyBitsPerChar(m) >= HIGH_ENTROPY_BITS_PER_CHAR) {
+      count += 1;
+      return REDACTED_PLACEHOLDER;
+    }
+    return m;
+  });
+
+  return { text: out, redactionCount: count };
+}
+
+/**
+ * The verification half of the fail-safe scrub. Re-scans text for any of the
+ * same secret shapes and returns `true` the moment one is still found.
+ * Intended use: call this on the OUTPUT of `redactSecretsInText` (or on any
+ * text a caller is about to upload) — a `true` result means the scrub cannot
+ * be trusted, and per the security invariant the artifact must be suppressed
+ * rather than uploaded, never uploaded "mostly redacted".
+ */
+export function textStillContainsSecretShapedValue(text) {
+  if (typeof text !== "string" || text.length === 0) return false;
+  for (const re of ALL_GLOBAL_EXACT_PATTERNS) {
+    re.lastIndex = 0;
+    const found = re.test(text);
+    re.lastIndex = 0;
+    if (found) return true;
+  }
+  GLOBAL_JWT_SHAPE_RE.lastIndex = 0;
+  const jwtFound = GLOBAL_JWT_SHAPE_RE.test(text);
+  GLOBAL_JWT_SHAPE_RE.lastIndex = 0;
+  if (jwtFound) return true;
+
+  OPAQUE_TOKEN_CANDIDATE_RE.lastIndex = 0;
+  let m;
+  while ((m = OPAQUE_TOKEN_CANDIDATE_RE.exec(text)) !== null) {
+    const candidate = m[0];
+    if (candidate.length >= HIGH_ENTROPY_MIN_LENGTH && shannonEntropyBitsPerChar(candidate) >= HIGH_ENTROPY_BITS_PER_CHAR) {
+      OPAQUE_TOKEN_CANDIDATE_RE.lastIndex = 0;
+      return true;
+    }
+  }
+  OPAQUE_TOKEN_CANDIDATE_RE.lastIndex = 0;
+  return false;
+}
