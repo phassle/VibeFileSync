@@ -229,6 +229,28 @@ test("designProviderNativeCI flags a runner the inventory never observed rather 
 
 test("a flow blocked from every lane still yields a proposal naming why, never an exception mid-portfolio", () => {
   const approval = portfolioApproval(["a", "b"]);
+  // Pin trigger support explicitly rather than relying on the adapter's shipped
+  // default: #154 has since added schedule/workflow_dispatch/merge_group. This
+  // test is about the deferred-trigger PATH, not about which triggers happen to
+  // be supported today.
+  const result = designProviderNativeCI({
+    portfolioApproval: approval,
+    flows: [prFastFlow("a"), nightlyFlow("b")],
+    executionResultsByFlowId: { a: activatableExecutionResult(), b: activatableExecutionResult() },
+    ciInventoryFacts: ciFacts(),
+    renderConfig: renderConfig(),
+    supportedTriggers: ["pull_request"],
+    deferredTriggers: ["schedule (nightly)", "workflow_dispatch (manual/API)", "merge_group"],
+  });
+  const laneA = result.lanes.find((l) => l.flowId === "a");
+  const laneB = result.lanes.find((l) => l.flowId === "b");
+  assert.equal(laneA.assigned, true);
+  assert.equal(laneB.assigned, false);
+  assert.equal(laneB.reason, "trigger-not-yet-supported-by-adapter");
+});
+
+test("with the adapter's shipped trigger support, a nightly flow is now assigned (#154 widened it)", () => {
+  const approval = portfolioApproval(["a", "b"]);
   const result = designProviderNativeCI({
     portfolioApproval: approval,
     flows: [prFastFlow("a"), nightlyFlow("b")],
@@ -236,9 +258,6 @@ test("a flow blocked from every lane still yields a proposal naming why, never a
     ciInventoryFacts: ciFacts(),
     renderConfig: renderConfig(),
   });
-  const laneA = result.lanes.find((l) => l.flowId === "a");
   const laneB = result.lanes.find((l) => l.flowId === "b");
-  assert.equal(laneA.assigned, true);
-  assert.equal(laneB.assigned, false);
-  assert.equal(laneB.reason, "trigger-not-yet-supported-by-adapter");
+  assert.equal(laneB.assigned, true);
 });
