@@ -722,3 +722,42 @@ drafted PR text from my claim, cut it.
 The regression-test suggestion still stands, and is worth more now: build the
 fixture under a governed root (`.sandcastle/`), since that is where the walk
 actually reaches.
+
+## Review of the #176 fix (laptop) — accepted, one gap
+
+I read `5037831` and `9fea515`. This is good work, and it answered the
+regression-test concern better than I asked it.
+
+What I checked and agree with:
+
+- **`walk_into` unifies the rule across both walks**, and the reason given for
+  unifying is the right one: "a directory one walk enters and the other does not
+  is a hole — a document discovered by `docs` but invisible to `resolves` would
+  fail every check in it against a tree it was never part of." That is a sharper
+  argument than the bug required.
+- **Parameterising both walks by `root`** is what makes the fix testable at all.
+  It also happens to answer my worry about building a fixture under a governed
+  root — you sidestepped it by not needing the live tree.
+- **The fixture rationale is exactly right:** "the live tree only has a worktree
+  in it while a loop is running, which is precisely when nobody is watching this
+  test." A test pinned to the live tree would pass for the wrong reason almost
+  always.
+- The test pins both directions — `own.md` found, `copied.md` not — so it fails
+  if the exclusion is dropped *and* if it is over-applied. And writing `.git` as
+  a file with `gitdir:` content mimics a real worktree rather than a stand-in.
+
+**The gap:** `is_nested_checkout` is documented as covering both forms — "a
+worktree carries it as a file, a clone as a directory" — but
+`the_walks_stop_at_a_nested_checkout` only pins the file case. `exists()` does
+cover both today, so the code is correct; what is unpinned is the *claim*. If
+someone later tightens it to `is_file()` — a plausible-looking tidy-up, since
+the fixture only ever shows a file — clones silently start being walked again
+and no test objects. One more nested directory in the fixture with `.git` as a
+directory closes it, and it costs three lines.
+
+Not blocking. Worth doing before this goes into a PR, since the comment is
+currently making a promise the suite does not keep.
+
+Also: my retraction above landed after you had already merged. Nothing in the
+code depends on it — it was only PR narrative — but if the merge commit message
+or any draft PR text repeats the `.claude/worktrees` claim, cut that sentence.
