@@ -6,19 +6,21 @@ metadata:
   version: "{{BUNDLE_VERSION}}"
 ---
 
-STATUS: stages 1–7 built (ticket #162: authority and sourced inventory;
+STATUS: stages 1–9 built (ticket #162: authority and sourced inventory;
 ticket #163: posture-specific evidence; ticket #164: risk ranking and
 one-flow interviews; ticket #165: portfolio reconciliation and per-flow
-review; ticket #166: safe execution design). Stages 8–10 remain
-placeholders for later tickets — do not invent their content here. See
+review; ticket #166: safe execution design; ticket #167: measurement
+readiness; ticket #168: provider-native CI design). Stage 10 remains a
+placeholder for a later ticket — do not invent its content here. See
 `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 6. qa-setup SKILL.md outline` (run
 notes) for the full target workflow this file will grow into,
 `dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2,
 `dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3,
 `dynamic-qa/shared/references/candidate-ranking-and-interviews.md` for
 stages 4–5, `dynamic-qa/shared/references/portfolio-reconciliation.md` for
-stage 6, and `dynamic-qa/shared/references/safe-execution-design.md` for
-stage 7 below.
+stage 6, `dynamic-qa/shared/references/safe-execution-design.md` for
+stage 7, `dynamic-qa/shared/references/baseline-plan.md` for stage 8, and
+`dynamic-qa/shared/references/ci-design.md` for stage 9 below.
 
 ## Explicit invocation only
 
@@ -508,12 +510,104 @@ See `shared/references/baseline-plan.md` for the full rationale, the
 Quantity type's three states, and the deterministic core's test coverage
 for each rule above.
 
+## Stage 9: Design CI last (provider-native proposal)
+
+Every earlier stage exists to keep this stage from happening too early:
+CI design distorts QA intent when it comes first, because a runner's
+quirks or a provider's defaults start to look like requirements. This
+stage runs only once the whole portfolio has cleared stage 6's dual
+approval — not merely once some flows have — and it proposes the smallest
+change that carries that approved portfolio, matching what the repository
+actually has rather than introducing a parallel stack.
+
+`shared/scripts/ci-design.mjs` is where this stage's own logic lives. It
+composes three earlier tickets' results; it re-derives none of them:
+
+1. **Confirm the ordering gate before anything else.** Call
+   `designProviderNativeCI({ portfolioApproval, flows,
+   executionResultsByFlowId, ciInventoryFacts, renderConfig,
+   newWorkflowPath })`, passing stage 6's `evaluatePortfolioApproval`
+   result straight through as `portfolioApproval`. **This function throws
+   unless `portfolioApproval.portfolioFullyApproved` is `true`** — there is
+   no path through it that produces a CI proposal, partial or otherwise,
+   while any flow remains in `draftFlowIds`. If the QA Owner or Technical
+   Owner asks to "just design the PR lane for the flows that are ready,"
+   the answer is that stage 9 cannot start yet — resolve the remaining
+   drafts in stage 6 first; CI design is unreachable before that, not
+   merely discouraged.
+2. **Assign each approved flow a real lane, not the stage-6 coherence
+   signal alone.** For every flow `portfolioApproval.approvedFlowIds`
+   cleared, `designProviderNativeCI` calls `assignFlowLane(flow,
+   executionResultsByFlowId[flow.id])` — supply each flow's own stage 7
+   `designExecutionProfile` result (`safe-execution-design.mjs`) here, not
+   a placeholder. Stage 6's `classifyCandidateLane` only signals which
+   trigger a flow's risk profile would want (`pull_request` or
+   `schedule`); this stage decides whether that lane is actually usable
+   today against two real facts: whether the flow's own Execution Profile
+   activated (`decision.activate`), and whether the GitHub Actions adapter
+   (`github-actions-adapter.mjs`, #153) can render that trigger yet
+   (`SUPPORTED_TRIGGERS` vs. `DEFERRED_TRIGGERS`). A flow failing either
+   check is never silently folded into a lane it does not qualify for —
+   `assigned: false` always carries a named `reason` and, when the cause is
+   an unbuilt trigger, the exact `deferredTrigger` label. Present every
+   unassigned flow to the Technical Owner by its named reason; do not
+   treat "not assigned yet" as a defect to route around.
+3. **Never assume only `pull_request` exists.** All four Provider-native
+   CI exposures DESIGN-dynamic-qa-spec.md §8 requires — PR-fast,
+   nightly-full, manual/API, merge-group — are named lanes regardless of
+   which the adapter can render today. If a concurrent ticket has since
+   taught the adapter to render more triggers, pass the adapter's current
+   `SUPPORTED_TRIGGERS`/`DEFERRED_TRIGGERS` through unchanged (the
+   defaults already do this) — this stage's own code never hard-codes the
+   assumption that PR-fast is the only lane, so a wider adapter widens what
+   this stage can assign with no prompt or code change here.
+4. **Let the module decide amend vs. a new file — never default to a new
+   `dynamic-qa.yml` out of habit.** Pass the repository's own stage 2 CI
+   Facts (`inventory-ci.mjs`'s `scanCiWorkflows` output) as
+   `ciInventoryFacts`, and a `renderConfig` whose `runsOn` is the assigned
+   flow's own Execution Profile `environments.runnerClass` (stage 7,
+   itself inventory-derived — never a runner this stage invents).
+   `chooseSmallestDiff` scores every inventoried workflow with a real,
+   hosted runner as an amend candidate, measures its estimated diff
+   against the exact line count `renderAdvisoryPullRequestLane` (#153)
+   would produce for a brand-new file, and returns whichever is smaller —
+   ties favor amending. In this repository, `.github/workflows/
+   acceptance.yml` already carries a `pull_request` trigger on
+   `develop`/`main` with a real hosted runner (`macos-14`): a real design
+   run here proposes amending that file, not adding a reflexive
+   `dynamic-qa.yml`. Present the `diffChoice.justification` to the
+   Technical Owner exactly as computed — it names the actual estimated
+   line counts, not a vague "smaller" claim.
+5. **Present the proposal's named infrastructure as evidence, not as a
+   convenience.** `designProviderNativeCI`'s `namedInfrastructure` (the
+   runners, environments, triggers, and existing workflow paths the
+   proposal cites) comes directly from stage 2's own CI Facts — never a
+   plausible-looking label this stage invented. Check
+   `runnerMatchesInventory`: if it reports `matches: false`, the Execution
+   Profile names a runner class stage 2 never actually observed in this
+   repository's CI — raise that mismatch with the Technical Owner before
+   treating the proposal as ready, rather than assuming an unobserved
+   runner is real and reusable.
+6. **Stop after the proposal — nothing here writes to `.github/
+   workflows/` or changes provider policy.** The output of this stage is
+   exactly the CI proposal artifact (`provider`, `approvedFlowIds`,
+   `lanes`, `diffChoice`, `namedInfrastructure`,
+   `runnerMatchesInventory`) to carry into stage 10's Setup Review Packet
+   alongside the Execution Profiles and Baseline Plan. Only the advisory
+   lane is ever proposed (`enforcementState: "advisory"` on every assigned
+   lane) — required and quarantine lane rendering do not exist yet, and
+   this stage never invents an enforcement state it cannot actually
+   render.
+
+See `shared/references/ci-design.md` for the full rationale, the
+amend-vs-new-file scoring in detail, and the deterministic core's test
+coverage for each rule above.
+
 ## Stages not yet built (placeholders for later tickets)
 
 Each numbered stage below is a placeholder. Do not invent its content here;
 implement it in the ticket that owns it.
 
-9. **Design CI last (provider-native proposal)** — placeholder, same scope.
 10. **Review once, then emit (Setup Review Packet, dual approval)** — placeholder,
     same scope.
 
