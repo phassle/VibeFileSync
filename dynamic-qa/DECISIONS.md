@@ -821,3 +821,113 @@ the central editor to replace:
   disk should add a thin restricted-YAML parse/render pair the same way
   `flow-definition.mjs` and `flow-yaml.mjs` do for Flow Definitions, rather
   than growing that concern inside `execution-profile.mjs` itself.
+
+## 19. Trust zones and disposable verification (#151)
+
+**Module.** `shared/scripts/trust-zones.mjs`, 28 Tier 1 tests in
+`trust-zones.test.mjs`. No schema, no fixtures — every function takes plain
+JS values (zone names, small caller-supplied descriptors), matching how
+#150 tests `capability-gate.mjs` inline rather than through fixture files.
+
+**This ticket answers a different question than #150, deliberately not a
+parallel safety model.** #150's Execution Profile + Capability Gate decide
+whether one Flow's run may activate. This ticket decides whether the *zone
+a run happens in* is itself a legal place for that run to be, and whether
+the run's content/identity/filesystem/network shape violates the hard
+security invariant regardless of which zone it's in. `trust-zones.mjs`
+imports `classifyOriginRisk` from `execution-profile.mjs` rather than a
+second regex, and every reference to Execution Profile shapes (`paths`,
+`network`, `credentials`) mirrors #150's own field names exactly so a
+caller can pass the same objects to both layers.
+
+**The four Trust Zones are a fixed, linear pipeline, not a graph.**
+`contract-authoring -> candidate-verification -> low-trust-ci ->
+privileged-publication` is the only legal direction. `checkZoneTransition`
+checks every ordered pair of the four zone names and returns a distinct
+named error for each of the 13 illegal ones — categorized as `skip`
+(jumping ahead, most importantly `contract-authoring ->
+privileged-publication`, which would let untrusted evidence inherit write
+authority directly), `backward` (flowing back down the pipeline, most
+importantly out of `privileged-publication`), `self-loop`, or
+`unknown-zone` — rather than one generic "illegal transition" flag. A test
+enumerates all 16 ordered pairs and asserts the 13 illegal ones produce 13
+distinct error names, so no two illegal transitions can silently collide on
+the same name.
+
+**The hard security invariant is three independent, named comparisons, not
+a paragraph.** SPEC-135 User Story 84's exact source list — repository,
+application, issue, branch, test, MCP, dependency, action, cache, artifact,
+model output — is `UNTRUSTED_CONTENT_SOURCES`, an explicit frozen array,
+not an inferred guess. Classification is fail-closed the other direction
+too: the *only* content source this module treats as trusted is the
+literal string `"reviewed-base-branch"` (DESIGN-dynamic-qa-spec.md §11
+zone 4's "separate reviewed base-branch code"); anything else — including a
+source absent from either list — classifies untrusted by default.
+`checkHardSecurityInvariant` then checks, independently (never
+`else if`, so a config violating more than one is reported for all of
+them): untrusted content + a privileged credential scope
+(`trust-invariant.untrusted-content-with-privileged-identity`, privilege
+detected via a `write|push|publish|deploy|admin|protected-branch` scope
+pattern — deliberately orthogonal to #150's production/non-production
+identity axis, since a non-production service account can still hold
+write/publish authority); untrusted content + broad filesystem access
+(`trust-invariant.untrusted-content-with-broad-filesystem`, "broad" meaning
+`/`, `~`, `$HOME`, or a wildcard path entry); and untrusted content +
+unrestricted network reach
+(`trust-invariant.untrusted-content-with-unrestricted-network`, "restricted"
+requiring both an all-`exact`-origin allowlist per `classifyOriginRisk` and
+`externallyEnforced: true` — reusing capability-gate.mjs's own "a permissive
+hosted runner does not satisfy exact egress" rule at the zone-assignment
+level).
+
+**Authoring isolation from privileged publication is checked twice, on
+purpose.** `checkZoneTransition` already refuses the direct
+`contract-authoring -> privileged-publication` jump; `checkAuthoringAuthority`
+separately refuses `contract-authoring` holding a privileged credential
+scope at all, regardless of any attempted transition — so a reviewer
+cannot satisfy the invariant merely by not modelling a transition, only by
+the authoring zone never being granted write/publish authority in the
+first place.
+
+**Disposable, unprivileged, pinned-commit verification is one function,
+three named failures.** `checkVerificationCompute({ environment,
+sourceCommit })` requires `environment.disposable === true`,
+`environment.unprivilegedUser === true` (this module's own field, distinct
+from and in addition to #150's `environments.disposable` *profile*
+declaration — this checks the concrete compute evidence for *this run*),
+and `sourceCommit` matching the exact same 40-hex-character SHA format
+`provenance.mjs`'s `validateProvenanceManifest` requires — mirrored, not
+imported, since `provenance.mjs` does not export that regex separately.
+Environment evidence here is caller-supplied, following #150's established
+pattern exactly (say so in the module header rather than pretending it is
+discovered).
+
+**Privileged lanes accept exactly two artifact kinds.**
+`checkPrivilegedLaneArtifact(zone, artifact)` only constrains
+`zone === "privileged-publication"` (every other zone passes unconditionally
+— this rule is specific to the one zone the spec says must never become an
+execution bridge). `artifact.kind === "code"` gets its own named error,
+`trust-zone.privileged-lane-refuses-code`, since executing generated code
+directly in the privileged lane is the single most direct execution-bridge
+route; every other kind but `"result-envelope"` and `"recompute"` —
+including `cache`/`path`/`command`/`url`, the exact artifact classes
+DESIGN-dynamic-qa-spec.md §11 zone 4 names — gets the general
+`trust-zone.privileged-lane-refuses-artifact`.
+
+**Seams left for #153, #155, #170:**
+- No caller anywhere assigns a real run to a Trust Zone yet, or calls any
+  function in this module from a `qa-setup`/`qa-generate` stage.
+  `preflight.mjs` (#146) and stage 7's wiring (#150's seam, still open)
+  are the natural callers.
+- `contentSource`, `credentials`, `environment.unprivilegedUser`, and
+  `sourceCommit` are all caller-supplied here, exactly as #150 left
+  environment evidence caller-supplied. No adapter or sandbox discovers any
+  of them from a real filesystem, credential store, or CI provider yet.
+- The Result Envelope artifact this module's `checkPrivilegedLaneArtifact`
+  accepts is referenced by name only (`kind: "result-envelope"`); no
+  schema for its actual contents exists yet. A ticket that defines it
+  should keep `trust-zones.mjs`'s acceptance check as the gate, rather than
+  duplicating an artifact-kind check elsewhere.
+- `qa-setup/SKILL.md`'s stage 7 prose integration is deferred to the
+  coordinator — see the exact replacement text and placeholder reported
+  separately.
