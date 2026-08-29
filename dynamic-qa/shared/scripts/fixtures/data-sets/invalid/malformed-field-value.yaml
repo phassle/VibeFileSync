@@ -1,0 +1,8 @@
+schema: dynamic-qa-data-v1
+id: malformed-field-value-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      apiToken:
+        wrong_key: "demo-api-token"

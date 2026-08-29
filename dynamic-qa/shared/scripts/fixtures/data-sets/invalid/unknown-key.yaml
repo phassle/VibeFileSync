@@ -1,0 +1,8 @@
+schema: dynamic-qa-data-v1
+id: unknown-key-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      note: "irrelevant"
+adapter_hint: "should be rejected as an unknown top-level key"

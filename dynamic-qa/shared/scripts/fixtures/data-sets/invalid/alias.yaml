@@ -1,0 +1,7 @@
+schema: dynamic-qa-data-v1
+id: alias-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      note: *anchor
