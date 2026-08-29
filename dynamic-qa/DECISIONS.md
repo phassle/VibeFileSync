@@ -1087,3 +1087,131 @@ DESIGN-dynamic-qa-spec.md §11 zone 4 names — gets the general
 - `qa-setup/SKILL.md`'s stage 7 prose integration is deferred to the
   coordinator — see the exact replacement text and placeholder reported
   separately.
+
+## 21. qa-setup stage 7 safe execution design (#166)
+
+**Modules.** `shared/scripts/safe-execution-design.mjs` (21 Tier 1/2 tests
+in `safe-execution-design.test.mjs`) and `shared/scripts/execution-profile-yaml.mjs`
+(5 tests in `execution-profile-yaml.test.mjs`) — the YAML authoring/rendering
+surface #150 explicitly left unbuilt. `flow-yaml.mjs` gained one new export,
+`renderRestrictedYAMLDocument` (the pre-existing renderer body, now named and
+exported generically; `renderFlowDefinitionYAML` is now a one-line wrapper
+over it with identical behaviour). Reference:
+`shared/references/safe-execution-design.md`. `qa-setup/SKILL.md`'s stage 7
+placeholder is filled in, superseding both #150's and #151's deferred
+inserts for that placeholder — see below.
+
+**This ticket is a composition, not a third safety model, and is
+structured to make that checkable rather than asserted.** Every function
+`execution-profile.mjs`, `capability-gate.mjs`, and `trust-zones.mjs` already
+exported is called directly from `safe-execution-design.mjs`; none of their
+logic is reimplemented. Concretely:
+
+- `deriveExecutionProfileFromInventory` (new, this ticket) assembles a
+  profile's required sections (`owners`, `allowedPhases`,
+  `allowedTestLevels`, `environments`, `paths`, `commands`, `resources`,
+  `identities`, `network`, `effects`, `diagnostics`, `evidence`) **only**
+  from what a caller-supplied `inventory` object actually names. A section
+  `inventory` omits is left OUT of the profile entirely — never filled with
+  a plausible default — and produces exactly one named blocker,
+  `inventory.<section>-known`. This is "profiles are derived from the
+  inventory rather than from defaults" (acceptance criterion 2) made
+  structural: there is no branch in this function that invents section
+  content. `credentials` alone is treated as legitimately optional when
+  absent, because `execution-profile.mjs`'s own validator already accepts
+  `credentials: {}` as "no credential required," a real answer, not a gap.
+- `checkTrustZoneForExecution` (new, this ticket) composes exactly the
+  subset of #151's checks that apply to one run's context —
+  `checkHardSecurityInvariant` unconditionally, `checkZoneTransition` /
+  `checkAuthoringAuthority` / `checkVerificationCompute` /
+  `checkPrivilegedLaneArtifact` conditionally on which zone fields the
+  caller supplied — and returns their raw `{ error, message }` issues
+  unmodified for the caller to fold in.
+- `designExecutionProfile` (new, this ticket) is the sole per-flow decision
+  point. It runs, in fixed order: inventory derivation, `validateExecutionProfile`
+  (#150), `checkExecutionProfileHonoursBoundaries` (#150, always run —
+  never gated behind schema validity passing first, so a reviewer sees
+  every gap in one pass), `checkTrustZoneForExecution` (composed above),
+  `runCapabilityGate` (#150), and finally hands every blocker collected to
+  `activationDecision` (#150) — the exact same non-bypassable function
+  #150 already built, never a second one. There is no code path in this
+  module that returns an activation result without going through
+  `activationDecision`.
+
+**A missing capability is guaranteed to defer, never skip, structurally —
+by reusing #150's own guarantee, not a new one.** `activationDecision`
+already guarantees "no code path returns `activate: true` alongside a
+non-empty blocker list." This ticket's contribution is only to make sure
+every one of its OWN four new failure classes (inventory-derivation gaps,
+profile-validation issues, boundary-honourability issues, Trust Zone
+issues) actually reaches that same function's `blockers` argument rather
+than being handled — or silently dropped — anywhere else. `designExecutionProfile`
+always returns a result (never `undefined`/`null`, never throws for an
+ordinary gap) with a rendered `profileYaml` even when `decision.state` is
+`"deferred"`: "a profile is generated before activation is possible" holds
+for a deferred flow too — the draft exists and is reviewable, it is simply
+not enforceable yet.
+
+**Only #165's approved flows reach profile design, checked the same
+fail-closed way #165 itself established.** `designSafeExecutionForApprovedFlows`
+reads `evaluatePortfolioApproval`'s `approvedFlowIds` directly and skips
+every flow not in that set (i.e. anything #165 left in `draftFlowIds`)
+without designing a profile for it at all. It throws — rather than
+treating a missing/malformed `portfolioApproval` as "nothing approved" —
+mirroring `portfolio-reconciliation.mjs`'s `issuesForFlow` fail-closed
+convention exactly, so this stage cannot silently run ahead of stage 6 or
+against a stale approval result.
+
+**The YAML authoring/rendering surface reuses `flow-yaml.mjs`'s renderer
+directly — there is one rendering path, not two.** `flow-yaml.mjs`'s
+internal renderer (previously only reachable through the
+Flow-Definition-specific `renderFlowDefinitionYAML`) is now also exported
+generically as `renderRestrictedYAMLDocument`; `renderFlowDefinitionYAML`
+is unchanged in behaviour, now a one-line wrapper over that same function.
+`execution-profile-yaml.mjs` calls `renderRestrictedYAMLDocument` directly
+for Execution Profiles rather than duplicating
+`renderMappingLines`/`renderSequenceLines` a second time, and calls
+`restricted-yaml.mjs`'s `parseRestrictedYAML` directly for the read side
+(fail-closed on aliases/tags/duplicate keys, exactly as every other schema
+in this bundle) plus `execution-profile.mjs`'s own `validateExecutionProfile`.
+No second parser or renderer was written anywhere in this ticket.
+
+**`qa-setup/SKILL.md`'s stage 7 placeholder is filled in, superseding both
+#150's and #151's deferred inserts for it — this ticket incorporates both
+Execution Profiles/Capability Gate (#150) and Trust Zones (#151) in one
+prose section rather than two separate ones.** The status line and the
+"stages not yet built" list were both updated (stage 7 moved out of the
+placeholder list; the remaining placeholders renumbered 8–10 in place,
+content unchanged). Only stage 7's block was touched — `qa-generate/SKILL.md`
+was not touched, per the run's strict coordination rule for this ticket.
+
+**Seams left, explicitly, for #167 (stage 8) and #169 (Setup Review
+Packet):**
+- Nothing writes `qa/execution-profiles/<id>.yaml` to the repository yet —
+  stage 7 only produces an in-memory `profileYaml` string for review, per
+  this bundle's "nothing is written to the repository until the Setup
+  Review Packet's dual approval" rule. The Setup Review Packet ticket is
+  the natural place to actually stage the file for the one emitted patch.
+- `environment` and Trust Zone `context` remain entirely caller-supplied
+  here, exactly as #150 and #151 left them — no provider adapter populates
+  either for real yet. The GitHub Actions adapter (#153's territory) should
+  shape its output to this module's parameter shapes rather than inventing
+  new ones.
+- Baseline readiness (stage 8) and provider-native CI design (stage 9) both
+  assume this stage's blocker-free, activatable result as their
+  precondition — neither should assume a flow can safely run before its
+  Execution Profile and Trust Zone assignment clear every blocker here.
+- The Result Envelope schema `checkPrivilegedLaneArtifact` gates still does
+  not exist (per #151's own seam note); this ticket's composition is ready
+  the moment a later ticket defines one.
+
+**Assumption a later implementer must know:** `designExecutionProfile`'s
+`context` argument (`zone`, `fromZone`, `contentSource`, `credentials`,
+`environment`, `sourceCommit`, `privilegedArtifact`) is optional field by
+field — omitting `zone` skips zone-transition/authoring-authority checks
+entirely (not a blocker), and omitting `contentSource` classifies as
+untrusted by `classifyContentTrust`'s fail-closed default, which still
+correctly triggers `checkHardSecurityInvariant` against whatever
+`paths`/`network`/`credentials` the profile declares. A caller that wants
+zone legality actually checked must supply `zone` explicitly; this stage
+does not infer a zone from anything.
