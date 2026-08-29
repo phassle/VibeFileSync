@@ -65,7 +65,51 @@ introduces the first per-bundle immutable content digest and byte-identical
 packaging check for the Dynamic skill family; it is new machinery, and later
 `dynamic-qa` tickets should extend it rather than invent a second scheme.
 
-## 3. Two skills only, no third `qa-heal` skill
+## 4. Deterministic core (Node, built-ins only) + a two-tier acceptance harness
+
+**Decision.** The bundle is not "Markdown prompts that ask an agent to
+validate." Anything that is pure computation — schema validation,
+canonicalization and content digests, the drift gate, quarantine expiry,
+diagnostics scrubbing, evidence-bundle parsing, threshold evaluation, and
+capability-gate checks — is real executable code in a deterministic core at
+`dynamic-qa/shared/scripts/` (see the `PLACEHOLDER.md` there), because the
+spec requires ordinary PR and nightly regression runs to call no LLM and no
+browser agent. The core is plain JavaScript (ESM), Node.js built-in modules
+only: no TypeScript, no transpile step, no `npm install`, no third-party
+dependency. Where strict YAML or JSON Schema handling is needed, later
+tickets hand-write a restricted-subset parser / validator here rather than
+add a library dependency — an empty supply chain is a security requirement
+for this bundle (attacker-controlled content must never combine with broad
+capability), not a style preference. Core tests use the built-in `node:test`
+and `node:assert` modules, so the fast tier needs no test-framework
+dependency either.
+
+**Why Node.** Claude Code and the other coding-agent harnesses this bundle
+targets are themselves Node CLIs, so Node is already present on any machine
+where these skills can run at all — the core adds no new runtime requirement
+to a customer's box. (This guarantee covers the developer machine running
+the agent, not automatically a minimal self-hosted CI runner; GitHub-hosted
+runners ship Node. Whoever builds the GitHub Actions adapter should state
+the runtime it depends on explicitly and treat a missing runtime as a Safety
+Blocker with the flow deferred, never a silent skip — not solved here.)
+
+**Consequence for the acceptance harness** (`dynamic-qa/acceptance/`, ticket
+#142): it runs two tiers. Tier 1 runs `node --test` directly against
+`dynamic-qa/shared/scripts` — no fixture repository, no model, no network,
+seconds not minutes. Tier 2 is the disposable fixture-repository harness,
+reserved for what is genuinely agentic (elicitation, generation, adoption,
+diagnosis, repair proposals) plus genuinely structural cross-harness checks
+(discoverability, packaging). The rule for every later ticket: if you find
+yourself asserting on model behavior for something that is really just
+computation, extract the computation into Tier 1 instead — see
+`dynamic-qa/acceptance/README.md` for the full contract.
+
+**Open item for a later ticket.** `build.sh`'s existing `shared/schemas` /
+`shared/references` copy-and-byte-diff pattern does not yet extend to
+`shared/scripts` — whichever ticket lands the first real core module should
+extend `build_shared`/`verify_shared_copies_identical` the same way.
+
+## 5. Two skills only, no third `qa-heal` skill
 
 Restated from the parent spec for anyone reading this file in isolation: exactly
 `qa-setup` and `qa-generate` are built. Repair is an explicit mode of
