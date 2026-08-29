@@ -1,0 +1,7 @@
+schema: dynamic-qa-data-v1
+id: anchor-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      note: &n "should be rejected before schema validation even runs"

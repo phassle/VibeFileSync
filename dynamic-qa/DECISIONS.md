@@ -151,3 +151,69 @@ Restated from the parent spec for anyone reading this file in isolation: exactly
 `qa-setup` and `qa-generate` are built. Repair is an explicit mode of
 `qa-generate` (`qa-generate repair --evidence ...`); no `qa-heal` directory exists
 anywhere in this build source, and none should be added.
+
+## 8. Named Data Set contract (#144)
+
+(Numbered 8, not 7, because section 7 above already existed when this ticket's
+briefing was written; appended here rather than colliding with it.)
+
+**Schema and validator.** `shared/schemas/dynamic-qa-data-v1.schema.json` plus
+`shared/scripts/named-data-set.mjs` follow #143's Flow Definition pattern
+exactly: strict root keys, `schema`/`id`/`revision` checked the same way,
+filename===id, an Issues-collecting validator that reports every problem
+rather than stopping at the first, and `parseNamedDataSetFile` combining
+restricted-YAML parsing with schema validation. No new YAML-level rule was
+added; all of #143's restricted-YAML fail-closed rules (aliases, anchors,
+custom tags, duplicate keys, block scalars, flow collections, tabs) apply
+unchanged because this module calls the same `parseRestrictedYAML`.
+
+**The no-secret-values rule splits into two kinds of check, deliberately not
+blurred together:**
+
+- *Exact, structural:* a fixed denylist of reserved field names
+  (`shared/scripts/named-data-set.mjs`'s `RESERVED_FIELD_CATEGORIES`) rejects
+  any field literally named for a selector, URL/endpoint, command, or
+  adapter-configuration setting, regardless of its value — those belong to
+  the Binding or the Execution Profile, never to case data. A field value
+  that starts with an unambiguous `scheme://` is rejected the same way
+  (`URL_SHAPE_RE`), independent of field name.
+- *Secret-value detection* (`shared/scripts/secret-detection.mjs`) is its own
+  module, imported by `named-data-set.mjs` rather than folded in, precisely
+  because it mixes exact rules (a PEM private-key header, known vendor token
+  prefixes such as AWS/GitHub/Slack/Stripe, an HTTP `Bearer` prefix, a
+  `scheme://user:pass@host` connection string) with two rules that are
+  necessarily heuristic and are labelled as such in every message they
+  produce: the three-segment dot-separated JWT shape, and a generic
+  high-entropy-opaque-string backstop. The heuristic rules can false-positive
+  on a legitimately non-secret opaque identifier (a UUID, a content hash used
+  as fixture data); the deliberate choice, given the "safe to review and
+  clone" invariant, is to fail closed anyway rather than risk a false
+  negative. `secret_handle` names are run through the same detector, since a
+  handle is supposed to be a name, never itself shaped like the secret it
+  stands in for.
+
+**Cross-file resolution (`shared/scripts/resolve-data-sets.mjs`).** #143 left
+a Flow's `data_sets` references checked for shape only (`data-set-refs.mjs`),
+never for existence. This ticket adds `resolveDataSetFile(id, { dataSetsDir })`
+(reads `<dataSetsDir>/<id>.yaml`, parses and validates it against the Named
+Data Set v1 contract, and reports `found: false` for a missing file rather
+than throwing) and `resolveFlowDataSets(flowData, { dataSetsDir })`, which
+re-applies `validateDataSetReferences` (reused, not forked) and then resolves
+every well-formed reference, reporting a dangling reference or an
+existing-but-invalid data set with the path rooted at the referencing
+`data_sets[<index>]`. This is deliberately kept as its own small, generic
+module — not merged into `named-data-set.mjs` or `flow-definition.mjs` — so
+#145/#146 can reuse the same "resolve an ID against a directory of
+`<id>.yaml` files, using this file-level validator" step (#146's
+provenance/drift gate will need the same resolve-and-validate sequence to
+fold a data set's digest into the provenance manifest) rather than
+reimplementing it.
+
+**Assumption for later tickets.** The `dataSetsDir` a caller passes to
+`resolveDataSetFile`/`resolveFlowDataSets` is not itself discovered by this
+module — a real invocation is expected to pass `<repository>/qa/data`
+(per DESIGN-dynamic-qa-spec.md §5's customer-repository layout). No
+assumption is made here about where that directory lives relative to the
+Flow file being resolved; that wiring is left to whichever ticket first
+drives this end-to-end against a real customer-repository tree (likely
+#145's flow+boundary reconciliation or #146's provenance/drift gate).

@@ -1,0 +1,7 @@
+schema: dynamic-qa-data-v2
+id: unsupported-schema-version-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      note: "irrelevant"

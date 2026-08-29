@@ -1,0 +1,20 @@
+# Fixture: a minimal, valid Named Data Set v1.
+#
+# Referenced by name from shared/scripts/fixtures/flows/valid.yaml
+# (data_sets: [changed-destination-basic]) — this is the same reusable-case
+# idea the Flow Definition fixture points at, kept in its own file per the
+# whole point of ticket #144 (cases separated from flow intent).
+schema: dynamic-qa-data-v1
+id: changed-destination-basic
+revision: 1
+cases:
+  - id: basic-change
+    fields:
+      oldContent: "Original report text"
+      newContent: "Updated report text"
+      apiToken:
+        secret_handle: demo-api-token
+  - id: unicode-change
+    fields:
+      oldContent: "Rapport (ancien)"
+      newContent: "Rapport (nouveau) — café"

@@ -1,0 +1,7 @@
+schema: dynamic-qa-data-v1
+id: forbidden-field-command-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      command: "rm -rf /tmp/whatever"
