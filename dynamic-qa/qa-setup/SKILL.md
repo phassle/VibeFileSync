@@ -6,18 +6,19 @@ metadata:
   version: "{{BUNDLE_VERSION}}"
 ---
 
-STATUS: stages 1–6 built (ticket #162: authority and sourced inventory;
+STATUS: stages 1–7 built (ticket #162: authority and sourced inventory;
 ticket #163: posture-specific evidence; ticket #164: risk ranking and
 one-flow interviews; ticket #165: portfolio reconciliation and per-flow
-review). Stages 7–10 remain placeholders for later tickets — do not invent
-their content here. See
+review; ticket #166: safe execution design). Stages 8–10 remain
+placeholders for later tickets — do not invent their content here. See
 `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 6. qa-setup SKILL.md outline` (run
 notes) for the full target workflow this file will grow into,
 `dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2,
 `dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3,
 `dynamic-qa/shared/references/candidate-ranking-and-interviews.md` for
-stages 4–5, and `dynamic-qa/shared/references/portfolio-reconciliation.md`
-for stage 6 below.
+stages 4–5, `dynamic-qa/shared/references/portfolio-reconciliation.md` for
+stage 6, and `dynamic-qa/shared/references/safe-execution-design.md` for
+stage 7 below.
 
 ## Explicit invocation only
 
@@ -358,13 +359,105 @@ incoherent portfolio.
 See `shared/references/portfolio-reconciliation.md` for the full rationale
 and the deterministic core's test coverage for each rule above.
 
+## Stage 7: Define safe execution
+
+Every flow that reached the approved portfolio in stage 6 still cannot run
+safely on its own: nothing yet says which paths, commands, environments,
+network reach, identities, effects, resources, and evidence make its
+execution enforceable rather than aspirational, and nothing yet says which
+of the four isolated Trust Zones a given run of it happens in. This stage
+closes that gap for every approved flow, one at a time, before anything is
+activated — and it never invents a fallback when a capability the profile
+would need is not actually there.
+
+This stage is deliberately a COMPOSITION of work two earlier tickets
+already built, not a new safety model:
+
+- **Execution Profiles and the Capability Gate** (`execution-profile.mjs`,
+  `capability-gate.mjs`) — the schema for a Flow's enforceable policy across
+  eight categories (paths, commands, environments, network, identities,
+  effects, resources, evidence), and the gate that checks a real
+  environment's evidence actually proves what the profile declares.
+- **Trust Zones and the hard security invariant** (`trust-zones.mjs`) — the
+  four isolated zones a run passes through
+  (`contract-authoring -> candidate-verification -> low-trust-ci ->
+  privileged-publication`), and the checkable rule that untrusted content
+  never combines with a privileged identity, broad filesystem access, or
+  unrestricted network reach.
+
+`shared/scripts/safe-execution-design.mjs` is where this stage's own logic
+lives, and it calls both of the above directly rather than re-deriving any
+of their checks:
+
+1. **Take only the flows stage 6 actually approved.** Call
+   `designSafeExecutionForApprovedFlows(flows, portfolioApproval, {
+   inventoryByFlowId, contextByFlowId })`, passing stage 6's
+   `evaluatePortfolioApproval` result straight through. A flow stage 6 left
+   in `draftFlowIds` never reaches profile design at all — this function
+   throws rather than proceeding if it is not given a real portfolio
+   approval result, so it cannot be called too early or on a stale
+   approval by accident.
+2. **Author each profile from inventoried fact, never a default.** For
+   each approved flow, `designExecutionProfile` calls
+   `deriveExecutionProfileFromInventory(flow, inventory)` first. Every one
+   of the profile's required sections (owners, allowedPhases,
+   allowedTestLevels, environments, paths, commands, resources, identities,
+   network, effects, diagnostics, evidence) comes only from what stage 1–2's
+   inventory (or a direct answer from the QA/Technical Owner, recorded the
+   same way) actually supplied. A section nobody has inventoried yet stays
+   OUT of the profile entirely and produces a named blocker
+   (`inventory.<section>-known`) — never a plausible-looking guess at, say,
+   a runner class or a path allowlist. Present each such gap to the
+   Technical Owner as a concrete question to answer, not a default to
+   rubber-stamp.
+3. **Validate, check honourability, and check Trust Zone legality — all
+   three, always, in one pass.** The same call also runs
+   `validateExecutionProfile` (schema/policy), `checkExecutionProfileHonoursBoundaries`
+   (can this profile actually honour the flow's own Boundary Declarations —
+   #145/#150's handoff), and `checkTrustZoneForExecution` (composes
+   `trust-zones.mjs`'s `checkHardSecurityInvariant` always, plus
+   `checkZoneTransition` / `checkAuthoringAuthority` /
+   `checkVerificationCompute` / `checkPrivilegedLaneArtifact` depending on
+   which zone this run's context names). Every issue any of these three
+   raise becomes a Safety Blocker in the same list — a reviewer sees every
+   gap in one pass, not one round of fixes at a time.
+4. **Run the Capability Gate against real environment evidence.**
+   `runCapabilityGate(profile, environment)` checks all eight categories
+   unconditionally against what the actual runner/sandbox/adapter reports
+   it enforces right now. `environment` is caller-supplied evidence — until
+   a provider adapter exists to populate it for real, ask the Technical
+   Owner for it directly and record the answer, rather than assuming a
+   permissive default enforces anything.
+5. **Let `activationDecision` be the only word on whether a flow may
+   activate.** Every blocker gathered above — inventory, validation,
+   honourability, Trust Zone, and Capability Gate — is what
+   `designExecutionProfile` hands to `activationDecision`. **A flow with
+   any open blocker always comes back `{ activate: false, state:
+   "deferred" }` — never a skip, never a silent pass.** Present the exact
+   named blocker(s) to the QA/Technical Owner plainly: which category,
+   which capability, what evidence is missing. A deferred flow still has a
+   generated profile draft (`profileYaml`) to review; it is simply not
+   enforceable yet, and stays out of activation until every blocker
+   naming it clears.
+6. **Never resolve a blocker yourself, and never batch-approve past one.**
+   Exactly like stage 6's reconciliation issues, a Safety Blocker is
+   something for the QA Owner and Technical Owner to close — provision the
+   missing runner, scope the credential correctly, narrow the network
+   allowlist — never something this stage papers over to keep moving. Once
+   the underlying gap is closed and the inventory/environment evidence is
+   updated, re-run `designExecutionProfile` for that flow; do not assume a
+   fix worked without seeing its blocker disappear from a fresh run.
+
+See `shared/references/safe-execution-design.md`,
+`shared/references/execution-profiles.md`, and
+`shared/references/trust-zones.md` for the full rationale and the
+deterministic core's test coverage for each rule above.
+
 ## Stages not yet built (placeholders for later tickets)
 
 Each numbered stage below is a placeholder. Do not invent its content here;
 implement it in the ticket that owns it.
 
-7. **Define safe execution (Execution Profiles, Capability Gate)** — placeholder,
-   same scope.
 8. **Establish measurement readiness (Baseline Plan)** — placeholder, same scope.
 9. **Design CI last (provider-native proposal)** — placeholder, same scope.
 10. **Review once, then emit (Setup Review Packet, dual approval)** — placeholder,

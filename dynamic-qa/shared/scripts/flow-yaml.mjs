@@ -110,6 +110,23 @@ function renderSequenceLines(arr, indent) {
 }
 
 /**
+ * Renders any plain JS value shaped as a restricted-YAML document (a
+ * top-level mapping) as text. This is the ONE rendering path in the bundle:
+ * `renderFlowDefinitionYAML` below is a thin, identically-behaved wrapper
+ * over this same function, and ticket #166's execution-profile-yaml.mjs
+ * reuses it directly for Execution Profiles rather than growing a second
+ * renderer. Nothing schema-specific lives here — schema-specific rules
+ * belong in the validator (flow-definition.mjs / execution-profile.mjs),
+ * not the renderer.
+ */
+export function renderRestrictedYAMLDocument(value) {
+  if (!isPlainObject(value)) {
+    throw new Error("renderRestrictedYAMLDocument requires a plain object");
+  }
+  return `${renderMappingLines(value, 0).join("\n")}\n`;
+}
+
+/**
  * Renders `flow` (a plain JS object already shaped like a Flow Definition —
  * typically the output of flow-assembly.mjs's assembleFlowDefinition) as
  * restricted-YAML text. Does not validate `flow` itself; callers should
@@ -117,8 +134,5 @@ function renderSequenceLines(arr, indent) {
  * which does both and proves the round trip).
  */
 export function renderFlowDefinitionYAML(flow) {
-  if (!isPlainObject(flow)) {
-    throw new Error("renderFlowDefinitionYAML requires a plain object");
-  }
-  return `${renderMappingLines(flow, 0).join("\n")}\n`;
+  return renderRestrictedYAMLDocument(flow);
 }
