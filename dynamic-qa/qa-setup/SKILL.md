@@ -359,7 +359,6 @@ incoherent portfolio.
 See `shared/references/portfolio-reconciliation.md` for the full rationale
 and the deterministic core's test coverage for each rule above.
 
-<<<<<<< HEAD
 ## Stage 7: Define safe execution
 
 Every flow that reached the approved portfolio in stage 6 still cannot run
@@ -453,7 +452,6 @@ See `shared/references/safe-execution-design.md`,
 `shared/references/execution-profiles.md`, and
 `shared/references/trust-zones.md` for the full rationale and the
 deterministic core's test coverage for each rule above.
-=======
 ## Stage 8: Establish measurement readiness
 
 Once every flow entering the approved portfolio has a safe Execution
@@ -509,19 +507,12 @@ treats missing evidence as zero.
 See `shared/references/baseline-plan.md` for the full rationale, the
 Quantity type's three states, and the deterministic core's test coverage
 for each rule above.
->>>>>>> impl/135-167-stage8-baseline-plan
 
 ## Stages not yet built (placeholders for later tickets)
 
 Each numbered stage below is a placeholder. Do not invent its content here;
 implement it in the ticket that owns it.
 
-<<<<<<< HEAD
-8. **Establish measurement readiness (Baseline Plan)** — placeholder, same scope.
-=======
-7. **Define safe execution (Execution Profiles, Capability Gate)** — placeholder,
-   same scope.
->>>>>>> impl/135-167-stage8-baseline-plan
 9. **Design CI last (provider-native proposal)** — placeholder, same scope.
 10. **Review once, then emit (Setup Review Packet, dual approval)** — placeholder,
     same scope.
