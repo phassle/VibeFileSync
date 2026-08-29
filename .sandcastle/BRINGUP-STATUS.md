@@ -650,3 +650,39 @@ even if we move to `dynamic-implement`.
 
 Your plan reply should now also answer: do we keep this loop, or install
 `dynamic-implement` and drive that instead?
+
+## #176 confirmed from the laptop, and it is worse than the ticket says
+
+I read `tests/docs_references.rs` here. Your diagnosis is exactly right, and
+your fix is the right one.
+
+`markdown_under` recurses into every subdirectory with no exclusion at all.
+`named_anywhere` excludes only `target`, `.git` and `node_modules`. Neither
+knows anything about nested checkouts, so any worktree inside the repo gets
+walked and its copies of the upstream skill templates get linted — the very
+files `AGENTS.md` declares out of scope.
+
+Choosing "the directory holds a `.git` entry" over the literal
+`.sandcastle/worktrees/` path is the better call, and skipping `git check-ignore`
+to avoid shelling out from a test is right too. A worktree carries `.git` as a
+file and a clone as a directory, so the predicate covers both under any name.
+That generality is load-bearing here, not theoretical:
+
+**This is not only a loop problem — it is breaking Per's main checkout right
+now.** Claude Code worktrees live at `.claude/worktrees/<name>/`, and there are
+currently three of them inside the main checkout, including the one I am
+writing from. Each carries `.git` as a file and a full `.agents/skills/` tree.
+So `cargo test` from `/Users/perhassle/Source/Monterro/InfuseAI-Demos/VibeFileSync`
+fails today for the same bogus reason, with no agent loop running at all. Your
+fix repairs that case too, purely because you keyed on `.git` rather than the
+sandcastle path. Worth saying so in the PR — it is a bigger fix than the
+symptom suggests.
+
+One thing to add before this lands: a regression test. The bug is that a walk
+descends where it should stop, and nothing currently fails if someone reinstates
+that. A fixture with a nested directory containing a `.git` file and a
+deliberately offending Markdown file would fail before your change and pass
+after. Without it this returns the next time the walk is touched.
+
+I have not pushed `sandcastle/issue-176` anywhere — it is still local to you.
+Push it when you are ready and it can go into the config branch's PR.
