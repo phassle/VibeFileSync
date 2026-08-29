@@ -62,6 +62,43 @@ import {
   renderMergeGroupLane,
   checkWorkflowHardening,
 } from "./github-actions-workflow.mjs";
+import { checkActionAndReusableWorkflowAllowlist, checkPrivilegedLaneRefusesLowTrustBridge } from "./workflow-hardening.mjs";
+import { parseJUnitXML, summarizeJUnit } from "./junit-report.mjs";
+import { buildDiagnosticsManifest } from "./diagnostics-scrub.mjs";
+
+// #156 (provider-neutral adapter contract, DESIGN-dynamic-qa-spec.md §9):
+// everything below this point through the end of the file expresses this
+// SAME adapter — no behaviour of #153/#154/#155's functions above is
+// changed — as an implementation of the neutral contract
+// (adapter-contract.mjs), so that a conformance suite written against the
+// contract (adapter-conformance.mjs) can run identically against this
+// adapter or any other. Two things are genuinely new here, not just
+// aggregation:
+//
+//   - `checkGeneratedConfigEnforcesProfile` (point 7) now ALSO composes
+//     #155's `checkActionAndReusableWorkflowAllowlist` and
+//     `checkPrivilegedLaneRefusesLowTrustBridge` — both were built by #155
+//     but never wired into this adapter's own enforcement gate (an open
+//     seam #155's own notes named for this ticket). Every existing
+//     rendered lane already satisfies both (the only actions ever emitted
+//     are the two DEFAULT_ALLOWLISTED_ACTIONS entries, pinned to the exact
+//     SHAs that allowlist approves, and no lane ever declares
+//     pull_request_target/workflow_run alongside a privileged job) — so no
+//     existing test's expected result changes. What changes is that a
+//     configuration violating either property, which previously slipped
+//     past this adapter's own enforcement check, is now caught. This is a
+//     security strengthening the ticket requires ("portability must not
+//     weaken security... the contract must make the security obligations
+//     explicit and checkable"), not a behaviour change to anything this
+//     adapter currently renders.
+//   - `planLane`, `emitReporting`, `emitFailureBundle`, and the exported
+//     `adapter` object are new, additive surface: `planLane` dispatches to
+//     the same four `plan*` functions already defined above (point 3);
+//     `emitReporting`/`emitFailureBundle` close the point-5 seam #155's
+//     notes explicitly left open ("no caller wires
+//     prepareDiagnosticForUpload/buildDiagnosticsManifest into a real
+//     generated workflow step... #156") by reusing junit-report.mjs and
+//     diagnostics-scrub.mjs directly — neither is a second detector.
 
 export const PROVIDER_IDENTITY = "github-actions";
 
@@ -71,6 +108,15 @@ export const PROVIDER_IDENTITY = "github-actions";
 // nothing is deferred any longer.
 export const SUPPORTED_TRIGGERS = Object.freeze(["pull_request", "schedule", "workflow_dispatch", "merge_group"]);
 export const DEFERRED_TRIGGERS = Object.freeze([]);
+
+// #156: this adapter renders ADVISORY lanes (pull_request/schedule/
+// workflow_dispatch) and one REQUIRED lane (merge_group). Quarantine-lane
+// rendering remains exactly the open seam #153/#154's notes already named
+// ("required-lane and quarantine-lane rendering... quarantine-lane
+// rendering, remain open for a later ticket") — declared honestly here
+// rather than silently omitted, mirroring DEFERRED_TRIGGERS above.
+export const SUPPORTED_LANES = Object.freeze(["advisory", "required"]);
+export const DEFERRED_LANES = Object.freeze(["quarantine"]);
 
 export const NODE_RUNTIME_CAPABILITY = "runtime.node-available";
 
@@ -285,7 +331,7 @@ export function planAdvisoryPullRequestLane({ profile, environmentEvidence, work
 // `lane`/`trigger` pair passed to `checkGeneratedConfigEnforcesProfile`
 // differ.
 
-function planLane({ renderer, lane, trigger, defaultWorkflowPath, profile, environmentEvidence, workflowConfig, workflowPath }) {
+function composeLanePlan({ renderer, lane, trigger, defaultWorkflowPath, profile, environmentEvidence, workflowConfig, workflowPath }) {
   const runtimeDeclared = checkNodeRuntimeCapabilityDeclared(profile);
   const gateResult = runCapabilityGate(profile ?? {}, environmentEvidence ?? {});
   const decision = activationDecision(gateResult, runtimeDeclared.errors);
@@ -313,7 +359,7 @@ function planLane({ renderer, lane, trigger, defaultWorkflowPath, profile, envir
  * `planAdvisoryPullRequestLane`.
  */
 export function planNightlyFullSuiteLane({ profile, environmentEvidence, workflowConfig, workflowPath } = {}) {
-  return planLane({
+  return composeLanePlan({
     renderer: renderNightlyFullSuiteLane,
     lane: "advisory",
     trigger: "schedule",
@@ -333,7 +379,7 @@ export function planNightlyFullSuiteLane({ profile, environmentEvidence, workflo
  * `checkWorkflowHardening`'s `dispatch.inputs-not-permitted` check.
  */
 export function planManualTriggerLane({ profile, environmentEvidence, workflowConfig, workflowPath } = {}) {
-  return planLane({
+  return composeLanePlan({
     renderer: renderManualTriggerLane,
     lane: "advisory",
     trigger: "workflow_dispatch",
@@ -353,7 +399,7 @@ export function planManualTriggerLane({ profile, environmentEvidence, workflowCo
  * adapter plans.
  */
 export function planMergeGroupLane({ profile, environmentEvidence, workflowConfig, workflowPath } = {}) {
-  return planLane({
+  return composeLanePlan({
     renderer: renderMergeGroupLane,
     lane: "required",
     trigger: "merge_group",
@@ -407,10 +453,22 @@ export function resolveRunReference(env = {}) {
  * existing caller is unaffected) are forwarded to `checkWorkflowHardening`
  * so each of the four lanes is checked against its own correct gating and
  * trigger expectations rather than the PR lane's.
+ *
+ * #156: ALSO composes #155's `checkActionAndReusableWorkflowAllowlist`
+ * (immutable pins AND an explicit approval, not pinning alone) and
+ * `checkPrivilegedLaneRefusesLowTrustBridge` (privileged/low-trust
+ * separation — no "pwn request" bridge) — both existed since #155 but were
+ * never wired into this, the adapter's sole point-7 enforcement gate, until
+ * now. Every lane this adapter renders already satisfies both (see the
+ * module header note), so no existing caller's expected result changes;
+ * what changes is that a configuration violating either property no longer
+ * slips past this check.
  */
 export function checkGeneratedConfigEnforcesProfile(profile, yamlText, { lane = "advisory", trigger = "pull_request" } = {}) {
   const hardening = checkWorkflowHardening(yamlText, { lane, trigger });
-  const errors = [...hardening.errors];
+  const allowlist = checkActionAndReusableWorkflowAllowlist(yamlText);
+  const bridge = checkPrivilegedLaneRefusesLowTrustBridge(yamlText);
+  const errors = [...hardening.errors, ...allowlist.errors, ...bridge.errors];
 
   const runnerClass = profile?.environments?.runnerClass;
   if (typeof runnerClass === "string" && runnerClass.trim() !== "") {
@@ -426,3 +484,109 @@ export function checkGeneratedConfigEnforcesProfile(profile, yamlText, { lane = 
 
   return { valid: errors.length === 0, errors };
 }
+
+// --- #156: the neutral-contract surface (points 3, 5, and the aggregate) ---
+
+const LANE_PLANNERS = Object.freeze({
+  advisory: {
+    pull_request: planAdvisoryPullRequestLane,
+    schedule: planNightlyFullSuiteLane,
+    workflow_dispatch: planManualTriggerLane,
+  },
+  required: {
+    merge_group: planMergeGroupLane,
+  },
+});
+
+/**
+ * Point 3, generalized: a single `{ lane, trigger, ... }`-shaped entry point
+ * a contract-neutral caller (or the conformance suite) can use without
+ * knowing this adapter's four separately-named `plan*` functions exist.
+ * Dispatches to the exact same function `planAdvisoryPullRequestLane` /
+ * `planNightlyFullSuiteLane` / `planManualTriggerLane` / `planMergeGroupLane`
+ * would have been called directly — no duplicated Capability Gate/renderer
+ * composition — and normalizes the result's `yaml` field to `config`
+ * (neutral naming: another provider's rendered configuration need not be
+ * YAML at all), while every direct caller of the original four functions is
+ * unaffected. An unknown `lane`/`trigger` pair (including `"quarantine"`,
+ * DEFERRED_LANES above) is refused as a deferred, blocked plan — never a
+ * silent no-op — naming the exact unsupported pair.
+ */
+export function planLane({ lane = "advisory", trigger = "pull_request", profile, environmentEvidence, workflowConfig, workflowPath } = {}) {
+  const planner = LANE_PLANNERS[lane]?.[trigger];
+  if (typeof planner !== "function") {
+    return {
+      rendered: false,
+      state: "deferred",
+      blockers: [
+        {
+          category: "lane",
+          capability: `lane:${lane}/trigger:${trigger}`,
+          message: `this adapter does not support lane ${JSON.stringify(lane)} with trigger ${JSON.stringify(trigger)} — supported lanes are ${JSON.stringify(SUPPORTED_LANES)} (deferred: ${JSON.stringify(DEFERRED_LANES)}), supported triggers are ${JSON.stringify(SUPPORTED_TRIGGERS)}`,
+        },
+      ],
+    };
+  }
+  const result = planner({ profile, environmentEvidence, workflowConfig, workflowPath });
+  if (!result.rendered) return result;
+  const { yaml, ...rest } = result;
+  return { ...rest, config: yaml };
+}
+
+/**
+ * Point 5 (reporting half). Reuses junit-report.mjs's `parseJUnitXML` /
+ * `summarizeJUnit` — the exact same primitives
+ * github-actions-annotations-cli.mjs and github-actions-summary-cli.mjs
+ * already use to publish native annotations and the job summary — rather
+ * than a second JUnit reader. Returns `{ summary, annotations }`: `summary`
+ * is the same total/passed/failed/errors/skipped/verdict shape a Result
+ * Envelope binding entry is built from; `annotations` is one
+ * `{ title, message }` entry per failed/errored test case, the same
+ * information the annotations CLI turns into `::error::` workflow commands.
+ * Pure function of the JUnit XML text — no filesystem access, so it is
+ * usable outside a real GitHub Actions run.
+ */
+export function emitReporting(junitXmlText) {
+  const parsed = parseJUnitXML(junitXmlText);
+  const summary = summarizeJUnit(parsed);
+  const annotations = parsed.tests
+    .filter((t) => t.status === "failed" || t.status === "error")
+    .map((t) => ({ title: `${t.classname ? `${t.classname} > ` : ""}${t.name}`, message: t.message ?? "failed" }));
+  return { summary, annotations };
+}
+
+/**
+ * Point 5 (strict failure-bundle half). Composes #155's
+ * `buildDiagnosticsManifest` directly — the sole fail-safe scrub/suppress
+ * gate (`prepareDiagnosticForUpload`) this bundle is built from — rather
+ * than re-implementing scrubbing, retention, or the exact-artifact-list
+ * rule here. This closes the seam #155's own notes named for this ticket:
+ * "no caller wires... buildDiagnosticsManifest into a real generated
+ * workflow step [or] the Failure Evidence Bundle."
+ */
+export function emitFailureBundle(diagnostics, opts) {
+  return buildDiagnosticsManifest(diagnostics, opts);
+}
+
+/**
+ * The neutral-contract-conforming adapter object (adapter-contract.mjs).
+ * Every property below is either one of this module's own exports, passed
+ * through unchanged, or one of the two thin compositions just above — this
+ * object adds no new decision logic of its own, it only names the shape a
+ * provider-neutral caller (or the conformance suite,
+ * adapter-conformance.mjs) can rely on existing.
+ */
+export const adapter = Object.freeze({
+  identity: PROVIDER_IDENTITY,
+  detect: detectProviderConfiguration,
+  deriveCapabilityEvidence,
+  planLane,
+  supportedTriggers: SUPPORTED_TRIGGERS,
+  deferredTriggers: DEFERRED_TRIGGERS,
+  supportedLanes: SUPPORTED_LANES,
+  deferredLanes: DEFERRED_LANES,
+  emitReporting,
+  emitFailureBundle,
+  resolveRunReference,
+  checkGeneratedConfigEnforcesProfile,
+});

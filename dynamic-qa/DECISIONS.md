@@ -2088,3 +2088,80 @@ verify one-hypothesis/protected-contracts/coverage/negative-control/
 neighbouring-coverage; emit the packet and stop) now name the exact
 functions above instead of "placeholder, same scope." #156 (adapter
 contract) and #169 (`qa-setup/SKILL.md`) were not touched.
+## 31. Provider-neutral adapter contract (#156)
+
+Extracts DESIGN-dynamic-qa-spec.md §9's seven-point provider-neutral CI
+adapter contract from the working GitHub Actions adapter (#153/#154/#155)
+rather than designing it ahead of one, per the ticket. New modules:
+`shared/scripts/adapter-contract.mjs` (the contract: the seven points and
+six security obligations as data, plus one behavioral checker per
+point/obligation — imports nothing provider-specific), `shared/scripts/
+adapter-conformance.mjs` (`runAdapterConformanceSuite(adapter, fixtures)`,
+the single reusable entry point, always running every point and obligation
+unconditionally, mirroring `capability-gate.mjs`'s composition style), and
+`shared/scripts/fixture-adapter.mjs` (a second, independently-implemented,
+fully-conforming "fixture-ci" adapter — JSON-shaped configuration, composing
+only `capability-gate.mjs`/`diagnostics-scrub.mjs`/`junit-report.mjs`,
+nothing GitHub-specific — proving the suite is genuinely reusable and that a
+second adapter needs no bundle-internal access; deliberately not a second
+real provider, per the ticket).
+
+**GitHub Actions is refactored, not rewritten, to conform.** No pre-existing
+function's signature or behaviour changed; every pre-existing test still
+passes unmodified. `github-actions-adapter.mjs` gains an exported `adapter`
+object plus three thin, additive compositions: `planLane` (a single
+`{ lane, trigger, ... }` entry point dispatching to the same four `plan*`
+functions #153/#154 already built — the private internal composer those
+functions shared was renamed `composeLanePlan` to free the `planLane` name
+for this public one), `emitReporting` (reuses `junit-report.mjs`'s
+`parseJUnitXML`/`summarizeJUnit`), and `emitFailureBundle` (reuses
+`diagnostics-scrub.mjs`'s `buildDiagnosticsManifest` directly) — the latter
+two close the point-5 seam #155's own notes named for this ticket.
+
+**One real strengthening, not a behaviour change.** `checkGeneratedConfig
+EnforcesProfile` (point 7) now ALSO composes #155's
+`checkActionAndReusableWorkflowAllowlist` and
+`checkPrivilegedLaneRefusesLowTrustBridge` — both existed since #155 but
+were never wired into this adapter's own enforcement gate. Every lane this
+adapter has ever rendered already satisfies both (only the two
+`DEFAULT_ALLOWLISTED_ACTIONS` entries are ever emitted, pinned to the exact
+SHAs that allowlist approves; no lane declares `pull_request_target`/
+`workflow_run` alongside a privileged job), so no existing assertion's
+expected result changes — what changes is that a configuration violating
+either property, previously invisible to this gate, is now caught. Portability
+must not weaken security; closing this seam is exactly what the ticket
+requires.
+
+**The six security obligations are fail-closed, never "untestable = fine".**
+Exact egress, minimal permissions, immutable pins, no-persisted-credential,
+privileged/low-trust separation, and diagnostics scrubbing each have their
+own named checker in `adapter-contract.mjs`. An adapter (or a fixtures bag)
+that cannot even be probed for an obligation FAILS that obligation — there is
+no path that treats an untestable adapter as presumed conformant. Diagnostics
+scrubbing is proven via `diagnostics-scrub.mjs`'s own documented test seam
+(forcing `opts.verify` to report failure) rather than depending on
+`secret-detection.mjs`'s exact regex coverage — a conforming
+`emitFailureBundle` must withhold every diagnostic when the scrub gate is
+forced to fail; a "rubber stamp" that bypasses the gate does not.
+
+**Quarantine-lane rendering remains an explicit seam**, declared via
+`DEFERRED_LANES = ["quarantine"]` on the GitHub Actions adapter (mirroring
+`DEFERRED_TRIGGERS`'s pattern) — not built here, matching #153/#154's own
+notes that this remains open for a later ticket.
+
+**Documentation:** prose lives in the new `shared/references/
+adapter-contract.md` (the neutral adapter shape, the seven points, the six
+obligations and how each is probed, how to run the suite against an
+arbitrary adapter, and exactly what changed in the GitHub Actions adapter).
+`qa-generate/SKILL.md` and `qa-setup/SKILL.md` were NOT edited, per the run's
+coordination note for this ticket.
+
+**Tests:** `shared/scripts/adapter-conformance.test.mjs` — both the real
+GitHub Actions adapter and the fixture-ci adapter pass the full suite
+(reusability, two adapter objects); a fixture adapter missing each of the 7
+points fails conformance naming that exact point (7 tests); a "rubber stamp"
+adapter unable to enforce each of the 6 security obligations fails
+conformance for that obligation rather than degrading to a silent pass (6
+tests); a sanity check confirms the fixture-ci adapter's own real methods
+are not accidentally penalized by the obligation tests' rubber-stamp
+counterexamples.
