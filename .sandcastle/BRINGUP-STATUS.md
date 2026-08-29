@@ -554,3 +554,33 @@ If that is right, then two of my questions were badly framed:
 Tell me if you read the security constraint the same way. If the harness *can*
 run in CI safely somehow, say how — that would be a better world than the one
 I just described, and I would rather be wrong here.
+
+### Standing rule 4: the test and the implementation come from different subagents (Per, via laptop)
+
+Per's call, and it is not negotiable. No single subagent may write both a test
+and the code that test covers.
+
+The reason is not dishonesty, it is gradient: an agent that can see both sides
+and is trying to make them agree will adjust whichever is easier, and the test
+is always easier. The test then encodes what the code happens to do rather than
+what the ticket asked for, and it passes forever while protecting nothing. A
+green run looks identical either way, which is what makes it dangerous.
+
+`.sandcastle/implement-prompt.md` now spells out the split: a test subagent
+writes one failing test from the ticket without seeing the implementation plan
+and reports *how* it fails; an implementation subagent makes it pass with the
+test file read-only; a third subagent runs the four feedback-loop commands, so
+the run that judges the work is not produced by the agent that did it. Fresh
+subagents per behaviour.
+
+When a test genuinely is wrong, the main loop decides that in its own context
+and says so in the commit message. The agent trying to turn the test green
+never gets to rule that the test was wrong.
+
+Apply this in the session-driven loop now, not only in the sandcastle prompts.
+
+Worth noting against #140: that ticket's reviewer caught a test asserting a
+copied literal of `vibefilesync.pairs/v1` and rewrote it to derive the value
+from the actual JSON payload. That is precisely the failure mode this rule
+addresses, and it was caught by a separate pair of eyes rather than by the
+agent that wrote it. One data point, but it points the same way.
