@@ -6,14 +6,16 @@ metadata:
   version: "{{BUNDLE_VERSION}}"
 ---
 
-STATUS: stages 1–3 built (ticket #162: authority and sourced inventory;
-ticket #163: posture-specific evidence). Stages 4–10 remain placeholders for
-later tickets — do not invent their content here. See
+STATUS: stages 1–5 built (ticket #162: authority and sourced inventory;
+ticket #163: posture-specific evidence; ticket #164: risk ranking and
+one-flow interviews). Stages 6–10 remain placeholders for later tickets — do
+not invent their content here. See
 `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 6. qa-setup SKILL.md outline` (run
 notes) for the full target workflow this file will grow into,
-`dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2, and
-`dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3
-below.
+`dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2,
+`dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3, and
+`dynamic-qa/shared/references/candidate-ranking-and-interviews.md` for
+stages 4–5 below.
 
 ## Explicit invocation only
 
@@ -210,13 +212,105 @@ See `shared/references/posture-specific-evidence.md` for the full rationale,
 the exact shape of `brownfield-observation` and `greenfield-source` facts,
 and the deterministic core's test coverage for each rule above.
 
+## Stage 4: Rank broadly, then refine
+
+Build the broad Candidate Flow list before any deep interview, so which
+flows earn stage 5's interview is a risk-based decision, not an accident of
+whichever flow came to mind first.
+
+1. **Build the Candidate Flow list from real evidence only.** Draw
+   candidates from stage 2's inventory and stage 3's confirmed evidence
+   (`intentStatus: "confirmed-intended"` brownfield observations,
+   `greenfield-source` facts with `provenance: "reported"`) — never from
+   imagination. For each candidate, construct it with
+   `shared/scripts/candidate-ranking.mjs`'s `makeCandidateFlow`, which fails
+   closed on a missing originating ticket link, exactly as stage 5's Flow
+   Definition will (AC: "each flow linked to originating tickets, so its
+   purpose and implementation context remain traceable").
+2. **Rank on all five factors, and show all five.** Call
+   `candidate-ranking.mjs`'s `rankCandidateFlows` and present every
+   candidate's `factorScores` — impact, frequency, change exposure, escape
+   history, and whether cheaper coverage already exists — never a single
+   combined number alone. Ask the QA Owner whether the ranking matches their
+   own sense of risk; a mismatch between the mechanical ranking and the QA
+   Owner's judgment is worth surfacing explicitly, not silently overriding
+   either way.
+3. **The QA Owner decides the portfolio; this stage never pads it.** Once
+   the QA Owner has chosen which ranked candidates to carry into stage 5,
+   call `evaluatePortfolioSize` with that count. Present the result plainly:
+   below the 5–10 guidance band is always a comfortable, allowed outcome —
+   ask only whether the QA Owner is confident nothing else rises to this
+   level of risk, never whether they want to "round up" to a number. Above
+   the guidance band, present the override requirement (a named
+   `qa-owner`/`technical-owner` approver plus a reason) rather than silently
+   dropping candidates to fit under it. There is no candidate-generating
+   function anywhere in the deterministic core — a smaller-than-guidance
+   portfolio is never a problem this stage tries to solve by inventing
+   coverage.
+4. **Carry every stage-3 blocker forward into ranking, not around it.** A
+   flow with an unresolved brownfield disagreement or no approved
+   greenfield source cannot yet be scored honestly — surface it as a
+   blocked candidate, never silently drop it or rank it as if its evidence
+   were settled.
+
+See `shared/references/candidate-ranking-and-interviews.md` for the full
+rationale and the deterministic core's test coverage for each rule above.
+
+## Stage 5: Interview one flow at a time
+
+For each ranked candidate the QA Owner selected, run one interview and
+produce exactly one strict, tech-neutral Flow Definition — never several
+flows from one interview, and never a partial one left half-assembled.
+
+1. **Ask one question at a time.** Resolve identity, Given/When/Then,
+   Expected Outcomes, Named Data Sets, every boundary/side effect, and
+   per-outcome tolerances through a sequence of single, plain-language
+   questions — never a combined form asking for several fields at once.
+   Give an evidence-backed recommendation where stage 2/3 evidence supports
+   one, but let the QA Owner's answer override it.
+2. **Cite evidence only through the choke point already built.** When an
+   Expected Outcome's wording rests on a specific brownfield observation or
+   greenfield source, cite that fact and let
+   `shared/scripts/flow-assembly.mjs`'s `evidenceIsEligibleForExpectedOutcome`
+   decide eligibility — for a brownfield fact this delegates entirely to
+   ticket #163's `posture.canBecomeExpectedOutcome`; do not read
+   `intentStatus` directly here. An Expected Outcome may also be authored
+   without citing a specific fact (e.g. it follows directly from the
+   approved ticket already backing the whole flow); the choke point only
+   blocks the case where ineligible evidence is cited and claimed anyway.
+3. **State outcomes in product language; tolerances are exact by default.**
+   Ask what the QA Owner would actually observe as correct, in plain
+   product terms — never a selector, route, or framework detail. A
+   tolerance other than exact must be attached to that one outcome and
+   requires the QA Owner's explicit choice; a `custom` tolerance
+   additionally requires their explicit approval and a stated reason
+   (`flow-assembly.mjs`/`flow-definition.mjs` fail assembly without both).
+4. **Stop on unresolved disagreement rather than assuming.** If the QA
+   Owner and a consulted Domain Expert disagree about a flow's intended
+   behaviour, or an answer leaves a required field ambiguous, stop and
+   carry the disagreement forward as a blocker — do not soften the
+   Expected Outcome, guess a plausible tolerance, or silently pick a side to
+   keep the interview moving.
+5. **Assemble, validate, and present the exact YAML for review.** Once every
+   question for this flow is answered, call
+   `flow-assembly.mjs`'s `assembleAndRenderFlowDefinition` to build the Flow
+   Definition, validate it against #143's contract, render it as restricted-
+   YAML text, and prove the render round-trips (re-parses to the same
+   canonical digest). Present that exact YAML to the QA Owner as the
+   "Flow Review" — this is the literal source-of-truth contract they are
+   agreeing to, not a paraphrase of it. A validation failure (including an
+   ineligible cited evidence fact, a missing originating ticket, or an
+   unapproved custom tolerance) is a blocker to resolve with the QA Owner
+   before moving to the next flow, never a shape to quietly relax.
+
+See `shared/references/candidate-ranking-and-interviews.md` for the full
+rationale and the deterministic core's test coverage for each rule above.
+
 ## Stages not yet built (placeholders for later tickets)
 
 Each numbered stage below is a placeholder. Do not invent its content here;
 implement it in the ticket that owns it.
 
-4. **Rank candidate flows** — placeholder, same scope.
-5. **Interview one flow at a time** — placeholder, same scope.
 6. **Reconcile the portfolio** — placeholder, same scope.
 7. **Define safe execution (Execution Profiles, Capability Gate)** — placeholder,
    same scope.

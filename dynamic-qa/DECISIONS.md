@@ -328,3 +328,56 @@ expected to read `Fact[]` — including `brownfield-observation` facts with
 input to risk/value ranking. Nothing in this ticket writes a ranking or
 scoring function; `canBecomeExpectedOutcome` and `buildGreenfieldFact`'s
 provenance are the seam #164 should read, not reimplement.
+
+## 11. Risk ranking and one-flow interviews (#164)
+
+**Ranking never invents a candidate — this is structural, not a review
+convention.** `candidate-ranking.mjs`'s `rankCandidateFlows` only reorders
+and annotates the exact array of `makeCandidateFlow` results it receives;
+there is no function anywhere in the module that can grow that array. A
+smaller-than-guidance portfolio is a valid outcome the module is built to
+accept, not a gap it tries to close.
+
+**Five factors stay individually visible.** `scoreCandidateFlow` returns
+`impact`, `frequency`, `changeExposure`, `escapeHistory` (a raw count,
+capped at 3 for scoring, with the raw count also reported), and
+`cheaperCoverageExists` (the one factor that SUBTRACTS from the total)
+before it ever sums them into `total`. Every one of Tier 1's "does this
+factor move the ranking" tests exercises a single factor's change against
+an otherwise-fixed candidate.
+
+**Portfolio size is guidance, with an override only above the band, never a
+cap that truncates.** `evaluatePortfolioSize` returns `allowed: true`
+unconditionally below the 5-10 band (SPEC-135.md story 15's "first-class,
+comfortable outcome" is enforced as literally no refusal code path exists
+for that case), and requires a reviewed `qa-owner`/`technical-owner`
+override (reusing `fact.mjs`'s `CONFIRMING_ROLES`, not reinventing the role
+check) only above 10. It never truncates a list on its own — a caller who
+gets `allowed: false` must go get review, not silently drop flows.
+
+**Stage 5 assembles and validates, never re-derives #163's or #143's
+rules.** `flow-assembly.mjs`'s `evidenceIsEligibleForExpectedOutcome`
+delegates brownfield eligibility entirely to `posture.canBecomeExpectedOutcome`
+and greenfield eligibility to the `provenance: "reported"` `posture.mjs`
+already computes — no `intentStatus` re-reading anywhere in this module.
+`assembleFlowDefinition` builds the schema-shaped object and then calls
+`flow-definition.mjs`'s own `validateFlowDefinition` — the schema and
+fail-closed rules (missing origin ticket, unapproved custom tolerance,
+forbidden template markers) are #143's, exercised again end to end here,
+never re-implemented.
+
+**A new module, `flow-yaml.mjs`, renders — deliberately not a general YAML
+writer.** It only emits the restricted subset `restricted-yaml.mjs` (#143)
+accepts (always-quoted scalar strings, `[]`/`{}` for empty collections, no
+block scalars or flow collections), so `assembleAndRenderFlowDefinition` can
+prove the full "generate → validate → canonical digest is stable" round
+trip Tier 1 and Tier 2 both test: render, re-parse, re-validate, and compare
+`canonical-digest.mjs`'s digest of the original and re-parsed values.
+
+**Seam left for #165 (stage 6, portfolio reconciliation).** Stage 6 is
+expected to read the set of assembled, validated Flow Definitions this
+ticket's stage 5 produces (in memory — nothing here writes to the
+repository) to find duplicates, contradictions, and shared boundaries
+across the whole portfolio. Nothing in this ticket performs cross-flow
+reconciliation; `assembleFlowDefinition`'s single-flow validation is not a
+substitute for it.

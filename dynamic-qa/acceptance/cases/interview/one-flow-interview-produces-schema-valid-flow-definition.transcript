@@ -1,0 +1,19 @@
+# Models stage 5's one-flow-at-a-time interview: identity, the observed
+# behaviour's intent confirmation (reusing stage 3's choke point), the
+# Given/When/Then shape, the Expected Outcome's tolerance, and a final exact
+# YAML Flow Review before the flow moves to stage 6's reconciliation. Each
+# question is its own line — never a combined prompt — and no write step
+# appears anywhere: only the Setup Review Packet (stage 10) writes.
+ask|flow-identity|What is this flow's stable, semantic id and title?
+answer|flow-identity|update-preserves-safetynet / "Update preserves the prior destination version before overwriting it"
+ask|observation-update-preserves-prior|Discovery observed that update() overwrites the destination without keeping a copy. Is preserving the prior version intended behaviour, or a bug that should be fixed instead?
+answer|intent-decision|intended
+ask|given-when-then|Walk me through Given/When/Then for this flow, one step at a time.
+answer|given-when-then|Given a changed destination, When Run is approved, Then the prior content is preserved in SafetyNet
+ask|boundary-treatment|Which crossed dependency is the owned outcome under test, and does it stay real?
+answer|boundary-treatment|the vibesync CLI itself, real, invoked against a disposable temporary folder pair
+ask|expected-outcome-tolerance|Should "the prior content is preserved" be checked exactly, or does it need a tolerance?
+answer|expected-outcome-tolerance|exact
+ask|flow-review|Here is the exact YAML for this flow. Does this match what we agreed?
+answer|flow-review|yes
+stop|flow-review-presented
