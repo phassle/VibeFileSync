@@ -1,0 +1,12 @@
+# Models stage 1 with an explicit invocation, a withheld QA Owner gate, and a
+# GRANTED Technical Owner gate — proving the Technical Owner's approval can
+# never rescue a missing QA Owner. The two gates are read independently via
+# lib/approvals.sh; qa-owner reads "withheld" here even though
+# technical-owner reads "approved".
+ask|invocation-source|How did this run start?
+answer|invocation-source|explicit-user-command
+ask|qa-owner|Who is the responsible QA Owner for this repository?
+answer|qa-owner|absent
+ask|technical-owner|Who is the Technical Owner for harness/CI/dependency consequences?
+answer|technical-owner|absent
+stop|missing-qa-owner-authority

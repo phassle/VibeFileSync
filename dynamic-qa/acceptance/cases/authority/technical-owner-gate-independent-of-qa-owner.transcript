@@ -1,0 +1,13 @@
+# Models stage 1 with an explicit invocation, a GRANTED QA Owner gate, and a
+# WITHHELD Technical Owner gate. Per SKILL.md stage 1 step 3, the Technical
+# Owner gate can remain absent/withheld longer than the QA Owner gate — only
+# the QA Owner gate blocks entry into stage 2. This transcript proceeds past
+# authority into a stage 2 stop state (inventory presented) with the
+# Technical Owner gate still open.
+ask|invocation-source|How did this run start?
+answer|invocation-source|explicit-user-command
+ask|qa-owner|Who is the responsible QA Owner for this repository?
+answer|qa-owner|absent
+ask|technical-owner|Who is the Technical Owner for harness/CI/dependency consequences?
+answer|technical-owner|absent
+stop|inventory-presented
