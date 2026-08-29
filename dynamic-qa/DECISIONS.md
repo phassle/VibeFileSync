@@ -328,9 +328,8 @@ expected to read `Fact[]` — including `brownfield-observation` facts with
 input to risk/value ranking. Nothing in this ticket writes a ranking or
 scoring function; `canBecomeExpectedOutcome` and `buildGreenfieldFact`'s
 provenance are the seam #164 should read, not reimplement.
-=======
 
-## 10. Binding generation and provenance (#146)
+## 11. Binding generation and provenance (#146)
 
 **Decision.** #146 adds five new deterministic-core modules under
 `shared/scripts/` — `preflight.mjs`, `provenance.mjs`,
@@ -426,9 +425,8 @@ since that is a real network readiness signal, not a fixed sleep.
 **Revision monotonicity ownership, stated plainly (per the run brief's
 ask):** #146 (this ticket) owns and implements it, in `provenance.mjs`,
 exported for #148 to reuse.
-=======
 
-## 11. Risk ranking and one-flow interviews (#164)
+## 12. Risk ranking and one-flow interviews (#164)
 
 **Ranking never invents a candidate — this is structural, not a review
 convention.** `candidate-ranking.mjs`'s `rankCandidateFlows` only reorders
