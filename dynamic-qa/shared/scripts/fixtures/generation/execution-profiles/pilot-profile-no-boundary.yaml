@@ -1,0 +1,62 @@
+# Fixture for preflight.test.mjs (#153): a well-formed Execution Profile
+# that does NOT honour flow-active.yaml's real, owned "vibesync-cli"
+# boundary (its side effects require isolation, but this profile omits
+# effects.namespace/effects.cleanup and does not name the boundary id at
+# all) — used to prove execution-profile-boundary-mismatch is refused
+# distinctly from invalid-execution-profile.
+schema: dynamic-qa-execution-profile-v1
+id: pilot-profile-no-boundary
+revision: 1
+owners:
+  qaOwner: Per
+  technicalOwner: Alex
+allowedPhases:
+  - candidate-verification
+  - pr
+allowedTestLevels:
+  - cli
+environments:
+  runnerClass: github-hosted-ubuntu
+  disposable: true
+  disposabilityEvidence: fresh hosted VM per job, destroyed after
+  sandbox: vm
+paths:
+  allowedRead:
+    - /repo
+  allowedWrite:
+    - /repo/tmp
+commands:
+  allowed:
+    - npm test
+resources:
+  maxProcesses: 4
+  maxCpuSeconds: 60
+  maxMemoryMb: 512
+  maxFileSizeMb: 10
+  maxWallTimeSeconds: 120
+identities:
+  approvedNonProduction:
+    - ci-bot
+  denyProduction:
+    - prod-service-account
+  denyMetadata:
+    - "169.254.169.254"
+network:
+  mode: none
+effects:
+  allowedBoundaryIds: []
+  reversibleSideEffects: false
+credentials: {}
+diagnostics:
+  classes: []
+  captureConditions:
+    - failure-only
+  scrubber: redact-secrets
+  maxSizeMb: 5
+  audience: qa-owner
+  retentionDays: 7
+evidence:
+  adapter: github-actions
+  capabilities:
+    - capability: runtime.node-available
+      category: evidence

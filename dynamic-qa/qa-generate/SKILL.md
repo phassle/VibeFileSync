@@ -81,16 +81,22 @@ below is single explicit-Flow-ID generation, real as of #146.
    filename, the repository's `qa/data` directory, the two approval booleans
    evidenced by the repository's own review/approval history (see that
    module's header comment — `qa-generate` supplies this evidence, it does
-   not re-derive it), the Execution Profile ID this generation targets (an ID
-   only — the Execution Profile artifact itself is #150's), the exact pinned
-   source commit SHA, the existing-harness descriptor (framework, test
-   directory, deterministic run command) discovered from the repository, and
-   the current `qa/provenance.json` if one exists. On `{ ready: false }`,
-   **stop immediately** and report the exact `reason` code and `issues` —
-   never proceed, never guess, never retry with different inputs. On
-   `{ ready: true }`, the returned `flowData` and `dataSets` are what every
-   later step below uses; do not re-parse the flow or re-resolve its data
-   sets.
+   not re-derive it), the Execution Profile ID this generation targets plus
+   the repository's `qa/execution-profiles` directory (#153 wired the actual
+   artifact resolution, well-formedness, and boundary-honourability checks
+   into preflight — this is no longer just an ID-string check), environment
+   evidence proving the Capability Gate is satisfied (never omit this input:
+   an absent environment is itself refused, not skipped — a real CI adapter,
+   e.g. `github-actions-adapter.mjs`'s `deriveCapabilityEvidence`, is the
+   intended real source), the exact pinned source commit SHA, the
+   existing-harness descriptor (framework, test directory, deterministic run
+   command) discovered from the repository, and the current
+   `qa/provenance.json` if one exists. On `{ ready: false }`, **stop
+   immediately** and report the exact `reason` code and `issues` — never
+   proceed, never guess, never retry with different inputs. On
+   `{ ready: true }`, the returned `flowData`, `dataSets`, and
+   `executionProfile` are what every later step below uses; do not re-parse
+   the flow, re-resolve its data sets, or re-validate its profile.
 2. **Reuse or generate the smallest conforming Binding.** Inspect the
    existing test layout and framework (from the preflight `harness`
    descriptor) for a deterministic test already proving every Expected
@@ -134,17 +140,23 @@ below is single explicit-Flow-ID generation, real as of #146.
    `enforcementLane` — brownfield candidates are `advisory`; a first active
    greenfield Binding is `required` unless repo governance records an
    explicit exception (spec §8); and `executionProfile: { id }` (digest
-   optional until #150 defines the artifact). Write the serialized result
-   (`serializeProvenanceManifest`) to `<repository>/qa/provenance.json` in
-   the same patch as the Binding file(s) — never separately.
-   Deterministic-CI enrollment beyond this manifest write is #148's
-   territory (the drift gate) and not yet built here.
+   optional until a caller fills it via `contentDigest`, per #150's
+   hand-off). Write the serialized result (`serializeProvenanceManifest`) to
+   `<repository>/qa/provenance.json` in the same patch as the Binding
+   file(s) — never separately. The deterministic drift gate
+   (`drift-gate-cli.mjs`, #148) enforces this manifest on every later CI run;
+   this step only writes it. Rendering the actual provider CI lane the
+   Binding runs in is a separate concern from this manifest write — see
+   `dynamic-qa/shared/references/github-actions-adapter.md` for the GitHub
+   Actions adapter this bundle ships (#153); wiring its invocation into this
+   skill's own step sequence is left to a coordinated follow-up, not done in
+   this edit.
 6. **Verify the candidate.** Run the affected flow's new/adopted test in the
    approved candidate-verification sandbox (safe execution Trust Zone 2,
-   spec §11) against the pinned source commit. Negative controls, neighbor-
-   flow verification, and the drift gate itself remain placeholders — #148
-   and #152 own that machinery; until it lands, running the new test once
-   and requiring it to pass is the whole of this step.
+   spec §11) against the pinned source commit. Negative controls and
+   neighbor-flow verification remain placeholders — #152 owns that
+   machinery; until it lands, running the new test once and requiring it to
+   pass is the whole of this step.
 7. **Present one review packet, emit a patch, and stop.** Show the level
    rationale, the Flow-to-Binding mapping (every assertion's stepId/outcomeId
    pair from step 4), the exact diff (Binding file(s) plus

@@ -16,10 +16,25 @@ import { runGenerationPreflight } from "./preflight.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(HERE, "fixtures", "generation");
 const DATA_SETS_DIR = path.join(FIXTURES, "data");
+const EXECUTION_PROFILES_DIR = path.join(FIXTURES, "execution-profiles");
 
 const VALID_SOURCE_COMMIT = "a".repeat(40);
 const GOOD_APPROVALS = { qaOwner: true, technicalOwner: true };
 const GOOD_HARNESS = { framework: "vitest", testDir: "tests/e2e", command: "npm test" };
+
+// A Capability Gate environment that fully matches
+// fixtures/generation/execution-profiles/pilot-profile.yaml — mirrors
+// capability-gate.test.mjs's own passingEnvironment() shape.
+const PASSING_ENVIRONMENT_EVIDENCE = {
+  paths: { enforcedRead: ["/repo"], enforcedWrite: ["/repo/tmp"] },
+  commands: { enforced: ["npm test"] },
+  environments: { runnerClass: "github-hosted-ubuntu", disposable: true, sandbox: "vm" },
+  resources: { maxProcesses: 4, maxCpuSeconds: 60, maxMemoryMb: 512, maxFileSizeMb: 10, maxWallTimeSeconds: 120 },
+  identities: { active: ["ci-bot"] },
+  network: { mode: "none" },
+  effects: { enforcedBoundaryIds: ["vibesync-cli"], namespaceIsolation: true, cleanupCapability: true },
+  evidence: [{ capability: "runtime.node-available", status: "met" }],
+};
 
 function readFixture(relPath) {
   return readFileSync(path.join(FIXTURES, relPath), "utf8");
@@ -32,6 +47,8 @@ function goodInput(overrides = {}) {
     dataSetsDir: DATA_SETS_DIR,
     approvals: GOOD_APPROVALS,
     executionProfileId: "pilot-profile",
+    executionProfilesDir: EXECUTION_PROFILES_DIR,
+    environmentEvidence: PASSING_ENVIRONMENT_EVIDENCE,
     sourceCommit: VALID_SOURCE_COMMIT,
     harness: GOOD_HARNESS,
     existingProvenanceManifest: null,
@@ -117,6 +134,58 @@ test("fail-closed: safety — a missing Execution Profile id is refused with mis
   const result = runGenerationPreflight(goodInput({ executionProfileId: undefined }));
   assert.equal(result.ready, false);
   assert.equal(result.reason, "missing-execution-profile-id");
+});
+
+test("fail-closed: safety — an Execution Profile id that does not resolve to a real file is refused with invalid-execution-profile", () => {
+  const result = runGenerationPreflight(goodInput({ executionProfileId: "does-not-exist" }));
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "invalid-execution-profile");
+});
+
+test("fail-closed: safety — no executionProfilesDir at all is refused with invalid-execution-profile", () => {
+  const result = runGenerationPreflight(goodInput({ executionProfilesDir: undefined }));
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "invalid-execution-profile");
+});
+
+test("fail-closed: safety — a malformed Execution Profile document is refused with invalid-execution-profile", () => {
+  const badProfilesDir = path.join(FIXTURES, "does-not-exist-profiles-dir");
+  const result = runGenerationPreflight(goodInput({ executionProfilesDir: badProfilesDir }));
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "invalid-execution-profile");
+});
+
+test("fail-closed: safety — an Execution Profile that does not honour the flow's boundaries is refused with execution-profile-boundary-mismatch", () => {
+  const result = runGenerationPreflight(
+    goodInput({
+      executionProfileId: "pilot-profile-no-boundary",
+      environmentEvidence: { ...PASSING_ENVIRONMENT_EVIDENCE, effects: { enforcedBoundaryIds: [] } },
+    }),
+  );
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "execution-profile-boundary-mismatch");
+});
+
+test("fail-closed: safety — no environment evidence at all is refused with missing-environment-evidence, never silently skipped", () => {
+  const result = runGenerationPreflight(goodInput({ environmentEvidence: undefined }));
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "missing-environment-evidence");
+});
+
+test("fail-closed: safety — environment evidence that does not satisfy the Capability Gate is refused with execution-profile-capability-blocked, naming the exact blocker", () => {
+  const result = runGenerationPreflight(
+    goodInput({ environmentEvidence: { ...PASSING_ENVIRONMENT_EVIDENCE, network: { mode: "exact-allowlist" } } }),
+  );
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "execution-profile-capability-blocked");
+  assert.ok(result.issues.length > 0);
+});
+
+test("fail-closed: safety — an empty environment evidence object fails every Capability Gate category rather than being treated as not-applicable", () => {
+  const result = runGenerationPreflight(goodInput({ environmentEvidence: {} }));
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "execution-profile-capability-blocked");
+  assert.ok(result.issues.length >= 5);
 });
 
 test("fail-closed: source identity — a missing source commit is refused with missing-source-commit", () => {

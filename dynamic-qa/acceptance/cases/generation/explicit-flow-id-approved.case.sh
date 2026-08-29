@@ -14,7 +14,7 @@ QA_APPROVED="true"
 TECH_APPROVED="true"
 
 case_setup() {
-  mkdir -p "$FIXTURE_REPO/qa/flows" "$FIXTURE_REPO/qa/data"
+  mkdir -p "$FIXTURE_REPO/qa/flows" "$FIXTURE_REPO/qa/data" "$FIXTURE_REPO/qa/execution-profiles"
   cat > "$FIXTURE_REPO/qa/flows/$FLOW_ID.yaml" <<'EOF'
 schema: dynamic-qa-flow-v1
 id: checkout-completes
@@ -67,6 +67,67 @@ cases:
   - id: basic
     fields:
       result: "done"
+EOF
+  cat > "$FIXTURE_REPO/qa/execution-profiles/pilot-profile.yaml" <<'EOF'
+schema: dynamic-qa-execution-profile-v1
+id: pilot-profile
+revision: 1
+owners:
+  qaOwner: Per
+  technicalOwner: Alex
+allowedPhases:
+  - candidate-verification
+  - pr
+allowedTestLevels:
+  - cli
+environments:
+  runnerClass: github-hosted-ubuntu
+  disposable: true
+  disposabilityEvidence: fresh hosted VM per job, destroyed after
+  sandbox: vm
+paths:
+  allowedRead:
+    - /repo
+  allowedWrite:
+    - /repo/tmp
+commands:
+  allowed:
+    - node --test tests/e2e
+resources:
+  maxProcesses: 4
+  maxCpuSeconds: 60
+  maxMemoryMb: 512
+  maxFileSizeMb: 10
+  maxWallTimeSeconds: 120
+identities:
+  approvedNonProduction:
+    - ci-bot
+  denyProduction:
+    - prod-service-account
+  denyMetadata:
+    - "169.254.169.254"
+network:
+  mode: none
+effects:
+  allowedBoundaryIds:
+    - checkout-service
+  reversibleSideEffects: true
+  namespace: "run-${case.id}"
+  cleanup: "remove the per-run temp tree"
+credentials: {}
+diagnostics:
+  classes: []
+  captureConditions:
+    - failure-only
+  scrubber: redact-secrets
+  maxSizeMb: 5
+  audience: qa-owner
+  retentionDays: 7
+evidence:
+  adapter: github-actions
+  capabilities:
+    - capability: runtime.node-available
+      category: evidence
 EOF
   approval_grant qa-owner
   approval_grant technical-owner

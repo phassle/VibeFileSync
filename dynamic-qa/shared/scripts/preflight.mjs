@@ -37,10 +37,44 @@
 //                    boundary *shape*, never policy), and every referenced
 //                    Named Data Set must resolve and validate
 //                    (resolve-data-sets.mjs, #144, reused). An Execution
-//                    Profile ID must also be named (#150 owns the artifact
-//                    itself; #146 only requires that generation names one by
-//                    ID — see run notes tickets/146.md "Explicitly NOT
-//                    yours").
+//                    Profile must also be named, resolved, and PROVEN
+//                    enforceable (#153 wires this — see below); #146 had
+//                    only checked that generation names a profile ID string,
+//                    never that the profile artifact itself is well-formed,
+//                    honours the flow's boundaries, or is actually enforced
+//                    by the real environment. Four checks, in order, none
+//                    skippable:
+//                      4a. `executionProfileId` is a valid semantic id
+//                          (unchanged from #146: reason
+//                          "missing-execution-profile-id").
+//                      4b. `<executionProfilesDir>/<id>.yaml` resolves and
+//                          passes `validateExecutionProfile` (#150, reused)
+//                          (reason "invalid-execution-profile").
+//                      4c. the resolved profile honours the flow's own
+//                          Boundary Declarations via
+//                          `checkExecutionProfileHonoursBoundaries` (#150,
+//                          reused) (reason
+//                          "execution-profile-boundary-mismatch").
+//                      4d. `environmentEvidence` — what the real runner/
+//                          adapter proves right now — is REQUIRED as an
+//                          input (never optional: #150's Capability Gate
+//                          note is explicit that "absence of an environment
+//                          section is itself a blocker; nothing can degrade
+//                          to a skip", so this module treats a caller who
+//                          passes no evidence at all as its own distinct
+//                          failure, reason "missing-environment-evidence",
+//                          rather than silently skipping the gate). Once
+//                          evidence is present (even an empty object — an
+//                          adapter genuinely proving nothing, which then
+//                          fails every category on its own terms), this runs
+//                          `runCapabilityGate` + `activationDecision`
+//                          (#150/#151, reused) and refuses with reason
+//                          "execution-profile-capability-blocked" and
+//                          `issues` set to the exact blockers on any open
+//                          Safety Blocker.
+//                    A GitHub Actions caller (github-actions-adapter.mjs,
+//                    #153) is the first real source of `environmentEvidence`
+//                    — see that module's `deriveCapabilityEvidence`.
 //   5. source identity — a full, exact source commit SHA the candidate will
 //                    be verified against (spec §7 step 6, SPEC-135 story 58).
 //   6. harness    — a minimal existing-harness descriptor (framework, test
@@ -60,7 +94,7 @@
 // happened. A later ticket that wires a persisted approval record should
 // pass it through here rather than inventing a second gate.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { parseFlowDefinitionFile } from "./flow-definition.mjs";
 import { parseRestrictedYAML } from "./restricted-yaml.mjs";
@@ -68,6 +102,8 @@ import { validateBoundaryPolicy } from "./boundary-policy.mjs";
 import { resolveFlowDataSets } from "./resolve-data-sets.mjs";
 import { isValidSemanticId } from "./id-rules.mjs";
 import { validateProvenanceManifest, checkRevisionMonotonic } from "./provenance.mjs";
+import { validateExecutionProfile, checkExecutionProfileHonoursBoundaries } from "./execution-profile.mjs";
+import { runCapabilityGate, activationDecision } from "./capability-gate.mjs";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -82,9 +118,11 @@ function fail(reason, issues = []) {
  * parseFlowDefinitionFile documents). Returns:
  *   - `{ ready: false, reason, issues }` on the first unmet precondition,
  *     checked in the fixed order documented above;
- *   - `{ ready: true, flowData, dataSets }` once every precondition holds,
- *     where `dataSets` is the resolved `[{ id, data }]` list for every
- *     `data_sets` reference, ready for provenance construction.
+ *   - `{ ready: true, flowData, dataSets, executionProfile }` once every
+ *     precondition holds, where `dataSets` is the resolved `[{ id, data }]`
+ *     list for every `data_sets` reference, ready for provenance
+ *     construction, and `executionProfile` is the resolved, validated,
+ *     boundary-honouring, Capability-Gate-passing Execution Profile document.
  */
 export function runGenerationPreflight({
   flowSource,
@@ -92,6 +130,8 @@ export function runGenerationPreflight({
   dataSetsDir,
   approvals,
   executionProfileId,
+  executionProfilesDir,
+  environmentEvidence,
   sourceCommit,
   harness,
   existingProvenanceManifest,
@@ -145,14 +185,59 @@ export function runGenerationPreflight({
     return fail("invalid-data-sets", dataSetsResult.errors);
   }
 
+  // 4a. a concrete Execution Profile must be named by id.
   if (!isValidSemanticId(executionProfileId)) {
     return fail("missing-execution-profile-id", [
       {
         path: ["executionProfileId"],
-        message:
-          "generation must name a concrete Execution Profile by id before it may run a candidate (the Execution Profile artifact itself is #150's, not this ticket's)",
+        message: "generation must name a concrete Execution Profile by id before it may run a candidate",
       },
     ]);
+  }
+
+  // 4b. the named profile must actually resolve and be well-formed (#150's
+  // validateExecutionProfile, reused — not re-implemented here).
+  const profilePath = path.join(executionProfilesDir ?? "", `${executionProfileId}.yaml`);
+  if (!executionProfilesDir || !existsSync(profilePath)) {
+    return fail("invalid-execution-profile", [
+      {
+        path: ["executionProfileId"],
+        message: `Execution Profile ${JSON.stringify(executionProfileId)} does not resolve under executionProfilesDir — the artifact itself, not just its id, must be present and valid`,
+      },
+    ]);
+  }
+  const executionProfile = parseRestrictedYAML(readFileSync(profilePath, "utf8"), { filename: executionProfileId });
+  const profileValidation = validateExecutionProfile(executionProfile, { expectedId: executionProfileId });
+  if (!profileValidation.valid) {
+    return fail("invalid-execution-profile", profileValidation.errors);
+  }
+
+  // 4c. the profile must honour this flow's own Boundary Declarations
+  // (#150's checkExecutionProfileHonoursBoundaries, reused).
+  const honoursCheck = checkExecutionProfileHonoursBoundaries(executionProfile, flowData.boundaries);
+  if (!honoursCheck.valid) {
+    return fail("execution-profile-boundary-mismatch", honoursCheck.errors);
+  }
+
+  // 4d. the profile must be proven enforceable against real environment
+  // evidence — never optional, never a silent skip (#150's Capability Gate:
+  // "absence of an environment section is itself a blocker").
+  if (environmentEvidence === undefined || environmentEvidence === null) {
+    return fail("missing-environment-evidence", [
+      {
+        path: ["environmentEvidence"],
+        message:
+          "generation must supply environment evidence (even an empty object, if the adapter genuinely proves nothing) for the Capability Gate — an absent environment can never silently skip this check",
+      },
+    ]);
+  }
+  const gateResult = runCapabilityGate(executionProfile, environmentEvidence);
+  const activation = activationDecision(gateResult);
+  if (!activation.activate) {
+    return fail(
+      "execution-profile-capability-blocked",
+      activation.blockers.map((b) => ({ path: ["environmentEvidence", b.category, b.capability], message: b.message })),
+    );
   }
 
   // 5. source identity
@@ -215,5 +300,5 @@ export function runGenerationPreflight({
     return { id, data };
   });
 
-  return { ready: true, flowData, dataSets };
+  return { ready: true, flowData, dataSets, executionProfile };
 }
