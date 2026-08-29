@@ -19,8 +19,50 @@
 // able to make a "fact" smuggle a real credential into inventory output), so
 // it is enforced here in the deterministic core rather than left as an
 // authoring convention in SKILL.md prose.
+//
+// Ticket #163 (qa-setup stage 3, "posture-specific evidence") extends this
+// same Fact shape with two more categories rather than forking a parallel
+// evidence system — see `posture.mjs`, which is the only module that
+// constructs or transitions these two categories:
+//
+//   brownfield-observation — a fact about what the application currently
+//     does. It carries one MORE dimension no other category has: intentStatus
+//     ("unconfirmed" | "confirmed-intended" | "confirmed-not-intended", see
+//     INTENT_STATUSES below). This is the concrete data-shape answer to the
+//     spec's "brownfield observations are evidence, not intended behaviour":
+//     an observation starts — and stays — "unconfirmed" until an accountable
+//     human (never a Domain Expert, see posture.mjs's confirmIntent) explicitly
+//     says whether it is intended. Only "confirmed-intended" may ever become a
+//     Flow contract's Expected Outcome later.
+//   greenfield-source — a fact recording that a not-yet-built flow's evidence
+//     came from an approved ticket or example (posture.mjs validates the
+//     approval; this module only stores the resulting fact). Provenance is
+//     "reported" when at least one valid approved source backs it, "unknown"
+//     when none exists — greenfield setup never invents a "value" for a flow
+//     it cannot observe.
 
 export const PROVENANCE = Object.freeze(["observed", "reported", "unknown"]);
+
+// The intent-confirmation dimension, exclusive to "brownfield-observation"
+// facts (see the module comment above and posture.mjs). Every other category
+// must never carry these fields — makeFact/validateFact reject that combination
+// on sight, the same fail-closed posture as the secret-value checks above.
+export const INTENT_STATUSES = Object.freeze([
+  "unconfirmed",
+  "confirmed-intended",
+  "confirmed-not-intended",
+]);
+
+// The only two identities allowed to move a brownfield observation off
+// "unconfirmed" (see posture.mjs's confirmIntent). A Domain Expert may
+// clarify what an observed behaviour means, but can never be the confirming
+// identity — that would let flow-specific input quietly stand in for QA
+// ownership, which the parent spec forbids.
+export const CONFIRMING_ROLES = Object.freeze(["qa-owner", "technical-owner"]);
+
+export function isValidIntentStatus(status) {
+  return INTENT_STATUSES.includes(status);
+}
 
 // The category vocabulary stage 2 of the spec names explicitly. Unknown
 // categories fail closed in validateFact/validateInventory: a category is
@@ -48,6 +90,9 @@ export const CATEGORIES = Object.freeze([
   "ci-artifact",
   // secret NAMES only — see the module comment above
   "secret-name",
+  // posture-specific evidence (ticket #163) — see the module comment above
+  "brownfield-observation",
+  "greenfield-source",
 ]);
 
 export function isValidProvenance(provenance) {
@@ -64,8 +109,18 @@ export function isKnownCategory(category) {
 //   - a provenance outside PROVENANCE
 //   - a "secret-name" category fact carrying `value` or `secretValue`
 //   - any fact carrying `secretValue` at all (there is no legitimate use)
+//   - a non-"brownfield-observation" fact carrying intentStatus/confirmedBy/
+//     confirmedByRole (the intent-confirmation dimension is exclusive to
+//     that one category — see the module comment above)
+//   - a "brownfield-observation" fact whose intentStatus is outside
+//     INTENT_STATUSES, or whose confirmedBy/confirmedByRole is present
+//     without the other, or whose confirmedByRole names a Domain Expert
+//     (only "qa-owner"/"technical-owner" may confirm intent), or whose
+//     intentStatus is "confirmed-intended"/"confirmed-not-intended" without
+//     a confirming identity
 export function makeFact(input = {}) {
-  const { id, category, description, provenance, evidence, value, secretName } = input;
+  const { id, category, description, provenance, evidence, value, secretName, intentStatus, confirmedBy, confirmedByRole } =
+    input;
   if (typeof id !== "string" || id.length === 0) {
     throw new Error("fact.id must be a non-empty string");
   }
@@ -82,6 +137,14 @@ export function makeFact(input = {}) {
     throw new Error("a secret-name fact may record a secret's name only, never its value");
   }
 
+  const carriesIntentFields =
+    intentStatus !== undefined || confirmedBy !== undefined || confirmedByRole !== undefined;
+  if (category !== "brownfield-observation" && carriesIntentFields) {
+    throw new Error(
+      "only a brownfield-observation fact may carry intentStatus/confirmedBy/confirmedByRole"
+    );
+  }
+
   const fact = { id, category, provenance };
   if (description !== undefined) fact.description = description;
   if (evidence !== undefined) fact.evidence = evidence;
@@ -90,6 +153,37 @@ export function makeFact(input = {}) {
       throw new Error("a secret-name fact requires a non-empty secretName");
     }
     fact.secretName = secretName;
+  } else if (category === "brownfield-observation") {
+    const resolvedStatus = intentStatus === undefined ? "unconfirmed" : intentStatus;
+    if (!isValidIntentStatus(resolvedStatus)) {
+      throw new Error(
+        `brownfield-observation fact.intentStatus must be one of ${INTENT_STATUSES.join(", ")}, got: ${String(resolvedStatus)}`
+      );
+    }
+    const hasConfirmedBy = confirmedBy !== undefined;
+    const hasConfirmedByRole = confirmedByRole !== undefined;
+    if (resolvedStatus === "unconfirmed") {
+      if (hasConfirmedBy || hasConfirmedByRole) {
+        throw new Error(
+          "an unconfirmed brownfield-observation fact must not already carry confirmedBy/confirmedByRole — that would let an observation arrive pre-confirmed without ever going through confirmIntent"
+        );
+      }
+    } else {
+      if (typeof confirmedBy !== "string" || confirmedBy.length === 0) {
+        throw new Error(
+          `a ${resolvedStatus} brownfield-observation fact requires a non-empty confirmedBy identity`
+        );
+      }
+      if (!CONFIRMING_ROLES.includes(confirmedByRole)) {
+        throw new Error(
+          `confirmedByRole must be one of ${CONFIRMING_ROLES.join(", ")}, got: ${String(confirmedByRole)} — a Domain Expert may clarify but never confirms intent`
+        );
+      }
+      fact.confirmedBy = confirmedBy;
+      fact.confirmedByRole = confirmedByRole;
+    }
+    fact.intentStatus = resolvedStatus;
+    if (value !== undefined) fact.value = value;
   } else if (value !== undefined) {
     fact.value = value;
   }
@@ -124,6 +218,38 @@ export function validateFact(fact) {
       errors.push("a secret-name fact requires a non-empty secretName");
     }
   }
+
+  const carriesIntentFields =
+    Object.prototype.hasOwnProperty.call(fact, "intentStatus") ||
+    Object.prototype.hasOwnProperty.call(fact, "confirmedBy") ||
+    Object.prototype.hasOwnProperty.call(fact, "confirmedByRole");
+  if (fact.category !== "brownfield-observation" && carriesIntentFields) {
+    errors.push("only a brownfield-observation fact may carry intentStatus/confirmedBy/confirmedByRole");
+  }
+  if (fact.category === "brownfield-observation") {
+    if (!isValidIntentStatus(fact.intentStatus)) {
+      errors.push(
+        `brownfield-observation fact.intentStatus must be one of ${INTENT_STATUSES.join(", ")}, got: ${String(fact.intentStatus)}`
+      );
+    } else if (fact.intentStatus === "unconfirmed") {
+      if (
+        Object.prototype.hasOwnProperty.call(fact, "confirmedBy") ||
+        Object.prototype.hasOwnProperty.call(fact, "confirmedByRole")
+      ) {
+        errors.push("an unconfirmed brownfield-observation fact must not carry confirmedBy/confirmedByRole");
+      }
+    } else {
+      if (typeof fact.confirmedBy !== "string" || fact.confirmedBy.length === 0) {
+        errors.push(`a ${fact.intentStatus} brownfield-observation fact requires a non-empty confirmedBy identity`);
+      }
+      if (!CONFIRMING_ROLES.includes(fact.confirmedByRole)) {
+        errors.push(
+          `confirmedByRole must be one of ${CONFIRMING_ROLES.join(", ")}, got: ${String(fact.confirmedByRole)} — a Domain Expert may clarify but never confirms intent`
+        );
+      }
+    }
+  }
+
   return { ok: errors.length === 0, errors };
 }
 

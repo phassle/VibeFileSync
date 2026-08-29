@@ -120,3 +120,104 @@ test("validateInventory rejects a fact carrying a secret value anywhere in the t
   assert.equal(ok, false);
   assert.ok(errors.some((e) => e.includes("secret-name fact may record a secret's name only")));
 });
+
+// --- ticket #163: posture-specific evidence extension ----------------------
+
+test("makeFact defaults a brownfield-observation fact to unconfirmed", () => {
+  const fact = makeFact({ id: "obs:1", category: "brownfield-observation", provenance: "observed" });
+  assert.equal(fact.intentStatus, "unconfirmed");
+  assert.equal(fact.confirmedBy, undefined);
+});
+
+test("makeFact rejects intentStatus/confirmedBy/confirmedByRole on any non-brownfield-observation category", () => {
+  assert.throws(() =>
+    makeFact({ id: "x", category: "test-framework", provenance: "observed", intentStatus: "confirmed-intended" })
+  );
+  assert.throws(() =>
+    makeFact({ id: "x", category: "greenfield-source", provenance: "reported", confirmedBy: "per" })
+  );
+});
+
+test("makeFact rejects an unconfirmed brownfield-observation fact that already carries a confirming identity", () => {
+  assert.throws(() =>
+    makeFact({
+      id: "obs:1",
+      category: "brownfield-observation",
+      provenance: "observed",
+      intentStatus: "unconfirmed",
+      confirmedBy: "per",
+      confirmedByRole: "qa-owner",
+    })
+  );
+});
+
+test("makeFact requires a confirming identity once intentStatus leaves unconfirmed", () => {
+  assert.throws(() =>
+    makeFact({
+      id: "obs:1",
+      category: "brownfield-observation",
+      provenance: "observed",
+      intentStatus: "confirmed-intended",
+    })
+  );
+});
+
+test("makeFact rejects a Domain Expert as the confirming role", () => {
+  assert.throws(() =>
+    makeFact({
+      id: "obs:1",
+      category: "brownfield-observation",
+      provenance: "observed",
+      intentStatus: "confirmed-intended",
+      confirmedBy: "dana",
+      confirmedByRole: "domain-expert",
+    })
+  );
+});
+
+test("makeFact accepts a properly confirmed brownfield-observation fact", () => {
+  const fact = makeFact({
+    id: "obs:1",
+    category: "brownfield-observation",
+    provenance: "observed",
+    intentStatus: "confirmed-intended",
+    confirmedBy: "per",
+    confirmedByRole: "qa-owner",
+  });
+  assert.equal(fact.intentStatus, "confirmed-intended");
+  assert.equal(fact.confirmedBy, "per");
+  assert.equal(fact.confirmedByRole, "qa-owner");
+});
+
+test("validateFact rejects a brownfield-observation fact with an invalid intentStatus", () => {
+  const { ok, errors } = validateFact({
+    id: "obs:1",
+    category: "brownfield-observation",
+    provenance: "observed",
+    intentStatus: "assumed",
+  });
+  assert.equal(ok, false);
+  assert.ok(errors.some((e) => e.includes("intentStatus")));
+});
+
+test("validateFact rejects a confirmed brownfield-observation fact missing confirmedByRole", () => {
+  const { ok, errors } = validateFact({
+    id: "obs:1",
+    category: "brownfield-observation",
+    provenance: "observed",
+    intentStatus: "confirmed-intended",
+    confirmedBy: "per",
+  });
+  assert.equal(ok, false);
+  assert.ok(errors.some((e) => e.includes("confirmedByRole")));
+});
+
+test("validateInventory accepts a greenfield-source fact with unknown provenance and no evidence", () => {
+  const inventory = {
+    generatedAt: "2026-08-29T00:00:00Z",
+    repoRoot: "/repo",
+    facts: [makeFact({ id: "gf:1", category: "greenfield-source", provenance: "unknown", description: "no approved source yet" })],
+  };
+  const { ok, errors } = validateInventory(inventory);
+  assert.equal(ok, true, errors.join("; "));
+});

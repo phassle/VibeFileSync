@@ -1,0 +1,14 @@
+# Models stage 3's brownfield path: posture declared explicitly, an
+# observation presented as evidence (never a claim about what should
+# happen), and the QA Owner's explicit intent decision recorded before
+# anything is treated as contract-eligible. No write step appears anywhere —
+# stage 3, like stages 1-2, only ever asks and reports.
+ask|posture-source|How did you determine this repository's posture?
+answer|posture-source|qa-owner-declaration
+ask|posture-value|Is this repository brownfield or greenfield?
+answer|posture-value|brownfield
+ask|observation-retry-swallows-error|Discovery observed that retry() silently swallows the action error instead of surfacing it. Is this intended, or a bug?
+answer|intent-decision|not-intended
+ask|posture-summary|Here is what stage 3 found and confirmed — does this match your understanding?
+answer|posture-summary|yes
+stop|posture-evidence-presented
