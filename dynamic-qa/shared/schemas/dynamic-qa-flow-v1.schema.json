@@ -83,7 +83,7 @@
     "boundaries": {
       "type": "array",
       "minItems": 1,
-      "description": "Boundary Declarations: every dependency crossed or side effect possible, classified real | simulated | forbidden. Undeclared external reach is forbidden by default, which is why at least one entry is required. Deeper policy (the owned outcome cannot be simulated, undeclared reach fails closed against an Execution Profile, etc.) is #145's; this schema validates only each declaration's shape.",
+      "description": "Boundary Declarations: every dependency crossed or side effect possible, classified real | simulated | forbidden. Undeclared external reach is forbidden by default, which is why at least one entry is required. #145's boundary-policy.mjs enforces the cross-cutting policy this schema documents but does not itself check: exactly one boundary declares role: owned and it must stay real; a volatile boundary can never be real; a forbidden boundary must claim no side effects; a real side-effecting boundary must declare isolation.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -93,7 +93,25 @@
           "system": { "type": "string", "minLength": 1, "description": "Tech-neutral name of the crossed dependency." },
           "treatment": { "enum": ["real", "simulated", "forbidden"] },
           "behavior": { "type": "string", "minLength": 1 },
-          "side_effects": { "type": "string", "minLength": 1, "description": "Use \"none\" when there are none." }
+          "side_effects": { "type": "string", "minLength": 1, "description": "Use \"none\" when there are none." },
+          "role": {
+            "enum": ["owned", "dependency"],
+            "description": "Reviewed, human-authored field. Exactly one boundary per flow declares role: owned — the service or outcome under test, which must stay real. Absent means \"dependency\" (not the owned outcome). Never inferred from system/behavior text."
+          },
+          "volatile": {
+            "type": "boolean",
+            "description": "Reviewed, human-authored field. true marks a third party, payments, time, randomness, or unverified behaviour — such a boundary can never be declared real. Absent means false."
+          },
+          "isolation": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["namespace", "cleanup"],
+            "description": "Required when treatment is real and side_effects is not \"none\": per-run namespace isolation and cleanup capability, so test order and interrupted cleanup cannot corrupt later runs.",
+            "properties": {
+              "namespace": { "type": "string", "minLength": 1 },
+              "cleanup": { "type": "string", "minLength": 1 }
+            }
+          }
         }
       }
     },

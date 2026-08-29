@@ -217,3 +217,57 @@ assumption is made here about where that directory lives relative to the
 Flow file being resolved; that wiring is left to whichever ticket first
 drives this end-to-end against a real customer-repository tree (likely
 #145's flow+boundary reconciliation or #146's provenance/drift gate).
+## 9. Boundary Declaration policy (#145)
+
+**Decision.** `boundaries.mjs` (#143) validates only shape. `boundary-policy.mjs`
+(new, #145) layers the cross-cutting policy on top by importing
+`validateBoundaries`/`BOUNDARY_TREATMENTS` from it rather than forking it, and
+adds two reviewed, human-authored fields to a Boundary Declaration —
+`role: owned | dependency` and `volatile: boolean` — plus an `isolation:
+{ namespace, cleanup }` block, all optional at the shape layer (so #143's
+existing fixtures/tests are untouched) and enforced at the policy layer.
+
+**Why explicit fields instead of inferring from `system`/`behavior` text.**
+Guessing which boundary is "the" owned outcome, or which is inherently
+volatile (time, randomness, a third party, payments, unverified behaviour),
+from free-text keyword matching would be exactly the silent heuristic #143
+already refused for judging Expected Outcome prose (see #143's own
+`DECISIONS.md` §6 note on "genuinely product language" staying human review).
+A rename of descriptive text could silently flip which boundary the policy
+treats as owned. `role` and `volatile` make that judgement an explicit,
+reviewed field on the Flow Definition itself instead.
+
+**The five enforced rules, each producing a hard error naming the offending
+boundary ID, never a warning:**
+
+1. Exactly one boundary declares `role: owned`, and it must stay `treatment:
+   real` — a fake cannot prove itself. Zero or more than one `owned` boundary
+   is refused.
+2. A boundary with `volatile: true` can never be `treatment: real` — third
+   parties, payments, time, randomness, and unverified behaviour are
+   simulated or forbidden, never real, so tests stay deterministic and
+   side-effect free.
+3. A `treatment: forbidden` boundary must be honourable: its `side_effects`
+   must be `"none"`. A forbidden boundary that also claims real side effects
+   cannot be honoured and is refused, never silently downgraded to
+   `simulated`.
+4. Undeclared external reach fails closed:
+   `resolveBoundaryTreatment(id, boundaries)` returns `"forbidden"` for any
+   ID not present in the declared list — never `"real"`, never a silent
+   pass-through default. Any later ticket that needs to ask "is touching this
+   boundary allowed?" (Binding generation, an Execution Profile check, the
+   drift gate) should call this rather than reimplementing a
+   lookup-with-fallback.
+5. A `treatment: real` boundary with non-`"none"` `side_effects` must declare
+   `isolation.namespace` and `isolation.cleanup` (both non-empty strings), so
+   test order and interrupted cleanup cannot corrupt later runs.
+
+**Left for a later ticket.** Execution Profile honourability — whether a
+flow's boundaries can actually be realized by a concrete Execution Profile's
+"allowed Boundary IDs, reversible side effects, namespace, cleanup, rate, and
+concurrency" (DESIGN-dynamic-qa-spec.md §5.3) — is not built here. That
+requires the Execution Profile artifact itself, which no landed ticket has
+built yet; `boundary-policy.mjs` only validates the Flow Definition's own
+Boundary Declarations for internal consistency. `resolveBoundaryTreatment` is
+written so an Execution Profile validator can reuse it directly rather than
+reimplementing boundary lookup.
