@@ -478,3 +478,75 @@ repository) to find duplicates, contradictions, and shared boundaries
 across the whole portfolio. Nothing in this ticket performs cross-flow
 reconciliation; `assembleFlowDefinition`'s single-flow validation is not a
 substitute for it.
+
+## 14. Deterministic drift gate (#148)
+
+**"Unrelated product changes are not drift" is structural, not a filter.**
+`drift-gate.mjs`'s `evaluateBindingDrift` only ever compares digests for the
+exact closure of paths a Binding's own Provenance Manifest record already
+names — its Flow Definition, its recorded Named Data Sets by id, its two
+schema contracts, its recorded harness config/lockfile paths, its recorded
+outputs, and its named Execution Profile. There is no code path anywhere in
+this module that reads or hashes any other file, so an arbitrary product
+source file cannot appear as a mismatch by construction — it is never fed
+in, not filtered out. Impact paths stay a downstream "which tests to run"
+concern (already the design's own framing), never an input to drift itself.
+
+**"A new bundle release alone is not drift" is the same kind of guarantee.**
+`record.generator.bundleVersion` is never read or compared anywhere in
+`evaluateBindingDrift`. Only a digest mismatch on the recorded schema
+contracts (`record.schemas.flow`/`.data`, against the customer's currently-
+installed `qa/schemas/*.json`) or an optional caller-supplied
+`isFrameworkSupported` predicate returning `false` can mark a Binding stale
+for a "contract" reason — a bundle version bump with every recorded input
+otherwise unchanged produces zero mismatches.
+
+**Hand-edited Bindings get their own reason code, not a generic rejection.**
+An output-file digest mismatch is reported as `OUTPUT_EDITED` (naming the
+edited path(s)), kept distinct from `OUTPUT_MISSING` and from every other
+mismatch code. The gate still marks the Binding `stale` — drift blocks until
+an explicit adoption or repair proposal verifies the edit and updates
+provenance, per DESIGN-dynamic-qa-spec.md §5.5 — but the report vocabulary
+never says "rejected" or "overwritten": nothing is deleted or silently
+regenerated here. Ownership of hand-edited customer-owned tests is real;
+traceability is not lost.
+
+**Reuse, not reinvention, per #146's landed note and the run brief's
+instruction:** revision monotonicity is `provenance.mjs`'s
+`checkRevisionMonotonic`; manifest shape/ordering is its
+`validateProvenanceManifest`; every digest is `canonical-digest.mjs`'s
+`contentDigest`. No second digest scheme or provenance validator exists in
+this ticket.
+
+**The standalone CI entry point is `drift-gate-cli.mjs`.** `node
+dynamic-qa/shared/scripts/drift-gate-cli.mjs [repository-root]` reads only
+files already in the repository (`qa/provenance.json`, `qa/flows/*.yaml`,
+`qa/data/*.yaml`, `qa/schemas/*.json`, `qa/execution-profiles/*.yaml`, plus
+each Binding's own recorded paths) and exits non-zero with an exact reason
+per stale/missing Binding — no model, no browser agent, no network call
+anywhere in its code. It is deliberately a thin filesystem/CLI shell around
+`drift-gate.mjs`'s pure decision functions, which is what Tier 1 actually
+unit-tests; the CLI itself is exercised end-to-end (a real fixture
+repository, a real hand-edit, a real unrelated file) rather than mocked, and
+is left to the acceptance harness / a later CI-wiring ticket to fixture
+formally rather than duplicating that proof as a unit test.
+
+**Retired-flow cleanup is flagged, not performed.** `evaluatePortfolioDrift`
+reports `RETIRED_FLOW_PROVENANCE` for any record whose flow is retired; nothing
+in this ticket deletes that record automatically.
+
+**Assumptions later implementers must know:**
+- Execution Profile digest comparison only runs when both the record names a
+  `executionProfile.digest` and the gate could resolve
+  `qa/execution-profiles/<id>.yaml` — #150 owns that artifact; its absence
+  never manufactures a false mismatch here, it just skips the check.
+- Adapter/framework contract compatibility is an optional injected predicate
+  (`isFrameworkSupported`), not a concrete registry — no adapter-contract
+  registry exists yet in this bundle (#149/#150 territory). Whichever ticket
+  first defines supported adapters should pass a real predicate into
+  `drift-gate-cli.mjs` rather than inventing a second drift check.
+- "Incompatible schema" is modeled purely as a digest mismatch on the
+  installed `qa/schemas/*.json` contract files versus what a Binding's
+  provenance recorded — not as a separate schema-version-string registry.
+  A cosmetic reformat of a schema JSON file does not move its digest
+  (`contentDigest` canonicalizes key order); a real content change does.
