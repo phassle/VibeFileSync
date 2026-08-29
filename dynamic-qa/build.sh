@@ -91,13 +91,23 @@ build_shared() {
       rm -f "$out/SKILL.md.bak"
     fi
 
-    # Populate the shared schema/reference copies from one build source.
-    mkdir -p "$out/assets/schemas" "$out/references/shared"
+    # Populate the shared schema/reference/script copies from one build source.
+    mkdir -p "$out/assets/schemas" "$out/references/shared" "$out/scripts"
     if [ -d "$HERE/shared/schemas" ]; then
       cp -R "$HERE/shared/schemas/." "$out/assets/schemas/"
     fi
     if [ -d "$HERE/shared/references" ]; then
       cp -R "$HERE/shared/references/." "$out/references/shared/"
+    fi
+    if [ -d "$HERE/shared/scripts" ]; then
+      # Deterministic-core modules only: leave fixtures/tests out of the
+      # shipped skill tree (they exist for dynamic-qa's own acceptance
+      # harness, not for a customer's installed skill).
+      (cd "$HERE/shared/scripts" && find . -type f -name '*.mjs' ! -name '*.test.mjs') \
+        | while IFS= read -r rel; do
+            mkdir -p "$out/scripts/$(dirname "$rel")"
+            cp "$HERE/shared/scripts/$rel" "$out/scripts/$rel"
+          done
     fi
   done
 }
@@ -135,6 +145,8 @@ verify_shared_copies_identical() {
     || fail "qa-setup and qa-generate assets/schemas differ — packaging must produce byte-identical copies from dynamic-qa/shared/schemas/"
   diff -rq "$a/references/shared" "$b/references/shared" \
     || fail "qa-setup and qa-generate references/shared differ — packaging must produce byte-identical copies from dynamic-qa/shared/references/"
+  diff -rq "$a/scripts" "$b/scripts" \
+    || fail "qa-setup and qa-generate scripts differ — packaging must produce byte-identical copies from dynamic-qa/shared/scripts/"
 }
 
 verify_no_sibling_reach_through() {

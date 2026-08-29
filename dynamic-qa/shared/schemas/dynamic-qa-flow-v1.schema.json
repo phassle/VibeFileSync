@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-flow-v1.schema.json",
+  "title": "dynamic-qa Flow Definition v1",
+  "description": "Strict, versioned contract for one Flow Definition file (qa/flows/<flow-id>.yaml). The filename equals the immutable, semantic Flow ID: never derived from an issue number, never reused, never renamed. This document is the human-readable contract; dynamic-qa/shared/scripts/flow-definition.mjs is the hand-written fail-closed validator that enforces it (no JSON Schema validator dependency is added — see dynamic-qa/DECISIONS.md and the run brief's deterministic-core decision).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "revision",
+    "title",
+    "intent",
+    "criticality",
+    "state",
+    "origin",
+    "test_level",
+    "data_sets",
+    "boundaries",
+    "steps"
+  ],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-flow-v1",
+      "description": "Immutable. Any other value, including a plausible future version string, is an unsupported-schema-version error, not a silent upgrade attempt."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+      "description": "Immutable, semantic, kebab-case Flow ID. Must equal the file's basename without extension. Never derived from an issue number; never reused; never renamed (the title may change instead)."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing per Flow ID. A single file's validator can only check that this is a positive integer; monotonic non-decrease across revisions is a cross-file provenance/drift-gate concern, not this schema's."
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "intent": { "type": "string", "minLength": 1, "description": "Why this flow is protected, in product language." },
+    "criticality": { "enum": ["low", "medium", "high", "critical"] },
+    "state": {
+      "enum": ["draft", "deferred", "active", "retired"],
+      "description": "Flow State, independent of Binding Freshness and Enforcement State (see DESIGN-dynamic-qa-spec.md domain-language table)."
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tickets"],
+      "properties": {
+        "tickets": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "format": "uri", "pattern": "^https?://" }
+        }
+      }
+    },
+    "test_level": {
+      "description": "Either the inferred selection, or an approved override with its reason.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["selection"],
+          "properties": { "selection": { "const": "inferred" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["selection", "value", "reason"],
+          "properties": {
+            "selection": { "const": "override" },
+            "value": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "data_sets": {
+      "type": "array",
+      "description": "Named Data Set references, by ID only. The Named Data Set contract itself (dynamic-qa-data-v1.schema.json) is #144's; this schema validates only the reference shape.",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
+      "uniqueItems": true
+    },
+    "boundaries": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Boundary Declarations: every dependency crossed or side effect possible, classified real | simulated | forbidden. Undeclared external reach is forbidden by default, which is why at least one entry is required. Deeper policy (the owned outcome cannot be simulated, undeclared reach fails closed against an Execution Profile, etc.) is #145's; this schema validates only each declaration's shape.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "system", "treatment", "behavior", "side_effects"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
+          "system": { "type": "string", "minLength": 1, "description": "Tech-neutral name of the crossed dependency." },
+          "treatment": { "enum": ["real", "simulated", "forbidden"] },
+          "behavior": { "type": "string", "minLength": 1 },
+          "side_effects": { "type": "string", "minLength": 1, "description": "Use \"none\" when there are none." }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Given/When/Then-shaped, in the order they occur. Order is meaningful data.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "intent"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
+          "kind": { "enum": ["given", "when", "then"] },
+          "intent": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Tech-neutral. Selectors, routes, commands, fixtures, waits, framework syntax, and CI details are invalid here."
+          },
+          "outcomes": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Required on every 'then' step; optional on intermediate checkpoints.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "expect"],
+              "properties": {
+                "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
+                "expect": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Product language plus scalar ${case.<field>} substitution only. No expression language."
+                },
+                "tolerance": {
+                  "description": "Applies to exactly this one Expected Outcome (structural nesting, not a separate cross-reference). Absent means exact.",
+                  "oneOf": [
+                    { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "exact" } } },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind"],
+                      "properties": {
+                        "kind": { "const": "normalized-text" },
+                        "ignore_case": { "type": "boolean" },
+                        "ignore_whitespace": { "type": "boolean" },
+                        "trim": { "type": "boolean" }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind"],
+                      "properties": {
+                        "kind": { "const": "numeric" },
+                        "abs_epsilon": { "type": "number", "exclusiveMinimum": 0 },
+                        "rel_epsilon": { "type": "number", "exclusiveMinimum": 0 }
+                      },
+                      "description": "Exactly one of abs_epsilon or rel_epsilon must be present."
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "epsilon_seconds"],
+                      "properties": { "kind": { "const": "temporal" }, "epsilon_seconds": { "type": "number", "exclusiveMinimum": 0 } }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind"],
+                      "properties": { "kind": { "const": "unordered-set" } }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "aspects"],
+                      "properties": {
+                        "kind": { "const": "presentation" },
+                        "aspects": {
+                          "type": "array",
+                          "minItems": 1,
+                          "uniqueItems": true,
+                          "items": { "enum": ["layout", "style", "position"] }
+                        }
+                      },
+                      "description": "May ignore only layout, style, or position. Content, values, behavior, accessibility, and counts must still fail when wrong."
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "approved_by", "reason"],
+                      "properties": {
+                        "kind": { "const": "custom" },
+                        "approved_by": { "type": "string", "minLength": 1 },
+                        "reason": { "type": "string", "minLength": 1 }
+                      },
+                      "description": "Requires explicit QA Owner approval, modeled as required fields rather than an implicit default."
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

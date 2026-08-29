@@ -104,12 +104,48 @@ yourself asserting on model behavior for something that is really just
 computation, extract the computation into Tier 1 instead — see
 `dynamic-qa/acceptance/README.md` for the full contract.
 
-**Open item for a later ticket.** `build.sh`'s existing `shared/schemas` /
-`shared/references` copy-and-byte-diff pattern does not yet extend to
-`shared/scripts` — whichever ticket lands the first real core module should
-extend `build_shared`/`verify_shared_copies_identical` the same way.
+**Resolved by #143.** `build_shared`/`verify_shared_copies_identical` now copy
+and byte-diff `shared/scripts/**/*.mjs` (implementation modules only — `*.test.mjs`
+and `fixtures/` stay out of the shipped skill tree; they exist for this
+bundle's own acceptance harness, not a customer's installed skill) the same
+way they already handled `shared/schemas` and `shared/references`.
 
-## 5. Two skills only, no third `qa-heal` skill
+## 6. Flow Definition v1: restricted-YAML scope, tolerance nesting, extension seams
+
+**Restricted-YAML subset excludes block scalars (`|`/`>`).** Every string value
+must fit on one line (plain, single-, or double-quoted). This keeps the parser
+small and its fail-closed surface easy to reason about; it also means a long
+Expected-Outcome or intent description must be written as one quoted line
+rather than a folded/literal block. If a later ticket finds this genuinely too
+restrictive, extending the parser to support block scalars is additive (a new
+node kind), not a rewrite.
+
+**Empty-collection literals `[]` and `{}` are allowed** as the one exception to
+"no flow-style collections": block style has no other way to spell an empty
+list or map (`data_sets: []` on a flow that needs no named data), and the
+literal empty form carries none of flow style's aliasing/nesting risk.
+Non-empty flow-style (`[1, 2]`, `{a: 1}`) is still rejected.
+
+**A tolerance is nested directly under the Expected Outcome it applies to**,
+rather than declared in a separate list cross-referenced by outcome ID. This
+was a genuine reading choice against DESIGN-dynamic-qa-spec.md §5.1's
+"optional tolerance attached to exactly one Expected Outcome": nesting makes
+the 1:1 relationship a structural invariant (there is no ID to get wrong or
+duplicate) instead of a rule the validator has to check separately. A future
+ticket that finds a real need for tolerances to be declared out-of-line (e.g.
+sharing one tolerance across a named pattern) should treat that as a new,
+explicitly-considered decision, not a silent reinterpretation.
+
+**Extension seams left for #144/#145.** `boundaries.mjs` and
+`data-set-refs.mjs` each validate only the shape of what a Flow Definition
+embeds/references (Boundary Declarations are inline in the flow file per
+§5.1; Named Data Sets are referenced by ID). Both modules say in their own
+header comment exactly what they do *not* check (the owned-outcome/undeclared-
+reach policy for boundaries; data-set file existence and the data set's own
+schema for `data_sets`) so #144/#145 extend them by importing and layering
+rather than forking.
+
+## 7. Two skills only, no third `qa-heal` skill
 
 Restated from the parent spec for anyone reading this file in isolation: exactly
 `qa-setup` and `qa-generate` are built. Repair is an explicit mode of

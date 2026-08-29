@@ -1,0 +1,63 @@
+# Same flow as valid.yaml, byte-for-byte different: reordered top-level
+# mapping keys, different quote style, extra blank lines and comments.
+# Used to prove digests are computed over the canonical validated data
+# model, not over formatting — array order is left untouched everywhere
+# since array order IS meaningful data (Given/When/Then sequencing).
+
+id: update-preserves-safetynet
+schema: dynamic-qa-flow-v1
+
+revision: 1
+state: draft
+criticality: high
+
+
+title: 'Update preserves the prior destination version in SafetyNet before Publish'
+intent: 'Prevent silent loss of the previous destination content when Update replaces it.'
+
+# origin comes after intent here, unlike valid.yaml
+origin:
+  tickets:
+    - 'https://github.com/phassle/VibeFileSync/issues/18'
+
+test_level:
+  selection: inferred   # trailing comment and extra spaces
+
+data_sets:
+  - changed-destination-basic
+
+boundaries:
+  - id: vibesync-cli
+    treatment: real
+    system: 'vibesync CLI'
+    behavior: "Invoke the CLI's Update mode against a temporary folder pair."
+    side_effects: 'Writes only inside the disposable temporary directories created for this run.'
+  - id: production-paths
+    system: 'production paths, user HOME, and external volumes'
+    treatment: forbidden
+    behavior: 'No production or home-directory path is read or written.'
+    side_effects: 'none'
+
+steps:
+  - id: given-changed-destination
+    kind: given
+    intent: "A folder pair named 'documents' uses Update mode, and the destination has different content than the source."
+  - id: when-review-and-run
+    kind: when
+    intent: 'The QA Owner reviews the Compare output and approves Run.'
+  - id: then-destination-matches-source
+    kind: then
+    intent: 'The destination content matches the source after Run completes.'
+    outcomes:
+      - id: destination-matches-source
+        expect: "The destination report file reads '${case.newContent}'."
+  - id: then-safetynet-preserves-prior
+    intent: 'The prior destination content is preserved in SafetyNet.'
+    kind: then
+    outcomes:
+      - id: safetynet-has-prior-content
+        expect: "Exactly one SafetyNet Run folder contains a report file that reads '${case.oldContent}'."
+      - id: no-sibling-temp-remains
+        expect: 'No sibling temporary file or folder remains beside the destination.'
+        tolerance:
+          kind: exact
