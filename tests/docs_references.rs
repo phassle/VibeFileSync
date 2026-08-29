@@ -52,8 +52,8 @@ const OWN_SKILL_SUFFIX: &str = "-vibesync";
 /// `0001-slug.md`), so checking them against *this* tree asks the wrong question.
 fn docs() -> Vec<String> {
     let mut found: Vec<String> = ROOT_GUIDES.iter().map(|doc| doc.to_string()).collect();
-    markdown_under(Path::new("docs"), &mut found);
-    markdown_under(Path::new(".sandcastle"), &mut found);
+    markdown_under(repo_root(), Path::new("docs"), &mut found);
+    markdown_under(repo_root(), Path::new(".sandcastle"), &mut found);
     for skill in own_skills() {
         found.push(skill);
     }
@@ -72,20 +72,60 @@ fn own_skills() -> Vec<String> {
         if !name.ends_with(OWN_SKILL_SUFFIX) {
             continue;
         }
-        markdown_under(&root.join(name), &mut skills);
+        markdown_under(repo_root(), &root.join(name), &mut skills);
     }
     skills
 }
 
-/// Every Markdown file below `relative`, at any depth.
-fn markdown_under(relative: &Path, into: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(repo_root().join(relative)) else {
+/// Whether a walk descends into `directory`, which is given as an absolute path.
+///
+/// `target/` is build output and `.git/` is history; neither is documentation's subject,
+/// and both are large enough to be worth not walking. `node_modules/` is vendored code
+/// this repository does not own.
+///
+/// A nested checkout is excluded for a different reason: it is not this tree. Both walks
+/// read the same rule because a directory one walk enters and the other does not is a
+/// hole — a document discovered by `docs` but invisible to `resolves` would fail every
+/// check in it against a tree it was never part of.
+fn walk_into(directory: &Path) -> bool {
+    let excluded_by_name = directory.file_name().is_some_and(|name| {
+        matches!(
+            name.to_string_lossy().as_ref(),
+            "target" | ".git" | "node_modules"
+        )
+    });
+    !excluded_by_name && !is_nested_checkout(directory)
+}
+
+/// Whether `directory` is a git checkout in its own right rather than part of this one.
+///
+/// `.sandcastle/main.mts` creates one worktree per issue under `.sandcastle/worktrees/`,
+/// directly below a root `docs` walks, so during an agent loop this repository physically
+/// contains a second complete copy of itself — upstream skills included. Walking in
+/// re-discovered exactly the `.agents/skills/` and `.claude/skills/` templates that
+/// `docs` excludes at the top level, and the suite then failed a gate run over documents
+/// it does not govern and whose spans are addressed at some other repository. A checkout
+/// answers for its own documents, from its own root.
+///
+/// The `.git` entry is the general form of the rule rather than the one path the loop
+/// happens to use: a worktree carries it as a file, a clone as a directory, so a nested
+/// checkout under any name is skipped.
+fn is_nested_checkout(directory: &Path) -> bool {
+    directory.join(".git").exists()
+}
+
+/// Every Markdown file below `root`/`relative`, at any depth, named relative to `root`.
+fn markdown_under(root: &Path, relative: &Path, into: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(root.join(relative)) else {
         return;
     };
     for entry in entries.flatten() {
         let child = relative.join(entry.file_name());
-        if entry.path().is_dir() {
-            markdown_under(&child, into);
+        let path = entry.path();
+        if path.is_dir() {
+            if walk_into(&path) {
+                markdown_under(root, &child, into);
+            }
         } else if child.extension().is_some_and(|ext| ext == "md") {
             into.push(child.to_string_lossy().into_owned());
         }
@@ -111,27 +151,23 @@ fn resolves(candidate: &str) -> bool {
     if candidate.contains('/') {
         return repo_root().join(candidate).exists();
     }
-    named_anywhere(Path::new("."), candidate)
+    named_anywhere(repo_root(), Path::new("."), candidate)
 }
 
-fn named_anywhere(relative: &Path, name: &str) -> bool {
-    let Ok(entries) = fs::read_dir(repo_root().join(relative)) else {
+fn named_anywhere(root: &Path, relative: &Path, name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(root.join(relative)) else {
         return false;
     };
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        // `target/` is build output and `.git/` is history; neither is documentation's
-        // subject, and both are large enough to be worth not walking.
-        if matches!(
-            file_name.to_string_lossy().as_ref(),
-            "target" | ".git" | "node_modules"
-        ) {
+        let path = entry.path();
+        if !walk_into(&path) {
             continue;
         }
         if file_name == name {
             return true;
         }
-        if entry.path().is_dir() && named_anywhere(&relative.join(file_name), name) {
+        if path.is_dir() && named_anywhere(root, &relative.join(file_name), name) {
             return true;
         }
     }
@@ -294,6 +330,37 @@ const ATTR_VOL_UUID: u32 = 0;
     assert!(declares(source, "ATTR_VOL_UUID"));
     assert!(!declares(source, "fn"));
     assert!(!declares(source, "unsafe"));
+}
+
+/// A git worktree inside this tree is still a whole repository, and both walks have to
+/// stop at its edge. `.sandcastle/main.mts` puts one per issue under
+/// `.sandcastle/worktrees/`, directly below a root `docs` walks, so a loop run turned
+/// this suite red over the upstream skill templates in the *copy* — a failure that says
+/// nothing about the change under test and reads like the agent broke the build.
+///
+/// Pinned against a fixture rather than against the live tree, because the live tree
+/// only has a worktree in it while a loop is running, which is precisely when nobody is
+/// watching this test.
+#[test]
+fn the_walks_stop_at_a_nested_checkout() {
+    let fixture = tempfile::tempdir().expect("a temporary directory");
+    let root = fixture.path();
+    fs::create_dir_all(root.join("docs")).expect("the fixture's own docs");
+    fs::write(root.join("docs/own.md"), "").expect("a document this tree owns");
+
+    let nested = root.join("docs/worktrees/issue-1");
+    fs::create_dir_all(nested.join("docs")).expect("the nested checkout's docs");
+    // A worktree records its git directory in a `.git` file; a clone has it as a
+    // directory. Either is enough to say "this is somebody else's tree".
+    fs::write(nested.join(".git"), "gitdir: /elsewhere\n").expect("the worktree marker");
+    fs::write(nested.join("docs/copied.md"), "").expect("a document the copy carries");
+
+    let mut found = Vec::new();
+    markdown_under(root, Path::new("docs"), &mut found);
+    assert_eq!(found, vec!["docs/own.md".to_string()]);
+
+    assert!(named_anywhere(root, Path::new("."), "own.md"));
+    assert!(!named_anywhere(root, Path::new("."), "copied.md"));
 }
 
 #[test]
