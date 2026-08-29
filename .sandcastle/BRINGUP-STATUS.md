@@ -56,6 +56,15 @@ any unattended run. Never enter tokens or credentials yourself.
 - If cargo is red: do not start the agent loop. Diagnose, fix by hand on this
   branch, push, and note it above. A loop started from a red build burns its
   iterations on the pre-existing bug.
-- If `main.mts` misbehaves at runtime, the likely spots are the `noSandbox`
-  import path (`@ai-hero/sandcastle/sandboxes/no-sandbox`) and the
-  `onSandboxReady` hook running `cargo fetch --locked`.
+- Runtime imports pre-verified on the laptop against the installed
+  `@ai-hero/sandcastle@0.12.0`: the package does export
+  `./sandboxes/no-sandbox`, `noSandbox({env})` constructs, and
+  `claudeCode` / `createSandbox` / `run` / `Output` all resolve. So if the
+  loop fails at startup, it is not the import path — look at `.env` loading
+  or the `onSandboxReady` hook running `cargo fetch --locked` instead.
+- Remaining unknown at runtime: whether `noSandbox`'s `env` is actually
+  forwarded into the agent's shell, i.e. whether `CARGO_TARGET_DIR` takes
+  effect. Cheap check on the server once a pipeline has run:
+  `ls ~/.cache/vibesync-sandcastle/` should contain a dir per branch. If it
+  is empty while builds are happening, the env is not being passed and
+  concurrent pipelines are sharing one cargo lock — say so here.
