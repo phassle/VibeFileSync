@@ -188,7 +188,11 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
           maxIterations: 1,
           agent,
           promptFile: "./.sandcastle/review-prompt.md",
-          promptArgs: { BRANCH: issue.branch, BASE_BRANCH: TARGET_BRANCH },
+          promptArgs: {
+            TASK_ID: issue.id,
+            BRANCH: issue.branch,
+            BASE_BRANCH: TARGET_BRANCH,
+          },
         });
 
         return {

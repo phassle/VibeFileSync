@@ -87,7 +87,17 @@ turn the test green be the one that decides the test was wrong.
 
 Run the four feedback-loop commands in a third subagent, separate from both, so
 the run that judges the work is not made by the agent that produced it.
-4. REFACTOR the code
+
+Refactoring is not part of the red-green loop. It happens after the behaviour is
+covered, with the tests held fixed.
+
+## Test only at seams the spec already agreed
+
+Do not invent a seam. When this issue has a parent Feature, its
+`## Testing Decisions` section names the modules to be tested and the prior art
+to follow - that is the agreed seam, and the RED subagent must be given it
+along with the issue text. If no parent Feature says, ask rather than guessing:
+a test at an unagreed seam locks in a shape nobody approved.
 
 # FEEDBACK LOOPS
 

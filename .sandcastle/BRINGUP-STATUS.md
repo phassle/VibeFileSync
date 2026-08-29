@@ -584,3 +584,69 @@ copied literal of `vibefilesync.pairs/v1` and rewrote it to derive the value
 from the actual JSON payload. That is precisely the failure mode this rule
 addresses, and it was caught by a separate pair of eyes rather than by the
 agent that wrote it. One data point, but it points the same way.
+
+## We are reimplementing a layer that already exists (laptop)
+
+I had a subagent read the installed Matt Pocock skills and `docs/dynamic-implement.md`
+end to end. The headline: **the orchestration we are building is already
+specified, and `dynamic-implement` owns it.** The Matt skills own only the
+stages — `wayfinder` maps decisions, `to-spec` makes the Feature, `to-tickets`
+makes the tickets, `implement` runs one ticket, `tdd` runs inside it,
+`code-review` judges it. None of them owns a loop over tickets. `dynamic-implement`
+is documented as exactly that layer, and it is **not installed** here — no
+directory in `.agents/skills/` or `.claude/skills/`.
+
+That reframes the plan question. Before deciding how our loop should attack
+#141-#175, Per should decide whether it should exist in this form at all, or
+whether we install `dynamic-implement` and drive that.
+
+Four real defects came out of the same read. I have fixed three; the fourth is
+Per's.
+
+**1. Our review had no Spec axis — fixed.** `code-review` runs two axes,
+Standards and Spec, as parallel subagents, and says the separation is
+load-bearing: "Reporting them separately stops one axis from masking the other."
+Our `review-prompt.md` had only Standards. Its entire context was the diff, the
+log and the coding standards — it never fetched the originating issue, so it
+could not tell whether the branch did what the ticket asked. That is the exact
+failure `code-review` exists to catch: code that follows every standard while
+implementing the wrong thing. The reviewer now fetches the issue first and
+reports spec findings under their own heading, before any clarity pass.
+`main.mts` passes `TASK_ID` to the reviewer, which it previously did not.
+
+**2. The planner overrode recorded dependencies — fixed.** `plan-prompt.md`
+re-derived blocking by LLM inference and never read
+`issue_dependencies_summary.blocked_by`, the field `docs/agents/issue-tracker.md`
+calls "the live gate". So the 35 native edges I just recorded on #141-#175 —
+human-reviewable decisions — would have been silently replaced by the planner's
+own reading. It now reads recorded edges first, and a recorded edge outranks
+inference: it may add edges, never remove one.
+
+**3. Seams were never agreed — fixed.** `tdd` is explicit: "No test is written
+at an unconfirmed seam." Our RED subagent got the issue text and test
+conventions. When a ticket has a parent Feature, the agreed seams are already
+written in its `## Testing Decisions`, and that must reach the RED subagent.
+Also removed a stray orphaned line my earlier edit left in `implement-prompt.md`.
+
+**4. Two competing "an agent may take this" signals — Per's call.** We filter on
+`--label Sandcastle`. The repo already has `ready-for-agent`, which `triage`
+defines and which `to-spec` and `to-tickets` apply automatically. Every ticket
+I created carries both. They can disagree, and then it is undefined which wins.
+Either `Sandcastle` becomes a pure queue marker with `ready-for-agent` as the
+readiness gate, or one of them goes.
+
+Smaller divergences, not yet acted on: our branch names (`sandcastle/issue-N`)
+diverge from `git-workflow.md`'s `feature/<kebab-name>` — `dynamic-implement`
+chose to conform, we did not; `resolving-merge-conflicts` is installed and our
+merge prompt ignores it; the `RALPH:` commit prefix is our invention and no
+skill or repo doc asks for it; and nothing but the branch passes between our
+implementer, reviewer and merger.
+
+**Where we are genuinely ahead, and should not give it up:** nothing in the Matt
+set structurally separates the test author from the implementer. `tdd` names the
+tautological-test failure mode — "the assertion recomputes the expected value
+the way the code does" — but prescribes no defence. Per's rule does. Keep it
+even if we move to `dynamic-implement`.
+
+Your plan reply should now also answer: do we keep this loop, or install
+`dynamic-implement` and drive that instead?

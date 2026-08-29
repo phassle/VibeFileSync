@@ -10,9 +10,30 @@ Here are the open issues in the repo:
 
 The list above has already been filtered to issues ready for work.
 
+# RECORDED DEPENDENCIES
+
+Blocking edges may already exist. `/to-tickets` records them as native GitHub
+issue dependencies when it creates a ticket set, and a human may have added or
+corrected them since. Those are decisions, not hints.
+
+Read them first:
+
+!`gh issue list --state open --label Sandcastle --limit 100 --json number --jq '.[].number' | while read n; do printf '%s blocked_by=%s\n' "$n" "$(gh api repos/{owner}/{repo}/issues/$n --jq '.issue_dependencies_summary.blocked_by' 2>/dev/null)"; done`
+
+`blocked_by` counts **open** blockers only, so it is the live gate: a non-zero
+value means that issue is not ready, whatever your own reading of the text
+suggests. An issue's body may also carry a `## Blocked by` section listing
+issue numbers.
+
+**A recorded edge wins over your inference.** Never treat an issue as unblocked
+because you judged the dependency unnecessary — a human approved that edge, and
+you are not seeing what they saw. You may only *add* edges you discover; you
+may never remove one. If a recorded edge looks wrong, still treat the issue as
+blocked, and say so in your reasoning rather than acting on it.
+
 # TASK
 
-Analyze the open issues and build a dependency graph. For each issue, determine whether it **blocks** or **is blocked by** any other open issue.
+For issues with no recorded edges, infer them. For each such issue, determine whether it **blocks** or **is blocked by** any other open issue.
 
 An issue B is **blocked by** issue A if:
 
