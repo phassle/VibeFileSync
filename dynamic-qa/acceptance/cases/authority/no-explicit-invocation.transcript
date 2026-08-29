@@ -1,0 +1,11 @@
+# dynamic-qa/acceptance/cases/authority/no-explicit-invocation.case.sh transcript
+#
+# Models qa-setup's stage 1 invocation gate (authority.evaluateInvocation)
+# refusing to start from anything other than an explicit user command or
+# explicit coordinator selection. This one plays a natural-language mention
+# ("we should really add QA coverage here") reaching the harness — the skill
+# must stop before doing anything else, including before asking who the QA
+# Owner is.
+ask|invocation-source|How did this run start?
+answer|invocation-source|natural-language-mention
+stop|not-explicit-invocation

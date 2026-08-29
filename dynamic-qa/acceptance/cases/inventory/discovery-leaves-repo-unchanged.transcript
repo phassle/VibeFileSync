@@ -1,0 +1,14 @@
+# Models a full stage 1 -> stage 2 run over a populated fixture repository
+# (existing tests, a CI workflow referencing a secret by name) reaching the
+# "inventory presented" stop state qa-setup's bare invocation form reaches
+# once stages 3+ are not yet built (ticket #162 scope). No write step
+# appears anywhere in this transcript — discovery only ever asks and reports.
+ask|invocation-source|How did this run start?
+answer|invocation-source|explicit-user-command
+ask|qa-owner|Who is the responsible QA Owner for this repository?
+answer|qa-owner|absent
+ask|technical-owner|Who is the Technical Owner for harness/CI/dependency consequences?
+answer|technical-owner|absent
+ask|inventory-summary|Here is what discovery found — does this match your understanding?
+answer|inventory-summary|yes
+stop|inventory-presented
