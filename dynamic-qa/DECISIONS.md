@@ -2165,3 +2165,74 @@ conformance for that obligation rather than degrading to a silent pass (6
 tests); a sanity check confirms the fixture-ci adapter's own real methods
 are not accidentally penalized by the obligation tests' rubber-stamp
 counterexamples.
+
+## 33. Untrusted-content proof (#170)
+
+The adversarial ticket: attack every already-landed defence
+(#150/#151/#153/#154/#155/#159) with hostile fixtures and prove content
+cannot authorize capability, per SPEC-135 User Stories 84-92 and the
+Testing Decisions paragraph's hostile-fixture list. No new defence was
+built — this ticket only attacks existing ones and reports honestly.
+
+**All hostile fixtures live in Tier 1** (`shared/scripts/hostile-fixtures.test.mjs`,
+25 tests, one section per SPEC-135 category: repository/application/MCP
+prompt injection, malicious branch/test names, dependency hooks,
+artifact/cache poisoning, secret patterns, redirects/DNS changes,
+metadata/internal reach, privilege escalation, diagnostic scrub failure) —
+every category is pure computation, so per the run brief's own tiering rule
+nothing here needed Tier 2. One Tier 2 case was added anyway
+(`acceptance/cases/hostile/repo-injection-leaves-tree-unchanged.case.sh`)
+specifically to prove the model/credential-absence property
+(`ci-clean/subprocess-env-scrub.case.sh`'s mechanism) holds against a
+fixture repository actively saturated with prompt-injection content, not
+only in the clean case — and that the hostile Flow Definition is refused
+with its exact named error while the fixture tree stays byte-unchanged.
+
+**Every attack fixture is paired with a named-error assertion**, never "it
+happened to fail": e.g. a Flow `expect` field carrying `$(curl ... | sh)` is
+rejected citing the exact forbidden-template-marker message; a dependency's
+postinstall-hook-shaped payload trying to reach `privileged-publication`
+directly is rejected as `trust-zone.illegal-transition.skip:...` and,
+independently, `trust-zone.privileged-lane-refuses-code`; an allowlist
+origin of `169.254.169.254`/`metadata.google.internal`/`10.0.0.5` is
+rejected via `classifyOriginRisk` returning `"metadata"`/`"internal"` and
+the capability gate's `network.allowlist-entries-exact`; an environment
+claiming an exact-allowlist match with `dnsRecheck`/`redirectRecheck: false`
+is rejected by name, proving the "redirect/DNS change after allowlist
+evaluation is caught by recheck" property against a concrete adversarial
+reproduction, not only the pre-existing #150 test coverage it composes.
+Full category -> fixture -> named-error map:
+`shared/references/hostile-fixtures.md`.
+
+**No attack succeeded.** Every category SPEC-135 names was reproducible
+against the real, already-landed deterministic core and was refused.
+
+**The two soft spots this ticket was explicitly asked to probe are both
+real as coded, and both currently latent, not live-exploitable** — because
+neither `portfolio-reconciliation.mjs`'s `reconcilePortfolio` nor
+`safe-execution-design.mjs`'s `designExecutionProfile` is yet wired to a
+real, attacker-reachable caller (both take fully caller-supplied
+evidence/options with no adapter deriving them from a real repository or
+sandbox yet — an explicit, pre-existing seam #151/#165 already documented,
+not a new discovery). Full reasoning and recommendations (make
+`resolveDataSet` and `context.zone` required rather than silently-skippable,
+before either function gets a real caller) are in
+`shared/references/hostile-fixtures.md`.
+
+**One additional, smaller finding surfaced while attacking the "malicious
+branch/test name" category:** `id-rules.mjs`'s `SEMANTIC_ID_RE` has no
+maximum length — an attacker-controlled branch name made of 300 lowercase
+letters passes `isValidSemanticId`. It cannot escape the safe character set
+(no path traversal, no shell metacharacter survives), so it does not alter
+command construction or artifact-path *target*, but an unbounded-length
+identifier fully within attacker control does reach filenames with no cap.
+Reported rather than silently treated as covered; a follow-up should add a
+length bound.
+
+**Coordination respected:** neither `github-actions-adapter.mjs` nor
+`qa-generate/SKILL.md`/`repair.mjs` (owned by concurrent #156/#160) was
+edited — `github-actions-adapter.mjs`'s existing exports
+(`classifyLaneContentSource`, `checkLaneTrustInvariant`) are only imported
+and attacked from the new test file. All prose lives in
+`shared/references/hostile-fixtures.md`, a new file, so neither in-flight
+ticket's `SKILL.md` was touched.
