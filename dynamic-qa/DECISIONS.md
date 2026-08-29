@@ -2005,3 +2005,86 @@ no "apply this patch" function. `dataSets` is caller-supplied in memory
 here reads `qa/data/` from disk, since nothing is written there until this
 same emission. No Provenance Manifest (`qa/provenance.json`) is produced
 here; that begins with qa-generate's first Binding.
+## 32. Guarded repair and the Repair Review Packet (#160)
+
+**Repair proposes; it never applies, never heals silently, and never
+widens its own permissions.** `shared/scripts/repair.mjs` (`repair.test.mjs`,
+66 tests) is the deterministic core `qa-generate repair` calls through its
+one orchestrator, `evaluateRepairProposal`. It reuses #159's
+`isBundleRepairEligible` (bundle shape, immutability, #158's eligibility),
+#152's `buildNegativeControlPlan`/`checkNegativeControlCoverage`, #146's
+`checkAssertionCoverage` and `scanGeneratedFiles`, and `canonical-digest.mjs`'s
+`contentDigest` — never re-deriving or forking any of them.
+
+**One causal hypothesis, never a loop.** `checkSingleCausalHypothesis`
+takes every distinct causal-hypothesis string the invocation considered
+(normally just the bundle's own `causalChain`). More than one distinct
+value is a **refusal that ends the invocation** (`reason:
+"second-causal-hypothesis"`), never a retry with the next theory —
+`evaluateRepairProposal` stops there before any file-scope or
+protected-contract check runs.
+
+**Fifteen named protected-contract categories, digested and compared
+before/after.** `PROTECTED_CONTRACT_CATEGORIES` spells out, individually,
+every category DESIGN-dynamic-qa-spec.md §7 and the run brief name as
+off-limits: `flowSemantics`, `tolerances`, `boundaries`, `dataMeaning`,
+`levelOverrides`, `lifecycle`, `enforcement`, `dependencies`, `lockfiles`,
+`workflows`, `profiles`, `identities`, `networkAccess`, `quarantine`,
+`requiredCheckPolicy`. `checkProtectedContractsUnchanged` computes
+`contentDigest` per category on a caller-supplied before/after snapshot
+(a missing category digests `null`, so appearance-from-nothing is caught
+too) and rejects the repair on ANY drift. A parallel, independent path-based
+denylist (`checkRepairFilesAreMechanicalOnly` /
+`classifyRepairFilePath`) refuses `qa/flows/*`, `qa/data/*`,
+`qa/execution-profiles/*`, `qa/quarantine*`, `.github/workflows/*`,
+`.github/*required-checks*`/`*branch-protection*`, `package.json`, every
+common lockfile, and `CODEOWNERS` outright — even a byte-identical rewrite
+of a protected path is refused, not only a semantic change. One test per
+category proves digest drift alone rejects the repair; a second test per
+category proves the corresponding path is excluded end to end.
+
+**THE missing guard #152 flagged, now built.** `negative-controls.mjs`'s
+own module footer says explicitly: "#160 must additionally guard against a
+repair candidate widening its own tolerance so its control passes more
+easily. That guard is NOT built here." `checkNegativeControlNotWeakened`
+closes it: it recomputes the DECLARED violation from the (protected,
+therefore unchanged) Flow contract via `reconstructProofObligations` /
+`buildNegativeControlPlan`, and requires every negative-control report to
+carry `appliedViolation.declaredViolationDigest` — a `contentDigest` the
+harness computes over the perturbation it ACTUALLY applied — equal to
+`declaredViolationDigest(declaredViolation)`. #152's own
+`judgeNegativeControl` only proves "some assertion failed for some
+reported reason"; it has no notion of WHICH violation was applied. A
+repair that widens its own tolerance (or otherwise weakens what its
+assertion checks) can still report `"assertion-failed"` by perturbing with
+something larger/easier than the flow's own bound requires — that report
+now carries a different digest and is rejected here, even though #152's
+gate alone would have accepted it. Covered by
+`repair.test.mjs`'s "tolerance-widening guard" tests.
+
+**Proposes only — structurally, not by convention.** `repair.mjs` imports
+no `node:fs`, no `node:child_process`, and contains no `writeFile`/
+`execSync` call anywhere; `proposedFiles` are opaque data that flow
+straight from the caller into the packet's `diff` section. A test reads
+the module's own source text and asserts the absence of every
+write/exec capability; a second test asserts a refusal never emits a
+packet at all (a refusal is no proposal, not a weaker one); a third
+asserts a successful proposal's `diff` is exactly the caller-supplied
+files, byte-for-byte.
+
+**The Repair Review Packet** (`REPAIR_REVIEW_PACKET_SECTIONS`,
+`validateRepairReviewPacket`) carries exactly six sections, no more, no
+fewer: `evidence`, `mappings`, `protectedContractDigests`, `diff`,
+`verification`, `residualRisk`. `evaluateRepairProposal` only ever
+assembles one, and only after every gate above passed in order — the first
+failing gate stops the invocation and returns `{ status: "refused",
+packet: null }`; repair never proceeds partially or patches around one
+failed gate by weakening another.
+
+**`qa-generate/SKILL.md`'s repair-mode section is filled in.** All seven
+steps (validate the bundle; reconstruct the read-only proof obligation;
+diagnose; gate on confirmed+binding-owned; propose a mechanical-only diff;
+verify one-hypothesis/protected-contracts/coverage/negative-control/
+neighbouring-coverage; emit the packet and stop) now name the exact
+functions above instead of "placeholder, same scope." #156 (adapter
+contract) and #169 (`qa-setup/SKILL.md`) were not touched.
