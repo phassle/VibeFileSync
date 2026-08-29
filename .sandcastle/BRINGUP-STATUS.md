@@ -396,3 +396,68 @@ ordinary work once the location is settled.
 **Suggested order given all that:** finish #140, get Per's answer on the #141
 location question, do #141, then #142 to get a real gate, and only then open
 the fan-out. Before #142 exists, parallelism buys you unverifiable work.
+
+## Standing rules from Per, added after #140 landed (laptop)
+
+#140 proved the loop works end to end. These three rules apply from now on, to
+the session-driven loop and to `npm run sandcastle` alike.
+
+### 1. Keep a watcher subagent on this channel at all times
+
+Per's instruction. The loop claimed #140 at 20:51:45 and the laptop's warning
+about 35 new tickets landed at 20:52:19 — half a minute later. Nothing broke
+this time, but it easily could have: for the rest of that iteration the loop
+was working from instructions it had already read and could not know had
+changed.
+
+So keep one long-lived subagent whose only job is to watch what the laptop
+session says, for as long as the loop runs. It polls
+`origin/chore/sandcastle-host-macos` for new commits touching this file,
+surfaces anything new to the main loop, and must be consulted **before each
+iteration's fan-out** — not only when something feels wrong. Treat a new
+instruction here the way you would treat Per speaking: it can redirect,
+narrow, or stop the work in flight.
+
+The channel is one-way in practice, so make it two-way: when the watcher finds
+an instruction the loop cannot follow, or that contradicts something already in
+motion, say so on this file rather than silently choosing one.
+
+### 2. Every finished spec leaves as a pull request
+
+A spec is never silently complete. When every sub-issue of a parent Feature is
+closed (`gh api repos/{owner}/{repo}/issues/<FEATURE> --jq .sub_issues_summary`
+shows `completed == total`), open **one pull request** from the spec's
+integration branch into `develop`, per `docs/agents/git-workflow.md`. Do not
+merge it, and never push to `develop` — the pull request is the handoff, and a
+human decides whether it lands.
+
+The body must let a reviewer judge the work without rebuilding it: the parent
+Feature as `Closes #<FEATURE>`, every ticket that landed, every ticket left
+unmerged **with its reason and an explicit statement that the spec is therefore
+incomplete**, the verification actually run and its real result, and whatever a
+reviewer should look at first. Where a gate does not meaningfully cover the
+change, say so — do not present a green Rust suite as evidence for a change
+that touches no Rust. `.sandcastle/merge-prompt.md` now carries the same rule
+for the sandcastle merger.
+
+### 3. One integration branch per spec — and this one is already mixed
+
+This needs fixing before the dynamic-qa work starts.
+
+`chore/sandcastle-host-macos` was meant to carry the Sandcastle host config.
+It now also carries #140's product change, because the loop merges into
+whatever branch it starts from. That is two unrelated things on one branch, and
+its eventual pull request would ask a reviewer to accept the agent
+infrastructure and a product change together.
+
+With 35 dynamic-qa tickets queued behind it, this gets much worse: the whole
+bundle would pile onto the config branch too.
+
+So before fanning out on #141-#175, start that spec from its own branch —
+`feature/135-dynamic-qa`, branched from `develop` — and merge its ticket
+branches there. Then #135's pull request contains #135's work and nothing else,
+and the Sandcastle config keeps its own separate pull request.
+
+What to do about #140 already sitting on the config branch is Per's call, not
+yours: leave it, or lift it onto its own branch. Ask before rewriting anything
+that is already pushed.
