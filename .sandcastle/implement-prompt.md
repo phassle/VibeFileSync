@@ -2,13 +2,19 @@
 
 Fix issue {{TASK_ID}}: {{ISSUE_TITLE}}
 
-Pull in the issue using `gh issue view <ID>`. If it has a parent PRD, pull that in too.
+Pull in the issue using `gh issue view {{TASK_ID}}`. If it has a parent PRD, pull that in too.
 
 Only work on the issue specified.
 
-Work on branch {{BRANCH}}. Make commits and run tests.
+Work on branch {{BRANCH}}, which branched from {{TARGET_BRANCH}}. Make commits and run tests.
 
 # CONTEXT
+
+This is `vibesync`, a Rust binary for macOS on Apple Silicon. It links macOS
+libSystem directly (`copyfile(3)`, `F_FULLFSYNC`), so it only builds and tests
+on macOS. Read `AGENTS.md`, `CONTEXT.md` and `.sandcastle/CODING_STANDARDS.md`
+before you change anything, and check `docs/adr/` for a decision record that
+already covers the area you are touching.
 
 Here are the last 10 commits:
 
@@ -35,7 +41,19 @@ If applicable, use RGR to complete the task.
 
 # FEEDBACK LOOPS
 
-Before committing, run `npm run typecheck` and `npm run test` to ensure the tests pass.
+Before committing, all four must pass:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo test --features fault-injection --test acceptance
+```
+
+The acceptance suite needs `--features fault-injection`, it does not compile
+without it. Never commit with a failing or ignored test. If a test cannot pass
+for a reason outside this issue, say so in the issue comment rather than
+weakening the test.
 
 # COMMIT
 

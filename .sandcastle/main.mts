@@ -1,34 +1,31 @@
-// Parallel Planner with Review — four-phase orchestration loop
+// Sandcastle orchestration for VibeFileSync - macOS host runs.
 //
-// This template drives a multi-phase workflow:
-//   Phase 1 (Plan):             An opus agent analyzes open issues, builds a
-//                               dependency graph, and outputs a <plan> JSON
-//                               listing unblocked issues with branch names.
-//   Phase 2 (Execute + Review): For each issue, a sandbox is created via
-//                               createSandbox(). The implementer runs first
-//                               (100 iterations). If it produces commits, a
-//                               reviewer runs in the same sandbox on the same
-//                               branch (1 iteration). All issue pipelines run
-//                               concurrently via Promise.allSettled().
-//   Phase 3 (Merge):            A single agent merges all completed branches
-//                               into the current branch.
+// Why noSandbox and not docker(): vibesync links macOS libSystem directly
+// (copyfile(3), F_FULLFSYNC via fcntl). It does not compile, link or test
+// inside a Linux container, so the agents run on the ai-server host itself,
+// isolated per issue by a git worktree instead of by a container.
 //
-// The outer loop repeats up to MAX_ITERATIONS times so that newly unblocked
-// issues are picked up after each round of merges.
+// Phase 1 (Plan):             one agent reads open issues labelled
+//                             "Sandcastle", builds a dependency graph and
+//                             emits a <plan> JSON of unblocked issues.
+// Phase 2 (Execute + Review): per issue, a worktree-backed sandbox runs the
+//                             implementer, then the reviewer on the same
+//                             branch. Capped by SANDCASTLE_CONCURRENCY.
+// Phase 3 (Merge):            one agent merges the finished branches into
+//                             the branch you started from.
 //
 // Usage:
-//   npx tsx .sandcastle/main.mts
-// Or add to package.json:
-//   "scripts": { "sandcastle": "npx tsx .sandcastle/main.mts" }
+//   npm run sandcastle
 
+import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import * as sandcastle from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
 import { z } from "zod";
 
-// The planner emits its plan as JSON inside <plan> tags; Output.object extracts
-// and validates it against this schema. We use Zod here, but any Standard
-// Schema validator works just as well — Valibot, ArkType, etc. See
-// https://standardschema.dev.
+type PlannedIssue = { id: string; title: string; branch: string };
+
 const planSchema = z.object({
   issues: z.array(
     z.object({ id: z.string(), title: z.string(), branch: z.string() }),
@@ -39,139 +36,171 @@ const planSchema = z.object({
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Maximum number of plan→execute→merge cycles before stopping.
-// Raise this if your backlog is large; lower it for a quick smoke-test run.
-const MAX_ITERATIONS = 10;
+/** Plan -> execute -> merge cycles before stopping. */
+const MAX_ITERATIONS = Number(process.env.SANDCASTLE_MAX_ITERATIONS ?? 10);
 
-// Hooks run inside the sandbox before the agent starts each iteration.
-// npm install ensures the sandbox always has fresh dependencies.
+/** Issue pipelines running at once. Each one is a full cargo build, so this is
+ *  bounded by cores and RAM on the server, not by the agent. */
+const CONCURRENCY = Number(process.env.SANDCASTLE_CONCURRENCY ?? 2);
+
+/** Model alias handed to Claude Code. Aliases survive model releases. */
+const MODEL = process.env.SANDCASTLE_MODEL ?? "opus";
+
+/** noSandbox deliberately does not pass --dangerously-skip-permissions, so an
+ *  unattended run needs this set. The agent then has your user's rights on the
+ *  server. Set it to "auto" for AI-mediated per-tool approval instead. */
+const PERMISSION_MODE = (process.env.SANDCASTLE_PERMISSION_MODE ??
+  "bypassPermissions") as "auto" | "bypassPermissions" | "acceptEdits";
+
+/** cargo target dir, kept per branch and outside the worktree. Worktrees are
+ *  recreated between runs, so a stable path per branch preserves the build
+ *  cache. Separate dirs also stop concurrent pipelines from queueing on a
+ *  single cargo lock. */
+const TARGET_CACHE_ROOT =
+  process.env.SANDCASTLE_TARGET_CACHE ??
+  join(homedir(), ".cache", "vibesync-sandcastle");
+
+const agent = sandcastle.claudeCode(MODEL, { permissionMode: PERMISSION_MODE });
+
+/** The branch the run started from. Merges land here, diffs are taken against it. */
+const TARGET_BRANCH = execFileSync(
+  "git",
+  ["rev-parse", "--abbrev-ref", "HEAD"],
+  { encoding: "utf8" },
+).trim();
+
+const sandboxFor = (branch?: string) =>
+  noSandbox({
+    env: {
+      CARGO_TARGET_DIR: join(
+        TARGET_CACHE_ROOT,
+        (branch ?? "planner").replace(/[^A-Za-z0-9._-]/g, "-"),
+      ),
+    },
+  });
+
+/** Warm the cargo registry before the agent starts, so its first build is not a
+ *  cold dependency fetch inside an iteration timeout. */
 const hooks = {
-  sandbox: { onSandboxReady: [{ command: "npm install" }] },
+  sandbox: {
+    onSandboxReady: [{ command: "cargo fetch --locked", timeoutMs: 300_000 }],
+  },
 };
 
-// Copy node_modules from the host into the worktree before each sandbox
-// starts. Avoids a full npm install from scratch; the hook above handles
-// platform-specific binaries and any packages added since the last copy.
-const copyToWorktree = ["node_modules"];
+/** Run tasks with a fixed number in flight. Rejections are captured per task,
+ *  the same shape Promise.allSettled returns. */
+async function allSettledLimit<T>(
+  tasks: Array<() => Promise<T>>,
+  limit: number,
+): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, tasks.length)) },
+    async () => {
+      while (next < tasks.length) {
+        const index = next++;
+        try {
+          results[index] = { status: "fulfilled", value: await tasks[index]!() };
+        } catch (reason) {
+          results[index] = { status: "rejected", reason };
+        }
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
+
+console.log(
+  `Sandcastle on ${TARGET_BRANCH} - model ${MODEL}, concurrency ${CONCURRENCY}, permissions ${PERMISSION_MODE}`,
+);
 
 for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
 
   // -------------------------------------------------------------------------
   // Phase 1: Plan
-  //
-  // The planning agent (opus, for deeper reasoning) reads the open issue list,
-  // builds a dependency graph, and selects the issues that can be worked in
-  // parallel right now (i.e., no blocking dependencies on other open issues).
-  //
-  // It outputs a <plan> JSON block — Output.object parses and validates it.
   // -------------------------------------------------------------------------
   const plan = await sandcastle.run({
-    hooks,
-    sandbox: docker(),
+    sandbox: sandboxFor(),
     name: "planner",
-    // One iteration is enough: the planner just needs to read and reason,
-    // not write code. (Structured output requires maxIterations: 1.)
     maxIterations: 1,
-    // Opus for planning: dependency analysis benefits from deeper reasoning.
-    agent: sandcastle.claudeCode("claude-opus-4-8"),
+    agent,
     promptFile: "./.sandcastle/plan-prompt.md",
-    // Extract and validate the <plan> JSON into a typed object. Throws
-    // StructuredOutputError if the tag is missing, the JSON is malformed, or
-    // validation fails — which aborts the loop.
     output: sandcastle.Output.object({ tag: "plan", schema: planSchema }),
   });
 
-  const issues = plan.output.issues;
+  const issues = plan.output.issues as PlannedIssue[];
 
   if (issues.length === 0) {
-    // No unblocked work — either everything is done or everything is blocked.
-    console.log("No unblocked issues to work on. Exiting.");
+    console.log("No unblocked Sandcastle issues to work on. Exiting.");
     break;
   }
 
-  console.log(
-    `Planning complete. ${issues.length} issue(s) to work in parallel:`,
-  );
+  console.log(`Planning complete. ${issues.length} issue(s) queued:`);
   for (const issue of issues) {
-    console.log(`  ${issue.id}: ${issue.title} → ${issue.branch}`);
+    console.log(`  ${issue.id}: ${issue.title} -> ${issue.branch}`);
   }
 
   // -------------------------------------------------------------------------
   // Phase 2: Execute + Review
-  //
-  // For each issue, create a sandbox via createSandbox() so the implementer
-  // and reviewer share the same sandbox instance per branch. The implementer
-  // runs first; if it produces commits, the reviewer runs in the same sandbox.
-  //
-  // Promise.allSettled means one failing pipeline doesn't cancel the others.
   // -------------------------------------------------------------------------
-
-  const settled = await Promise.allSettled(
-    issues.map(async (issue) => {
+  const settled = await allSettledLimit(
+    issues.map((issue) => async () => {
       const sandbox = await sandcastle.createSandbox({
         branch: issue.branch,
-        sandbox: docker(),
+        sandbox: sandboxFor(issue.branch),
         hooks,
-        copyToWorktree,
       });
 
       try {
-        // Run the implementer
         const implement = await sandbox.run({
-          name: "implementer",
+          name: `implementer:${issue.id}`,
           maxIterations: 100,
-          agent: sandcastle.claudeCode("claude-opus-4-8"),
+          agent,
           promptFile: "./.sandcastle/implement-prompt.md",
           promptArgs: {
             TASK_ID: issue.id,
             ISSUE_TITLE: issue.title,
             BRANCH: issue.branch,
+            TARGET_BRANCH,
           },
         });
 
-        // Only review if the implementer produced commits
-        if (implement.commits.length > 0) {
-          const review = await sandbox.run({
-            name: "reviewer",
-            maxIterations: 1,
-            agent: sandcastle.claudeCode("claude-opus-4-8"),
-            promptFile: "./.sandcastle/review-prompt.md",
-            promptArgs: {
-              BRANCH: issue.branch,
-            },
-          });
+        if (implement.commits.length === 0) return implement;
 
-          // Merge commits from both runs so the merge phase sees all of them.
-          // Each sandbox.run() only returns commits from its own run.
-          return {
-            ...review,
-            commits: [...implement.commits, ...review.commits],
-          };
-        }
+        const review = await sandbox.run({
+          name: `reviewer:${issue.id}`,
+          maxIterations: 1,
+          agent,
+          promptFile: "./.sandcastle/review-prompt.md",
+          promptArgs: { BRANCH: issue.branch, TARGET_BRANCH },
+        });
 
-        return implement;
+        return {
+          ...review,
+          commits: [...implement.commits, ...review.commits],
+        };
       } finally {
         await sandbox.close();
       }
     }),
+    CONCURRENCY,
   );
 
-  // Log any agents that threw (network error, sandbox crash, etc.).
   for (const [i, outcome] of settled.entries()) {
     if (outcome.status === "rejected") {
       console.error(
-        `  ✗ ${issues[i]!.id} (${issues[i]!.branch}) failed: ${outcome.reason}`,
+        `  x ${issues[i]!.id} (${issues[i]!.branch}) failed: ${outcome.reason}`,
       );
     }
   }
 
-  // Only pass branches that actually produced commits to the merge phase.
-  // An agent that ran successfully but made no commits has nothing to merge.
   const completedIssues = settled
     .map((outcome, i) => ({ outcome, issue: issues[i]! }))
     .filter(
@@ -186,36 +215,26 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(
     `\nExecution complete. ${completedBranches.length} branch(es) with commits:`,
   );
-  for (const branch of completedBranches) {
-    console.log(`  ${branch}`);
-  }
+  for (const branch of completedBranches) console.log(`  ${branch}`);
 
   if (completedBranches.length === 0) {
-    // All agents ran but none made commits — nothing to merge this cycle.
     console.log("No commits produced. Nothing to merge.");
     continue;
   }
 
   // -------------------------------------------------------------------------
   // Phase 3: Merge
-  //
-  // One agent merges all completed branches into the current branch,
-  // resolving any conflicts and running tests to confirm everything works.
-  //
-  // The {{BRANCHES}} and {{ISSUES}} prompt arguments are lists that the agent
-  // uses to know which branches to merge and which issues to close.
   // -------------------------------------------------------------------------
   await sandcastle.run({
     hooks,
-    sandbox: docker(),
+    sandbox: sandboxFor(TARGET_BRANCH),
     name: "merger",
     maxIterations: 1,
-    agent: sandcastle.claudeCode("claude-opus-4-8"),
+    agent,
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
-      // A markdown list of branch names, one per line.
+      TARGET_BRANCH,
       BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
-      // A markdown list of issue IDs and titles, one per line.
       ISSUES: completedIssues.map((i) => `- ${i.id}: ${i.title}`).join("\n"),
     },
   });

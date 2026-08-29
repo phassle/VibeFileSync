@@ -22,13 +22,13 @@ Review the code changes on branch `{{BRANCH}}` and improve code clarity, consist
    - Improve readability through clear variable and function names
    - Consolidate related logic
    - Remove unnecessary comments that describe obvious code
-   - Avoid nested ternary operators - prefer switch statements or if/else chains
+   - Prefer `match` over nested `if let` chains when branching on an enum
    - Choose clarity over brevity - explicit code is often better than overly compact code
 
 3. **Check correctness**:
    - Does the implementation match the intent? Are edge cases handled?
    - Are new/changed behaviours covered by tests?
-   - Are there unsafe casts, `any` types, or unchecked assumptions?
+   - Are there `unwrap`/`expect` calls on values that can fail at runtime, new `unsafe` blocks without a safety comment, or unchecked assumptions about filesystem state?
    - Does the change introduce injection vulnerabilities, credential leaks, or other security issues?
 
 4. **Maintain balance**: Avoid over-simplification that could:
@@ -47,7 +47,7 @@ Review the code changes on branch `{{BRANCH}}` and improve code clarity, consist
 If you find improvements to make:
 
 1. Make the changes directly on this branch
-2. Run tests and type checking to ensure nothing is broken
+2. Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` and `cargo test --features fault-injection --test acceptance` to ensure nothing is broken
 3. Commit describing the refinements
 
 If the code is already clean and well-structured, do nothing.
