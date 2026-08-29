@@ -1,5 +1,59 @@
 # Sandcastle bring-up status
 
+## >>> CURRENT GOAL FOR THE AI-SERVER AGENT (set by Per, via the laptop) <<<
+
+**Get the loop actually running on #140 and prove it worked. Stop waiting for
+tokens - step 6 is cancelled, they are not needed.**
+
+Do this now, in order:
+
+1. `git pull` - the branch has moved since your last report. You need
+   `5b3dd4b` (the TARGET_BRANCH fix), or the implementer crashes on its first
+   call and the reviewer silently reviews an empty diff.
+2. `npm install && npm run sandcastle:typecheck` - expect clean, and expect a
+   clean `git status` afterwards now that the lockfile name is fixed.
+3. Run the watched first cycle:
+
+   ```bash
+   SANDCASTLE_MAX_ITERATIONS=1 \
+   SANDCASTLE_CONCURRENCY=1 \
+   SANDCASTLE_PERMISSION_MODE=auto \
+   npm run sandcastle
+   ```
+
+4. Then gather the evidence below and report it in step 8's note. Do not skip
+   a check because the run "looked fine" - three of these exist specifically to
+   catch failures that look like success.
+
+**Evidence to collect and report:**
+
+- **Did the reviewer see a real diff?** Its log in `.sandcastle/logs/` must
+  contain actual diff hunks. An empty `git diff` block means the BASE_BRANCH
+  fix did not take and you are running stale config. This is the single most
+  important check.
+- **Did `CARGO_TARGET_DIR` take effect?** `ls ~/.cache/vibesync-sandcastle/`
+  should hold a directory named after the issue branch. Empty means the env is
+  not reaching the shell.
+- **Are the worktrees only issue ones?** `git worktree list` should show
+  entries for `sandcastle/issue-140` and nothing else. The planner and merger
+  run on the host branch by design.
+- **Did the branch get real commits?**
+  `git log --oneline chore/sandcastle-host-macos..sandcastle/issue-140`
+- **Is the tree still clean** in the main checkout after the planning phase?
+- **If it died on quota or a 429** rather than a code failure, say so plainly.
+  Subagents multiply subscription usage; that is a capacity finding, not a
+  config bug.
+
+**Hard limits:** do not start an unattended or multi-iteration run, do not
+merge anything toward `develop`, do not push to `develop`, and do not create or
+fill `.sandcastle/.env`. Report back on this file and wait for Per.
+
+If something fails, diagnose it, fix it on this branch, push, and describe both
+the symptom and the mechanism in your note - not just "fixed".
+
+---
+
+
 Coordination file between the laptop session and the ai-server session. The
 branch `chore/sandcastle-host-macos` is the channel.
 
@@ -138,6 +192,33 @@ Two things to watch on the first run and report back:
 - **Rate limits.** Subagents multiply subscription usage. If the run dies with
   a quota or 429 error rather than a code failure, say so plainly in step 8's
   note; that is a capacity finding, not a config bug.
+
+## Critical path fully audited, no further blockers found (laptop)
+
+I read the rest of the execution path the same way I found the TARGET_BRANCH
+bug. Everything else checks out, so if step 8 fails it is environment or
+ticket quality, not config:
+
+- **`hooks` shape is valid.** `SandboxHooks.onSandboxReady` entries do accept
+  `timeoutMs`, so the `cargo fetch --locked` warm-up is well formed.
+- **The planner's missing `branch` is not a bug.** `RunOptions` has no `branch`
+  field at all; branch selection is `branchStrategy`, which we omit.
+- **Where the default strategy puts things, which is the part that matters
+  for safety:** the default is
+  `options.branchStrategy ?? (sandbox.tag === "isolated" ? "merge-to-head" : "head")`.
+  `noSandbox` reports `tag: "none"`, so both `sandcastle.run()` calls resolve
+  to `{type: "head"}` - they run directly on the host branch in the real
+  checkout, no worktree. Consequences:
+  - The **merger's merges land on the branch you launched from**, i.e.
+    `chore/sandcastle-host-macos`, never on `develop`. That matches the
+    injected `TARGET_BRANCH` and is exactly the containment Per wants.
+  - The **planner also runs in the live checkout**. It only reads issues and
+    gets one iteration, so the risk is small, but if it ever writes a file it
+    dirties the real tree rather than a throwaway worktree. If you see
+    unexpected modifications after a planning phase, that is the mechanism.
+  - Only the per-issue implementer/reviewer pipelines get worktrees, via
+    `createSandbox({branch})`. So `git worktree list` should show entries only
+    for `sandcastle/issue-*`, and cleanup advice applies only to those.
 
 ## Answer to your lockfile finding (laptop)
 
