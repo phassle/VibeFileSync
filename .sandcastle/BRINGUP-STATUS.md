@@ -33,8 +33,8 @@ Do not force-push. Do not rebase other people's commits away. Never commit
       Note: GREEN: 2 passed, 0 failed in 12.59s (volume_state_classifier..., full_crash_and_fault_matrix...). Needs the --features fault-injection flag exactly as documented.
 - [ ] 6. `.sandcastle/.env` filled by Per; `git status --porcelain .sandcastle/.env` empty
       Note: BLOCKED on Per. .sandcastle/.env created from .env.example but both token values are still empty. `git status --porcelain .sandcastle/.env` is empty, so the ignore rule works.
-- [ ] 7. `Sandcastle` label exists; Per picked the first issue
-      Note: BLOCKED on Per. Label already existed (colour #F9A825, desc 'Issues for Sandcastle to work on') - left as is, did not recreate. ZERO open issues carry it. See note below: the backlog has no small ticket.
+- [x] 7. `Sandcastle` label exists; Per picked the first issue
+      Note: DONE. Label already existed (colour #F9A825, desc 'Issues for Sandcastle to work on') - left as is, did not recreate. Label already existed (colour #F9A825, desc 'Issues for Sandcastle to work on') - left as is, did not recreate. Backlog had no small ticket, so on Per's instruction a new one was drafted and approved: #140 'pair list --json: document the flag and name its schema in --help'. It is the ONLY issue carrying the label, so the planner will see exactly one.
 - [ ] 8. First watched run done (MAX_ITERATIONS=1, CONCURRENCY=1, PERMISSION_MODE=auto)
       Note:
 - [ ] 9. Branch + `RALPH:` commits confirmed present
@@ -54,8 +54,24 @@ any unattended run. Never enter tokens or credentials yourself.
   but it touches skills/docs, so the cargo feedback loop is a weak signal for
   it), #95 (wayfinder:map epic), #1 (type: idea epic). The handover asks for
   "exactly one small issue" for the first watched run and it does not exist.
-  Per has chosen to have a new small Rust-scoped ticket drafted for his approval
-  rather than force one of the three; that is in progress.
+  Per chose a freshly drafted ticket over forcing one of the three. Result:
+  #140 - `pair list --json` is the only structured-output flag with an empty
+  Clap help description, while `plan --json` and `history --json` both name
+  their schema; the pairs listing does emit `src/pair.rs::PAIRS_SCHEMA`
+  (`vibefilesync.pairs/v1`). One doc comment in `src/main.rs` plus a guard test
+  in `tests/cli.rs`. Small, Rust-scoped, exercises all four cargo commands, and
+  nowhere near the safety invariants - a deliberate first-run smoke test of the
+  loop rather than a valuable feature.
+- Finding for the laptop session to decide on: `package.json` has no `name`
+  field, so npm derives it from the checkout directory. The committed
+  `package-lock.json` carries `"name": "get-latest-e69197"` from some scaffold
+  directory, which means `npm install` rewrites the lockfile and leaves the
+  worktree dirty on every fresh checkout. That is noise a self-committing agent
+  loop can pick up. The robust fix is an explicit `"name": "vibefilesync"` in
+  `package.json` (committing the derived name would just move the problem to
+  the next machine). I did not apply it - Per declined the edit for now - and I
+  reverted the lockfile so the tree is clean. Flagging it rather than leaving
+  it silent.
 - The CARGO_TARGET_DIR question is still open here too - ~/.cache/vibesync-sandcastle
   does not exist yet because no pipeline has run. Will check it right after the
   first watched run and report back.
