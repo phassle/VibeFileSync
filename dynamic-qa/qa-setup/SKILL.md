@@ -6,21 +6,22 @@ metadata:
   version: "{{BUNDLE_VERSION}}"
 ---
 
-STATUS: stages 1–9 built (ticket #162: authority and sourced inventory;
+STATUS: all ten stages built (ticket #162: authority and sourced inventory;
 ticket #163: posture-specific evidence; ticket #164: risk ranking and
 one-flow interviews; ticket #165: portfolio reconciliation and per-flow
 review; ticket #166: safe execution design; ticket #167: measurement
-readiness; ticket #168: provider-native CI design). Stage 10 remains a
-placeholder for a later ticket — do not invent its content here. See
+readiness; ticket #168: provider-native CI design; ticket #169: Setup
+Review Packet, emit patch and stop). See
 `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 6. qa-setup SKILL.md outline` (run
-notes) for the full target workflow this file will grow into,
+notes) for the full target workflow this file grew into,
 `dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2,
 `dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3,
 `dynamic-qa/shared/references/candidate-ranking-and-interviews.md` for
 stages 4–5, `dynamic-qa/shared/references/portfolio-reconciliation.md` for
 stage 6, `dynamic-qa/shared/references/safe-execution-design.md` for
-stage 7, `dynamic-qa/shared/references/baseline-plan.md` for stage 8, and
-`dynamic-qa/shared/references/ci-design.md` for stage 9 below.
+stage 7, `dynamic-qa/shared/references/baseline-plan.md` for stage 8,
+`dynamic-qa/shared/references/ci-design.md` for stage 9, and
+`dynamic-qa/shared/references/setup-review-packet.md` for stage 10 below.
 
 ## Explicit invocation only
 
@@ -603,13 +604,97 @@ See `shared/references/ci-design.md` for the full rationale, the
 amend-vs-new-file scoring in detail, and the deterministic core's test
 coverage for each rule above.
 
-## Stages not yet built (placeholders for later tickets)
+## Stage 10: Review once, then emit — and stop
 
-Each numbered stage below is a placeholder. Do not invent its content here;
-implement it in the ticket that owns it.
+Every earlier stage held its output in memory only. This is the earliest
+point in `qa-setup` a repository write is even possible — the Setup Review
+Packet exists precisely so that one approval is informed by everything
+built so far, not a formality granted before anyone has actually seen it.
+After emission, `qa-setup` stops: generation, merging, provider-policy
+changes, and pilot execution are separate actions this skill never takes
+on its own.
 
-10. **Review once, then emit (Setup Review Packet, dual approval)** — placeholder,
-    same scope.
+`shared/scripts/setup-review-packet.mjs` is where this stage's own logic
+lives. It composes five earlier tickets' results; it re-derives none of
+them, and it introduces no second approval model:
+
+1. **Assemble one packet covering all seven required areas.** Call
+   `assembleSetupReviewPacket({ flows, portfolioApproval, dataSets,
+   executionResults, baselinePlan, ciProposal, harnessFacts })`, passing
+   stage 6's `evaluatePortfolioApproval` result, stage 7's per-flow
+   `designExecutionProfile` results, stage 8's Baseline Plan, stage 9's
+   `designProviderNativeCI` result, and stage 2's inventory facts straight
+   through. Each of `REQUIRED_PACKET_AREAS` — contract, data, safety,
+   harness, dependency, ci, unresolvedRequirements — is built
+   independently; an area whose upstream input is missing or malformed is
+   named in `missingAreas` rather than aborting the whole assembly, so a
+   reviewer sees every gap in one pass, the same "every issue at once"
+   shape stage 7's own composition already established. Call
+   `validateSetupReviewPacket(packet)` before presenting it — a packet
+   missing even one required area is rejected outright, never presented as
+   if it were informed.
+2. **Present every area plainly, including the unresolved one.** The
+   `unresolvedRequirements` area is not an afterthought — it names every
+   draft flow stage 6 left unresolved, every deferred Execution Profile's
+   Safety Blockers, every Baseline Plan metric still
+   `measurement-required`, every CI lane stage 9 could not assign, and any
+   runner the CI proposal names that stage 2 never actually observed. A
+   reviewer approving this packet is approving it WITH these gaps named,
+   never a packet that quietly omits them to look more finished.
+3. **Require two independent approvals — the same two gates, reused, not a
+   second model.** Call
+   `evaluateSetupReviewApproval(approvalRecord)`, passing an
+   `authority.mjs`-shaped record (`{ qaOwnerGate: { present, identifier },
+   technicalOwnerGate: { present, identifier } }`) — exactly stage 1's own
+   gate shape, reused for a new question ("has this packet been approved"
+   instead of "does this person hold this role"). Contract approval
+   (`qaOwnerGate`) and technical approval (`technicalOwnerGate`) are
+   evaluated independently; `validateAuthorityRecord`'s existing rules
+   (both gates required, no collapsing them into one field, no gate
+   present without a named identifier) apply unchanged. Present which gate
+   is satisfied and which is withheld exactly as reported — never round up
+   "one approved" to "approved."
+4. **Emit only when the packet is complete, both gates are satisfied, and
+   measurement is ready — check in that order.** Call
+   `emitSetupReviewPacket({ packet, approvalRecord, flows,
+   executionResults, dataSets, baselinePlan, ciProposal })`. It refuses,
+   naming the exact reason, for any of: an incomplete packet
+   (`"incomplete-packet"`), a malformed or non-independent approval record
+   (`"invalid-approval-record"` / `"gates-not-independent"`), either gate
+   withheld (`"contract-approval-withheld"` /
+   `"technical-approval-withheld"` / `"both-approvals-withheld"`), or the
+   Baseline Plan not yet `"ready"` (`"measurement-required"` — stage 8's
+   own stop condition, checked again here so it cannot be bypassed by
+   reaching stage 10 anyway). **There is no argument to this function that
+   produces a partial patch** — refusal is total, exactly like #168's
+   ordering gate for CI design.
+5. **On success, the return value IS the patch — present it, then stop.**
+   `emitSetupReviewPacket`'s result carries `files` (`{ path, contents }`
+   for exactly: `qa/flows/<id>.yaml` per approved flow, `qa/data/<id>.yaml`
+   per Named Data Set an approved flow actually references,
+   `qa/execution-profiles/<id>.yaml` per stage 7 result — activated and
+   deferred flows both, `qa/schemas/<file>` for the bundle's own current
+   schema files, and `qa/baseline-plan.yaml`) and a `summary` for quick
+   review. Present this exactly as computed. **This skill does not write
+   these files, does not open a pull request, does not regenerate
+   anything, and does not touch provider policy** — presenting the patch
+   for the QA Owner and Technical Owner to apply through their own normal
+   review process (a PR, a direct commit, whatever this repository's own
+   Git workflow already is) is the last thing `qa-setup` does. Ticket
+   #170/#171 (Bindings, adoption) start from this patch already applied;
+   they are not this skill's job.
+6. **A draft flow, an unactivated Execution Profile, or an unassigned CI
+   lane never blocks emission by itself.** Only the packet's completeness,
+   the two approvals, and Baseline Plan readiness gate emission — a
+   portfolio that is not fully approved, or a flow whose Execution Profile
+   stayed deferred, is real, named information the packet surfaces (step 2
+   above), not a hard stop for the whole packet. (Ci-design's own ordering
+   gate, stage 9's `designProviderNativeCI`, already requires
+   `portfolioFullyApproved` before a CI proposal can exist at all — by the
+   time stage 10 runs, that condition already holds structurally.)
+
+See `shared/references/setup-review-packet.md` for the full rationale and
+the deterministic core's test coverage for each rule above.
 
 ## Dependencies
 

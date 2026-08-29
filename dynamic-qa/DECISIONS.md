@@ -1917,3 +1917,91 @@ repair-execution behavior, not a bundle-shape property, and belongs to
 unedited per coordination — see `shared/references/failure-evidence.md`
 for the exact repair-mode step 1 / step 4 placeholder text this ticket
 leaves in place.
+
+## 30. Setup Review Packet and emit-then-stop (#169)
+
+**This is the first point `qa-setup` can write, and the module structurally
+guarantees it.** `shared/scripts/setup-review-packet.mjs` composes #165's
+`evaluatePortfolioApproval`, #166's `designExecutionProfile` results, #167's
+Baseline Plan / `computeReadiness`, and #168's `designProviderNativeCI`
+result into one packet and one emission gate — it re-derives none of them.
+Every other customer-repository artifact (Flow Definitions, Named Data
+Sets, Execution Profiles, the bundled schemas) stays in memory until
+`emitSetupReviewPacket` succeeds; #167's Baseline Plan file remains the one
+documented exception (SPEC-135 story 44 — resumable measurement across
+days), not a precedent this ticket weakens or extends.
+
+**Seven required areas, each independently checked.**
+`assembleSetupReviewPacket` builds `REQUIRED_PACKET_AREAS` (contract, data,
+safety, harness, dependency, ci, unresolvedRequirements) from dedicated
+builders that each throw on their own missing/malformed upstream input;
+the assembler catches every area's failure separately into `missingAreas`
+rather than aborting on the first bad input, so a reviewer sees every gap
+at once — the same shape #166's stage 7 composition already established
+for Safety Blockers. `validateSetupReviewPacket` rejects anything short of
+all seven.
+
+**Dual approval reuses #162's gates — not a second model.**
+`evaluateSetupReviewApproval` calls `authority.mjs`'s
+`validateAuthorityRecord`/`gatesAreIndependent` directly on the same
+`{ qaOwnerGate, technicalOwnerGate }` shape stage 1 already established;
+`authority.mjs`'s own header names "the Setup Review Packet" as one of the
+two places `GATE_KEYS` is reused. `present: true` here means "approved the
+packet" rather than "holds this role" — the field shape and independence
+rules are unchanged. Withholding either gate, or both, is independent and
+total; a non-independent record (same object behind both keys) never reads
+as `bothApproved`.
+
+**Emit-then-stop is a structural property of the function's own control
+flow.** `emitSetupReviewPacket` checks, in fixed order: packet
+completeness, approval-record validity/independence, both gates satisfied,
+then Baseline Plan readiness (`measurement-required` blocks emission here
+too, re-checked so stage 8's own stop cannot be bypassed by reaching stage
+10 anyway). Only then does it return the patch's file list — there is no
+code path that writes a file, calls a generator, merges anything, or
+changes provider/CI policy, and the return value carries no
+`apply`/`merge`/`generate`/`run`/`activate` handle for a caller to invoke
+next.
+
+**Exactly the expected patch — no amend-renderer built here either.**
+`buildSetupPatchFiles` emits, in a fixed sorted order: `qa/flows/<id>.yaml`
+(approved flows only), `qa/data/<id>.yaml` (only data sets an approved
+flow references), `qa/execution-profiles/<id>.yaml` (every stage 7 result,
+activated and deferred alike), `qa/schemas/<file>` (the bundle's own
+current schema files, enumerated from `shared/schemas/` rather than
+hard-coded), and `qa/baseline-plan.yaml`. Deliberately excluded:
+`qa/quarantines/*` (nothing is quarantined by setup) and
+`qa/provenance.json` (no Binding exists yet — that is qa-generate's job).
+#168 explicitly left "no actual amend-renderer exists... producing the
+exact merged YAML for an existing third-party workflow file" as a seam for
+"stage 10's Setup Review Packet, or a later qa-generate step" — this ticket
+does NOT build that renderer: the CI proposal is presented in the packet's
+`ci`/`dependency` areas for review, but never becomes a patch file, and no
+`.github/workflows/` change is ever part of this patch. That remains open
+for whichever ticket actually applies CI policy.
+
+**qa-setup/SKILL.md stage 10 filled in; STATUS line now reads "all ten
+stages built."** No stale placeholder list remains.
+
+**FLAGGED FOR REVIEW — a naming tension between this ticket's brief and
+DESIGN-dynamic-qa-spec.md §5.4/SPEC-135 story 44:** the ticket brief for
+#169 frames stage 10 as "the first and only place qa-setup writes," but
+#167 (landed, and DESIGN §5.4 explicitly) already has stage 8 write
+`qa/baseline-plan.yaml` directly on `measurement-required`, precisely so
+burn-in evidence can accumulate across sessions without hidden state. Per
+run brief decision #4, where the ticket brief and the more specific design
+doc conflict, this is worth surfacing rather than silently resolving either
+way: this module treats the Baseline Plan file as the one pre-existing,
+spec-mandated exception (unchanged, not touched by this ticket) and
+guarantees the STRUCTURAL "everything else waits for approval" property for
+every other artifact instead of re-litigating #167's own write.
+
+**Seams for #170/#171:** `emitSetupReviewPacket`'s returned `files` array
+is the exact handoff — a later ticket applies it (writes it to the real
+repository, opens a PR, whatever this repository's own Git workflow
+already is) as a genuinely separate action; this ticket deliberately builds
+no "apply this patch" function. `dataSets` is caller-supplied in memory
+(stage 5 authors Named Data Sets the same way it authors flows) — nothing
+here reads `qa/data/` from disk, since nothing is written there until this
+same emission. No Provenance Manifest (`qa/provenance.json`) is produced
+here; that begins with qa-generate's first Binding.
