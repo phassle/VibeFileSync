@@ -1087,3 +1087,58 @@ DESIGN-dynamic-qa-spec.md §11 zone 4 names — gets the general
 - `qa-setup/SKILL.md`'s stage 7 prose integration is deferred to the
   coordinator — see the exact replacement text and placeholder reported
   separately.
+
+## 22. qa-setup stage 8 measurement readiness (#167)
+
+**Module.** `shared/scripts/baseline-plan.mjs`, 28 Tier 1 tests in
+`baseline-plan.test.mjs`. Schema doc: `shared/schemas/dynamic-qa-baseline-plan-v1.schema.json`.
+Reference: `shared/references/baseline-plan.md`. `qa-setup/SKILL.md` stage 8
+filled in.
+
+**The three-state Quantity type is the whole ticket, modeled at the type
+level rather than in prose.** A numerator or denominator is always exactly
+one of `unknownQuantity()` (no evidence), `notApplicableQuantity(reason)`
+(does not apply here, reason mandatory), or `knownQuantity(value)` (a real
+measured number — 0 is an entirely ordinary `known` value, distinguished
+from `unknown` by tag, never by value). There is no fourth "just missing"
+state and no function anywhere in the module that turns `unknown` or
+`not-applicable` into a number. `isQuantity` and every consumer
+(`metricStatus`, `computeReadiness`) only recognize these three exact
+shapes.
+
+**`buildBaselinePlan` has no `readiness` parameter.** Readiness is always
+`computeReadiness`'s own derivation from the metrics/window actually
+given — there is no argument, override, or force path that lets a caller
+assert `ready` ahead of the evidence. `validateBaselinePlan` independently
+re-derives readiness and reports a mismatch as an issue, so a hand-edited
+YAML file cannot simply declare `readiness: ready` either.
+
+**Two clocks are deliberately kept separate — read this before touching
+either.** `validateBaselinePlan`'s anti-fabrication check anchors the
+burn-in recompute to `now ?? data.generatedAt`, NOT the real wall clock: a
+plan honestly `measurement-required` on the day it was written must stay
+*valid* forever after, even once real time quietly clears the 14-day/20-run
+burn-in gate — going stale is not fabrication. `resumeBaselinePlan`
+separately recomputes *current* readiness against the real (or injected)
+clock every call, independent of the stored value's own validity check.
+This split is what makes "measurement can span days" true without
+rewriting the file in between: do not collapse these two clocks back into
+one, or either a stale-but-honest document becomes falsely invalid, or a
+day-one document falsely reports `ready` before the burn-in gate clears.
+
+**Resume takes exactly one required argument: `repoRoot`.**
+`resumeBaselinePlan(repoRoot, { now })` reads only
+`qa/baseline-plan.yaml` (`BASELINE_PLAN_REPO_PATH`) from disk — no cache,
+no module-level state, no session identifier. A missing file reports
+`{ exists: false, readiness: "measurement-required" }` without error, a
+normal starting point rather than a failure.
+
+**Assumption for #169/#171: `RUN_COUNT_METRIC_ID` is pinned to
+`pr-check-latency-p95`'s denominator** as the source of "20 relevant
+completed PR runs" from SPEC-135's Implementation Decisions. This ticket
+never collects a real count; a later ticket that finds a better source
+should change this constant deliberately, in one place, rather than
+re-deriving the burn-in gate elsewhere.
+
+**No real VibeFileSync baseline data was created or written by this
+ticket.** All tests exercise disposable temp directories only.

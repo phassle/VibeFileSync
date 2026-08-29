@@ -358,6 +358,62 @@ incoherent portfolio.
 See `shared/references/portfolio-reconciliation.md` for the full rationale
 and the deterministic core's test coverage for each rule above.
 
+## Stage 8: Establish measurement readiness
+
+Once every flow entering the approved portfolio has a safe Execution
+Profile, compute how ready this repository actually is to measure whether
+the pilot improves anything. This stage never invents a number and never
+treats missing evidence as zero.
+
+1. **Load or start the Baseline Plan.** Call
+   `shared/scripts/baseline-plan.mjs`'s `resumeBaselinePlan(repoRoot)`.
+   This reads only `qa/baseline-plan.yaml` from the repository — nothing
+   else, no prior conversation state — so measurement can span days: a
+   plan started on day one and resumed on day fifteen produces the same
+   result a single continuous session would. If no plan exists yet, this
+   is a normal starting point, not an error.
+2. **Name the six required baselines and their exact collection method.**
+   Named-flow coverage, escaped regressions, comparable PR-check p95
+   duration, false-positive/flaky failure rate, active human maintenance
+   time, and repair decisions accepted unchanged/edited/rejected. For each,
+   work out with the QA Owner and Technical Owner the exact query,
+   collection interval, and source system — this is required on every
+   metric even before any evidence exists; a baseline with no stated
+   collection method is not a metric `baseline-plan.mjs` will accept.
+3. **Record each baseline's current evidence honestly, one state at a
+   time.** For each metric, the only three states a numerator or
+   denominator may hold are `unknownQuantity()` (no evidence yet),
+   `notApplicableQuantity(reason)` (this baseline genuinely does not apply
+   here — e.g. repair decisions for a capability that has not shipped
+   yet — always with a real, stated reason), or `knownQuantity(value)` (an
+   actual measured number, where a measured zero is exactly as ordinary as
+   any other number). **Never write a number you have not actually
+   measured, and never let a missing denominator read as a zero
+   numerator.** If in doubt whether something is genuinely known, it is
+   `unknown`.
+4. **Build and validate the plan; let readiness fall out of the evidence.**
+   Call `buildBaselinePlan({...}, { now })`. It has no `readiness`
+   parameter — readiness is always `computeReadiness`'s own answer, never
+   something asserted. If any required baseline is still
+   `measurement-required`, or the 14-calendar-day / 20-relevant-PR-run
+   burn-in gate has not cleared yet, the plan's readiness is
+   `measurement-required`.
+5. **On `measurement-required`, stop here — do not force a Setup Review
+   Packet forward.** Present the plan plainly: which baselines are
+   evidenced, which are `not-applicable` (and why), which are still
+   missing and what their collection method will be once data exists.
+   Write `qa/baseline-plan.yaml` via `saveBaselinePlanToRepo` so a later
+   invocation can resume from exactly this point. This is the expected,
+   normal outcome for a first pass — never something to explain away by
+   estimating a plausible-looking number instead.
+6. **Only on `ready`, treat measurement as established** and carry the
+   Baseline Plan forward into stage 10's Setup Review Packet alongside the
+   Execution Profiles and CI proposal.
+
+See `shared/references/baseline-plan.md` for the full rationale, the
+Quantity type's three states, and the deterministic core's test coverage
+for each rule above.
+
 ## Stages not yet built (placeholders for later tickets)
 
 Each numbered stage below is a placeholder. Do not invent its content here;
@@ -365,7 +421,6 @@ implement it in the ticket that owns it.
 
 7. **Define safe execution (Execution Profiles, Capability Gate)** — placeholder,
    same scope.
-8. **Establish measurement readiness (Baseline Plan)** — placeholder, same scope.
 9. **Design CI last (provider-native proposal)** — placeholder, same scope.
 10. **Review once, then emit (Setup Review Packet, dual approval)** — placeholder,
     same scope.
