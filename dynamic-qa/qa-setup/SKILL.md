@@ -6,12 +6,14 @@ metadata:
   version: "{{BUNDLE_VERSION}}"
 ---
 
-STATUS: stages 1–2 built (ticket #162: authority and sourced inventory).
-Stages 3–10 remain placeholders for later tickets (#163 onward) — do not
-invent their content here. See `dynamic-qa/DESIGN-dynamic-qa-spec.md
-## 6. qa-setup SKILL.md outline` (run notes) for the full target workflow this
-file will grow into, and `dynamic-qa/shared/references/authority-and-inventory.md`
-for the detailed rationale behind stages 1–2 below.
+STATUS: stages 1–3 built (ticket #162: authority and sourced inventory;
+ticket #163: posture-specific evidence). Stages 4–10 remain placeholders for
+later tickets — do not invent their content here. See
+`dynamic-qa/DESIGN-dynamic-qa-spec.md ## 6. qa-setup SKILL.md outline` (run
+notes) for the full target workflow this file will grow into,
+`dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2, and
+`dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3
+below.
 
 ## Explicit invocation only
 
@@ -144,13 +146,75 @@ See `shared/references/authority-and-inventory.md` for the detailed
 breakdown of every fact category and how secret names are handled without
 ever reading a value.
 
+## Stage 3: Enter through posture-specific evidence
+
+Brownfield and greenfield need opposite defaults for the same question —
+"what should this flow do?" — because one has a running application to
+observe and the other does not. This stage exists so the two never get
+conflated: an observed bug must never quietly become tomorrow's contract,
+and a not-yet-built flow must never get an invented one.
+
+1. **Establish posture explicitly, before anything else in this stage.**
+   Ask the QA Owner (or, for harness/CI-flavoured questions, the Technical
+   Owner) directly: is this repository brownfield (the application exists)
+   or greenfield (it does not yet)? Classify the answer's source
+   (`qa-owner-declaration` or `technical-owner-declaration`) and evaluate it
+   with `shared/scripts/posture.mjs`'s `evaluatePostureDeclaration`. Do
+   **not** decide posture yourself from what stage 2's inventory or
+   `posture.repositoryShapeSignal` shows — that signal exists only to give
+   the human something concrete to react to ("discovery found substantial
+   application code — does 'greenfield' still sound right?"), never to
+   settle the question on your own. Anything other than an explicit
+   declaration — inferring it from repository shape, assuming a default, or
+   a source this skill doesn't recognize — stops immediately with reason
+   `posture-not-explicit` (or `unrecognized-posture-source` /
+   `unrecognized-posture`). Nothing past this point runs until posture is
+   settled.
+2. **Brownfield: gather observations, then ask before any of them count.**
+   For each behaviour discovery finds worth surfacing, construct it with
+   `posture.makeObservationFact` — it always starts `unconfirmed`. Present
+   each observation to the QA Owner (bringing in a scoped Domain Expert from
+   stage 1 only for the specific question their knowledge answers, never as
+   the one who decides) and ask plainly: is this intended, or is it a bug?
+   Record the answer with `posture.confirmIntent`, which requires the
+   confirming identity to be the QA Owner or Technical Owner —
+   **never** the Domain Expert, even if the Domain Expert is the one who
+   explained what the behaviour actually does. An observation that stays
+   `unconfirmed`, or that the accountable human confirms as
+   `not-intended` (a bug), must never be treated as if it were a candidate
+   Expected Outcome later — `posture.canBecomeExpectedOutcome` is `false`
+   for both, and only `true` once confirmed `intended` by the right
+   identity. Do not soften this into "probably fine" or a lighter tolerance
+   instead of an explicit question; an unresolved observation is a stage-3
+   blocker to carry forward, not a shortcut to fill in.
+3. **Greenfield: work only from approved tickets and examples.** With no
+   running application to observe, ask the QA Owner which already-approved
+   ticket(s) or worked example(s) describe each candidate flow's intended
+   behaviour, and record each as a source (`type`, `reference`,
+   `approvedBy`, `approvedByRole`) for
+   `shared/scripts/posture.mjs`'s `requireApprovedGreenfieldEvidence`. A
+   flow with no valid approved source stays blocked for this stage — do not
+   invent plausible-sounding behaviour to fill the gap, and do not accept a
+   Domain Expert's description alone as the approving authority
+   (`approvedByRole` must be the QA Owner or Technical Owner). Use
+   `posture.buildGreenfieldFact` to record the result: `reported`,
+   citing the approved source, once one exists; `unknown` — not a guess —
+   otherwise.
+4. **Carry every posture-3 blocker forward, do not paper over it.**
+   Disagreement about intent, an observation nobody will confirm either way,
+   or a greenfield flow with no approved source all become exact blockers on
+   that flow going into stage 4's ranking — never a weaker Expected Outcome,
+   a widened tolerance, or a flow silently dropped from consideration.
+
+See `shared/references/posture-specific-evidence.md` for the full rationale,
+the exact shape of `brownfield-observation` and `greenfield-source` facts,
+and the deterministic core's test coverage for each rule above.
+
 ## Stages not yet built (placeholders for later tickets)
 
 Each numbered stage below is a placeholder. Do not invent its content here;
 implement it in the ticket that owns it.
 
-3. **Enter through posture-specific evidence (brownfield/greenfield)** — placeholder,
-   same scope.
 4. **Rank candidate flows** — placeholder, same scope.
 5. **Interview one flow at a time** — placeholder, same scope.
 6. **Reconcile the portfolio** — placeholder, same scope.

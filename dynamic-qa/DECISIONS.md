@@ -151,3 +151,61 @@ Restated from the parent spec for anyone reading this file in isolation: exactly
 `qa-setup` and `qa-generate` are built. Repair is an explicit mode of
 `qa-generate` (`qa-generate repair --evidence ...`); no `qa-heal` directory exists
 anywhere in this build source, and none should be added.
+
+## 9. Posture-specific evidence (#163)
+
+**Extended #162's Fact shape, did not fork it.** Stage 3 needed two new
+things a plain `observed`/`reported`/`unknown` Fact cannot express: (a) that
+a brownfield observation is evidence, never intended behaviour, until an
+accountable human says otherwise, and (b) that greenfield evidence must
+trace to an approved ticket or example. Both landed as an extension of
+`fact.mjs` rather than a parallel evidence system:
+
+- Two new categories: `brownfield-observation` and `greenfield-source`.
+- One new dimension, exclusive to `brownfield-observation`: `intentStatus`
+  (`unconfirmed` | `confirmed-intended` | `confirmed-not-intended`), plus
+  `confirmedBy`/`confirmedByRole` once it leaves `unconfirmed`. Every other
+  category is still forbidden from carrying these fields — `makeFact` and
+  `validateFact` both fail closed on the combination, the same posture as
+  the pre-existing secret-value checks.
+
+**The only legal path off `unconfirmed` runs through `posture.mjs`'s
+`confirmIntent`.** `makeObservationFact` refuses to construct a
+pre-confirmed observation (no back door around the interview), and
+`confirmIntent` requires a `qa-owner`/`technical-owner` identity —
+never `domain-expert`. `canBecomeExpectedOutcome(fact)` is the single choke
+point stage 5 (a later ticket) must call before letting an observation
+become a Flow contract's Expected Outcome; it is false for `unconfirmed`
+*and* for `confirmed-not-intended` — an explicitly confirmed bug must never
+qualify either, only `confirmed-intended` does.
+
+**Posture is an explicit declaration, never a repository-shape guess.**
+`posture.mjs`'s `evaluatePostureDeclaration` mirrors `authority.mjs`'s
+explicit-invocation gate: it accepts only `qa-owner-declaration` /
+`technical-owner-declaration` as a `source`, and fails closed
+(`posture-not-explicit`) on `inferred-from-repository-shape` or
+`assumed-default`. `repositoryShapeSignal` (read-only, via `repo-walk.mjs`)
+exists purely to inform the human answering the question — it is
+deliberately never accepted as a `source` value itself.
+
+**Greenfield evidence requires an approved source or stays `unknown`.**
+`requireApprovedGreenfieldEvidence` is a hard stop when no source, or only
+invalid sources, are offered. `buildGreenfieldFact` returns a `reported`
+fact (citing the approved ticket/example as evidence) only once a valid
+source exists, and `unknown` — never a filled-in assumption — otherwise.
+
+**Domain Expert scoping (AC3) reuses #162, not new code.**
+`authority.validateAuthorityRecord` already rejects an unscoped Domain
+Expert entry; this ticket's `confirmIntent`/`validateGreenfieldSource` add
+the second half — a Domain Expert can never be the *identity* that confirms
+intent or approves a greenfield source, only `qa-owner`/`technical-owner`
+can. Together these mean a Domain Expert's participation is bounded both by
+scope (which flows they may speak to) and by role (they can never act as
+the accountable decision-maker).
+
+**Seam left for #164 (stage 4, ranking candidate flows).** Stage 4 is
+expected to read `Fact[]` — including `brownfield-observation` facts with
+`intentStatus: "confirmed-intended"` and `greenfield-source` facts — as
+input to risk/value ranking. Nothing in this ticket writes a ranking or
+scoring function; `canBecomeExpectedOutcome` and `buildGreenfieldFact`'s
+provenance are the seam #164 should read, not reimplement.

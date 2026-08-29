@@ -1,0 +1,10 @@
+# Models stage 3's greenfield path: posture declared explicitly, then a
+# stop when a candidate flow has no approved ticket or example to work
+# from. No write step appears anywhere — stage 3 only ever asks and reports.
+ask|posture-source|How did you determine this repository's posture?
+answer|posture-source|qa-owner-declaration
+ask|posture-value|Is this repository brownfield or greenfield?
+answer|posture-value|greenfield
+ask|checkout-flow-evidence|Which approved ticket or example describes the intended behaviour of the checkout flow?
+answer|checkout-evidence|none-available
+stop|greenfield-blocked-no-approved-source
