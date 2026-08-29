@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-quarantine-v1.schema.json",
+  "title": "dynamic-qa Quarantine Record v1",
+  "description": "The Quarantine Record DESIGN-dynamic-qa-spec.md §5.6 and §12 describe: 'an explicit, expiring policy overlay' that 'leaves base Flow State, Freshness, and Enforcement State visible, routes the Binding to a named advisory lane, and blocks qualification.' Ticket #161. This document is the human-readable contract only — no JSON Schema validator dependency is added, matching every other schema in this bundle. The actual hand-written, fail-closed validation (including the business rules a plain schema cannot express, such as 'expiresAt must be after startAt' or 'both approval gates must be present') lives in shared/scripts/quarantine.mjs. A Quarantine Record is an OVERLAY: it never redeclares and structurally cannot write flowState, bindingFreshness, or enforcementState (see lifecycle-state.mjs, ticket #157) — none of those keys is even a legal member of this object (additionalProperties: false).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "quarantineId",
+    "flowId",
+    "bindingId",
+    "diagnosisId",
+    "originatingFailureRef",
+    "owner",
+    "failureClass",
+    "trackedIssue",
+    "acceptedRisk",
+    "approvals",
+    "startAt",
+    "expiresAt",
+    "accountableOwner",
+    "effectiveLane",
+    "evidence"
+  ],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-quarantine-v1",
+      "description": "Immutable. Any other value is an unsupported-schema-version error, never a silent upgrade."
+    },
+    "quarantineId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identifier for this Quarantine Record, distinct from the Diagnosis Record it attaches to."
+    },
+    "flowId": { "type": "string", "minLength": 1 },
+    "bindingId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The exact Binding the exception applies to. Quarantine is scoped to a named Binding, never a whole portfolio or an unnamed set of tests."
+    },
+    "diagnosisId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Diagnosis Record (#158) this quarantine attaches to — quarantine follows a diagnosed failure, it never precedes or replaces one."
+    },
+    "originatingFailureRef": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Reference identifier for the originating Failure Evidence Bundle (#159 owns that schema; this field is only a stable pointer into it, never a copy of its content)."
+    },
+    "owner": {
+      "type": "string",
+      "enum": ["product", "binding", "environment", "unresolved"],
+      "description": "Reuses diagnosis.mjs's Failure Owner enum verbatim — never redeclared."
+    },
+    "failureClass": {
+      "type": "string",
+      "enum": ["product-regression", "binding-defect", "environment-failure", "test-flake", "unclassified-failure"],
+      "description": "Reuses diagnosis.mjs's derived Failure Class enum verbatim — never redeclared."
+    },
+    "trackedIssue": {
+      "type": "string",
+      "pattern": "^https?://\\S+$",
+      "description": "A stable http(s) URI to the tracked issue accepting this risk. Required — quarantine is never untracked."
+    },
+    "acceptedRisk": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable statement of the risk being knowingly accepted while this Binding is quarantined."
+    },
+    "approvals": {
+      "type": "object",
+      "description": "Reuses authority.mjs's qaOwnerGate/technicalOwnerGate shape verbatim. BOTH gates must be present — a single combined 'approved' field is rejected exactly as it is in the Setup Review Packet and Repair Review Packet.",
+      "additionalProperties": false,
+      "required": ["qaOwnerGate", "technicalOwnerGate"],
+      "properties": {
+        "qaOwnerGate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["present", "identifier"],
+          "properties": { "present": { "const": true }, "identifier": { "type": "string", "minLength": 1 } }
+        },
+        "technicalOwnerGate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["present", "identifier"],
+          "properties": { "present": { "const": true }, "identifier": { "type": "string", "minLength": 1 } }
+        }
+      }
+    },
+    "startAt": { "type": "string", "format": "date-time" },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Must be strictly after startAt. Defaults to startAt + 7 days when a caller does not supply one (createQuarantineRecord's job); once written, a record always carries an explicit value — nothing here reads an absent expiresAt as 'never expires'."
+    },
+    "accountableOwner": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The named human accountable for this exception (DESIGN-dynamic-qa-spec.md §8: 'the QA Owner owns... quarantine')."
+    },
+    "effectiveLane": {
+      "const": "advisory",
+      "description": "The requested effective lane while quarantined. Always 'advisory', never 'required' — quarantine can only ever loosen a Binding's own CI gating for itself, and can never write provenance.mjs's real enforcementLane field."
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Immutable at creation. No function in quarantine.mjs edits an existing record's evidence list — only createQuarantineRecord ever produces one, and it freezes both the array and every entry."
+    }
+  }
+}
