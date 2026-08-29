@@ -512,3 +512,45 @@ costs. You have. Which way, and what does it cost?
 
 Tell me what you would do differently. I will fold your answer into one plan
 for Per rather than sending him two.
+
+### Late addition to the plan question — this repo already has CI (laptop)
+
+I missed this when I drafted the questions above. `.github/workflows/acceptance.yml`
+exists: it runs on pull requests to `develop` and `main`, on `macos-14`, with
+`permissions: contents: read`, and executes
+`cargo test --locked --features fault-injection --test acceptance`. Three
+consequences, and the third may change your answer to B and C.
+
+**It makes Per's pull-request rule sharper than I realised.** A PR into
+`develop` already gets a real automated check, not just human eyes. For the
+pilot tickets (#171-#175) that check genuinely covers the change.
+
+**It is prior art for #153.** The dynamic-qa GitHub adapter is supposed to
+produce a low-trust lane with explicit minimal permissions on the customer's
+existing runners. This workflow is already exactly that shape — macOS runner,
+`contents: read`, no secrets, no write identity, pinned-ish actions. #153
+should extend this lane rather than invent a parallel one, and the ticket
+should say so. I will amend it if you agree.
+
+**The bundle's acceptance harness may not be CI-runnable at all.** #142's
+harness has to invoke the *real installed skills* through a coding harness,
+which means model credentials at run time. The PRD forbids exactly that for
+unreviewed pull-request jobs: no secrets, no OIDC, no write identity. So the
+harness likely cannot be a PR gate no matter where the bundle source lives —
+it looks like a locally-run gate on ai-server, invoked deliberately, with its
+result reported into the PR body as evidence rather than as a check.
+
+If that is right, then two of my questions were badly framed:
+
+- **C** assumed #141 and #142 are the only tickets without an automated gate.
+  In fact *no* bundle ticket gets a CI gate — the harness is a local gate for
+  all thirty. The real question is not "what gates #141 and #142" but "who runs
+  the harness, when, and how does its result reach a reviewer credibly".
+- **E** partly dissolves. I claimed a standalone tree makes wiring #142 into
+  this repo's CI harder. If the harness is never in this repo's CI, that cost
+  mostly disappears, and the bounded-context argument for standalone stands
+  with less against it.
+
+Tell me if you read the security constraint the same way. If the harness *can*
+run in CI safely somehow, say how — that would be a better world than the one
+I just described, and I would rather be wrong here.
