@@ -341,3 +341,58 @@ confirmation, not an open risk.
   `ls ~/.cache/vibesync-sandcastle/` should contain a dir per branch. If it
   is empty while builds are happening, the env is not being passed and
   concurrent pipelines are sharing one cargo lock — say so here.
+
+## 35 new Sandcastle tickets are in your queue (laptop) - read before grabbing one
+
+`/to-tickets` broke #135 into 35 tracer-bullet tickets, #141-#175, all now
+carrying the `Sandcastle` label on Per's instruction. They are sub-issues of
+#135 with native GitHub dependencies. Three things about them change how your
+loop should behave.
+
+**1. Only #141 is actually unblocked. Respect the graph.**
+
+I verified it: querying `issue_dependencies_summary.blocked_by` across
+#141-#175 returns zero open blockers for #141 and nothing else. Every ticket
+body also carries an explicit `## Blocked by` section listing the issue
+numbers, so you can see the edge without the dependencies API. If your poller
+picks by label alone it will start work whose foundations do not exist yet -
+tickets that assume a schema, a harness or an adapter that no one has built.
+Filter the frontier on blockers before you fan out.
+
+**2. The cargo gate is blind on #141-#170, and will report false green.**
+
+Those thirty tickets build the `dynamic-qa` Agent Skills bundle: Markdown,
+YAML and scripts. `cargo fmt`, `cargo clippy` and both `cargo test`
+invocations will pass on a change that touches none of them - and they will
+pass just as happily on an empty or wrong change. A green gate there is not
+evidence of anything.
+
+Only #171-#175, the pilot tickets, touch VibeFileSync's Rust suite and reuse
+`tests/cli.rs::Fixture`; for those the four commands are the right gate and
+each ticket body says so.
+
+For #141-#170 the intended gate is the bundle's own acceptance harness, which
+#142 builds. Until #142 exists there is no automated gate at all for bundle
+work. Do not treat cargo green as a merge criterion on those tickets - either
+wire in the real harness once it exists, or hold them for human review. Each
+of those ticket bodies carries a Verification note saying the same thing, so
+your implementer subagents will see it too.
+
+**3. #141 contains a decision that is Per's, not an agent's.**
+
+The one unblocked ticket asks where the `dynamic-qa` bundle's source tree
+lives - a directory in this repository, or a standalone tree installed into
+the skills directory. The PRD says dynamic-qa is a separate bounded context
+that must not put its terminology into the VibeFileSync glossary or treat
+VibeFileSync ADRs as its architecture decisions. That is an architectural call
+with long consequences, and an agent picking it silently is how a bounded
+context gets violated on day one.
+
+Surface the choice to Per and wait, rather than letting a subagent decide it
+and commit. The rest of #141 - packaging, self-containment, generated shared
+references, content-addressed releases, side-effect-free invocation - is
+ordinary work once the location is settled.
+
+**Suggested order given all that:** finish #140, get Per's answer on the #141
+location question, do #141, then #142 to get a real gate, and only then open
+the fan-out. Before #142 exists, parallelism buys you unverifiable work.
