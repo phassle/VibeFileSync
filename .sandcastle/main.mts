@@ -62,7 +62,16 @@ const TARGET_CACHE_ROOT =
 
 const agent = sandcastle.claudeCode(MODEL, { permissionMode: PERMISSION_MODE });
 
-/** The branch the run started from. Merges land here, diffs are taken against it. */
+/** The branch the run started from. Merges land here, diffs are taken against it.
+ *
+ *  Passed to the prompts as BASE_BRANCH, never as TARGET_BRANCH. TARGET_BRANCH
+ *  and SOURCE_BRANCH are built-in prompt arguments in @ai-hero/sandcastle:
+ *  supplying either through promptArgs throws a PromptError, and the framework
+ *  injects TARGET_BRANCH itself. Its injected value differs by call site --
+ *  sandcastle.run() gets the host branch, but sandbox.run() gets the worktree's
+ *  own branch, so inside the implementer and the reviewer {{TARGET_BRANCH}}
+ *  equals {{BRANCH}} and a diff against it is empty. Hence BASE_BRANCH for
+ *  anything that must name the branch we forked from. */
 const TARGET_BRANCH = execFileSync(
   "git",
   ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -168,7 +177,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
             TASK_ID: issue.id,
             ISSUE_TITLE: issue.title,
             BRANCH: issue.branch,
-            TARGET_BRANCH,
+            BASE_BRANCH: TARGET_BRANCH,
           },
         });
 
@@ -179,7 +188,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
           maxIterations: 1,
           agent,
           promptFile: "./.sandcastle/review-prompt.md",
-          promptArgs: { BRANCH: issue.branch, TARGET_BRANCH },
+          promptArgs: { BRANCH: issue.branch, BASE_BRANCH: TARGET_BRANCH },
         });
 
         return {
@@ -233,7 +242,6 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     agent,
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
-      TARGET_BRANCH,
       BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
       ISSUES: completedIssues.map((i) => `- ${i.id}: ${i.title}`).join("\n"),
     },

@@ -6,7 +6,7 @@ Pull in the issue using `gh issue view {{TASK_ID}}`. If it has a parent PRD, pul
 
 Only work on the issue specified.
 
-Work on branch {{BRANCH}}, which branched from {{TARGET_BRANCH}}. Make commits and run tests.
+Work on branch {{BRANCH}}, which branched from {{BASE_BRANCH}}. Make commits and run tests.
 
 # CONTEXT
 

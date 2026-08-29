@@ -76,6 +76,61 @@ any unattended run. Never enter tokens or credentials yourself.
   does not exist yet because no pipeline has run. Will check it right after the
   first watched run and report back.
 
+## STOP - read before step 8 (laptop, after your steps 1-5 report)
+
+Do not start the first watched run on the config you verified. It would have
+failed on the implementer's very first call, and the typecheck cannot catch it
+because `promptArgs` is just `Record<string, string>`. Pull before you run.
+
+Two real bugs, found by reading `@ai-hero/sandcastle@0.12.0`'s own dist, both
+now fixed on this branch:
+
+1. **`TARGET_BRANCH` is a reserved built-in prompt argument.** `index.js`
+   defines `BUILT_IN_PROMPT_ARG_KEYS = ["SOURCE_BRANCH", "TARGET_BRANCH"]` and
+   calls `validateNoBuiltInArgOverride(userArgs)` at every run site. Passing
+   either through `promptArgs` throws `PromptError: "TARGET_BRANCH" is a
+   built-in prompt argument and cannot be overridden`. The old `main.mts`
+   passed it in all three places (implementer, reviewer, merger), so all three
+   agents would have hard-failed immediately. The original handover's finding 3
+   had the right diagnosis but the wrong fix: the framework already injects it.
+
+2. **The injected value differs by call site, and the useful one is not what
+   the reviewer needs.** `sandcastle.run()` injects
+   `TARGET_BRANCH: currentHostBranch`, but `sandbox.run()` (from
+   `createSandbox`, so the implementer and the reviewer) injects
+   `TARGET_BRANCH: worktreeInfo.branch` - the issue branch itself. So
+   `git diff {{TARGET_BRANCH}}...{{BRANCH}}` in `review-prompt.md` would have
+   diffed a branch against itself and returned nothing. The reviewer would have
+   silently reviewed an empty diff and reported the code clean. That one is
+   worse than the crash, because it looks like success.
+
+Fix applied: the host branch now travels as `BASE_BRANCH`, which is not
+reserved. `implement-prompt.md` and `review-prompt.md` use `{{BASE_BRANCH}}`.
+`merge-prompt.md` keeps `{{TARGET_BRANCH}}` on purpose - the merger runs via
+`sandcastle.run()`, where the injected value is exactly the host branch it
+wants, and it is no longer passed explicitly. `npm run sandcastle:typecheck`
+is clean after the change.
+
+**Your action:** `git pull`, re-run `npm run sandcastle:typecheck`, and when
+the first watched run happens, check the reviewer actually saw a non-empty
+diff (its log should contain real diff hunks, not an empty
+`git diff` block). Report that specifically in step 8's note - it is the
+evidence that bug 2 is really dead.
+
+Also, on the `.env` question: `resolveEnv` in `index.js` reads
+`<repo>/.sandcastle/.env`, then for each key present in that file falls back to
+`process.env[key]` when the file's value is empty, and drops the key entirely
+if both are empty. So keys must exist in the file, and empty values silently
+vanish rather than erroring. And `mergeProviderEnv` throws if the agent
+provider and the sandbox provider declare the same key - not a problem for
+`CARGO_TARGET_DIR`, but worth knowing if a future env var is added in both
+places.
+
+Finally, `CARGO_TARGET_DIR` is confirmed to reach the shell: `noSandbox`
+builds `processEnv = { ...process.env, ...createOptions.env }` and passes it to
+every `spawn`. So the `~/.cache/vibesync-sandcastle/<branch>` check is a
+confirmation, not an open risk.
+
 ## Notes from laptop session
 
 - Branch prepared and pushed as commit `9189923`. `npm run sandcastle:typecheck`
