@@ -69,6 +69,26 @@ test("fail-closed: detects a fixed sleep — Playwright networkidle", () => {
   assert.ok(violations.some((v) => v.pattern === "playwright-networkidle"));
 });
 
+test("fail-closed: detects a fixed sleep — Selenium driver.sleep", () => {
+  const violations = detectFixedSleep("driver.sleep(1000);\n");
+  assert.ok(violations.some((v) => v.pattern === "selenium-driver-sleep"));
+});
+
+test("fail-closed: detects a fixed sleep — WebdriverIO browser.pause", () => {
+  const violations = detectFixedSleep("browser.pause(2000);\n");
+  assert.ok(violations.some((v) => v.pattern === "webdriverio-pause"));
+});
+
+test("fail-closed: detects a fixed sleep — legacy Puppeteer page.waitFor(ms)", () => {
+  const violations = detectFixedSleep("await page.waitFor(1500);\n");
+  assert.ok(violations.some((v) => v.pattern === "puppeteer-legacy-waitfor"));
+});
+
+test("Playwright waitForTimeout is not double-counted as puppeteer-legacy-waitfor", () => {
+  const violations = detectFixedSleep("await page.waitForTimeout(1000);\n");
+  assert.ok(!violations.some((v) => v.pattern === "puppeteer-legacy-waitfor"));
+});
+
 test("fail-closed: detects a stub/placeholder — TODO marker", () => {
   const violations = detectStubOrPlaceholder("// TODO: write the real assertion\n");
   assert.ok(violations.some((v) => v.pattern === "todo-marker"));

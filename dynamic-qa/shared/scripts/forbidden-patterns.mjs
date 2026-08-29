@@ -19,6 +19,12 @@
 //                              adapters target (spec §10's "no
 //                              `networkidle`, no fixed sleeps" reference
 //                              contract), not a guess about intent.
+//                              Extended by #149 with the Selenium
+//                              (`driver.sleep`), WebdriverIO
+//                              (`browser.pause`), and legacy Puppeteer
+//                              (`.waitFor(ms)`) idioms — real browser-test
+//                              fixed-sleep patterns the original set did
+//                              not name.
 //   - `detectStubOrPlaceholder` — TODO/FIXME/"not implemented"/placeholder
 //                              markers, and an assertion that can never
 //                              fail (e.g. `assert(true)`), i.e. code that
@@ -44,6 +50,15 @@ const FIXED_SLEEP_PATTERNS = [
   { name: "cypress-numeric-wait", re: /\bcy\.wait\s*\(\s*\d/ },
   { name: "js-settimeout-as-sleep", re: /setTimeout\s*\(\s*(?:resolve|done|cb|callback)\s*,\s*\d+\s*\)/ },
   { name: "playwright-networkidle", re: /networkidle/ },
+  // Browser-specific additions (#149, SPEC-135 user story 36): each of
+  // these is a real fixed-sleep idiom in a browser test framework that the
+  // patterns above do not catch, either because the call is preceded by a
+  // receiver (`driver.sleep(...)`, ruled out by "generic-sleep-call"'s
+  // negative lookbehind on purpose, since bare `sleep(` is a different,
+  // already-covered idiom) or because the API name itself is distinct.
+  { name: "selenium-driver-sleep", re: /\bdriver\.sleep\s*\(/ },
+  { name: "webdriverio-pause", re: /\bbrowser\.pause\s*\(\s*\d/ },
+  { name: "puppeteer-legacy-waitfor", re: /\.waitFor\s*\(\s*\d/ },
 ];
 
 const STUB_OR_PLACEHOLDER_PATTERNS = [

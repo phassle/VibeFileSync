@@ -821,3 +821,95 @@ the central editor to replace:
   disk should add a thin restricted-YAML parse/render pair the same way
   `flow-definition.mjs` and `flow-yaml.mjs` do for Flow Definitions, rather
   than growing that concern inside `execution-profile.mjs` itself.
+
+## 18. Browser Binding conventions (#149)
+
+**Modules.** `shared/scripts/browser-conventions.mjs`
+(`detectHookConvention`, `validateSelector`, `proposeHook`), +23 Tier 1
+tests in `browser-conventions.test.mjs`. `shared/scripts/forbidden-patterns.mjs`
+gained three browser-specific fixed-sleep patterns (`selenium-driver-sleep`,
+`webdriverio-pause`, `puppeteer-legacy-waitfor`) rather than a second
+detector — #146's `detectFixedSleep` already owns "fixed sleep instead of a
+bounded readiness signal" for every framework; this ticket only filled a gap
+in its pattern set. Reference: `shared/references/browser-bindings.md`.
+
+**Reuse-first, never impose.** `detectHookConvention(files)` counts real
+attribute-assignment uses (`data-cy="..."`, not a bare substring match
+inside a comment) of each of nine known hook attribute names across the
+repository's existing source, and returns the attribute with a strictly
+highest non-zero count. Two or more tied at the top is reported
+`ambiguous: true` rather than guessed at — SPEC-135's "reuse the deliberate
+convention" only holds when the convention is actually unambiguous.
+`proposeHook` then follows whatever `detectHookConvention` found, and falls
+back to `data-testid` only when nothing was detected — the literal name
+`data-testid` is never forced over an equivalent convention already in use.
+
+**A hook is proposed only for a critical or ambiguous point with no stable
+selector already**, per SPEC-135 user story 34 and the ticket's acceptance
+criteria — `proposeHook` returns `proposed: false` for every other point,
+including the reason, so the product is never polluted with a blanket test
+attribute. This is a gate on the caller-supplied `{ critical, ambiguous,
+hasStableSelector }` flags, not a judgment this module makes itself: the
+genuinely generative call — is *this* interaction point actually critical
+or ambiguous — stays in `qa-generate`'s prose, per the run brief's
+"extract the computation, not the judgment."
+
+**Five forbidden selector classes, one named error code each.**
+`validateSelector` rejects, in this checked order so overlaps resolve
+deterministically: `xpath-selector`, `dom-position-selector`,
+`generated-id-selector`, `hashed-class-selector`, and
+`transient-attribute-selector`. A stable role/accessible-name contract
+(`getByRole`, `getByLabel`, `[role=]`, `[aria-label=]`,
+`[aria-labelledby=]`) is always accepted (`kind: "role-or-accessibility"`),
+and a selector targeting a known or caller-supplied hook attribute is
+accepted as `kind: "stable-hook"`. Anything else this module does not
+specifically forbid is accepted as `kind: "unclassified"` — this ticket
+only enumerates what must be refused; it does not attempt to enumerate
+every selector shape that is fine.
+
+**Reference doc and the `qa-generate/SKILL.md` placeholder — integrated by
+the run's central editor, not by this ticket.** Per the run's strict
+coordination rule, this ticket does not touch `qa-generate/SKILL.md` or
+`qa-setup/SKILL.md`. It adds `shared/references/browser-bindings.md` (the
+prose walkthrough above) and reports the exact text for the central editor
+to extend in `qa-generate/SKILL.md`'s generation-mode step 2:
+
+> `2. **Reuse or generate the smallest conforming Binding.** Inspect the`
+> `   existing test layout and framework (from the preflight `harness``
+> `   descriptor) for a deterministic test already proving every Expected`
+> `   Outcome from step 1's `flowData`; adopt it if so. Otherwise author the`
+> `   smallest new Binding file that fits the existing layout's conventions —`
+> `   this is the one genuinely generative part of this workflow, and belongs`
+> `   here in prose, not in the deterministic core. #147 owns the actual`
+> `   adoption-detection heuristics; until then, treat "no obviously matching`
+> `   existing test" as "generate new".`
+
+The central editor should append (not replace) a sentence such as: "When
+the target level is browser, follow
+`dynamic-qa/shared/references/browser-bindings.md` for selector and hook
+conventions — call `detectHookConvention`, `validateSelector`, and
+`proposeHook` from `dynamic-qa/shared/scripts/browser-conventions.mjs`
+rather than choosing selectors freehand."
+
+**Seams left, explicitly, for whichever ticket wires real browser
+generation:**
+- Nothing yet calls `browser-conventions.mjs` from `qa-generate`'s actual
+  generation flow or from `binding-verification.mjs`'s candidate-acceptance
+  gate — this ticket builds the deterministic core only, per the run
+  brief's "implement only your ticket" rule. The natural integration point
+  is step 4 (`verifyCandidateBinding`): a browser candidate's selectors
+  should be extracted and run through `validateSelector` the same way its
+  assertions are run through `checkAssertionCoverage`, and a forbidden
+  selector should reject the candidate exactly like a forbidden pattern
+  does today.
+- Discovering each candidate selector's literal string from a generated
+  test file (so it can be handed to `validateSelector`) is not built here —
+  this module takes already-extracted selector strings and interaction
+  points as input, the same shape of gap #147 flagged for level-inference's
+  `safe`/`observable`/cost derivation.
+- `detectHookConvention`'s known-attribute list (nine common `data-*`
+  names) is a starting set, not exhaustive; a customer with an
+  unrecognized attribute name still gets `validateSelector`'s
+  `options.hookAttribute` escape hatch, but nothing today auto-populates
+  that option from a genuinely novel convention `detectHookConvention`
+  cannot name.
