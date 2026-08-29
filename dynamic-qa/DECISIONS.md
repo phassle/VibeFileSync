@@ -1389,3 +1389,91 @@ measured runtime data justifies it) but nothing here adds one.
   for the placeholder pointer.
 - Action-pin SHAs (`CHECKOUT_ACTION_SHA`, `SETUP_NODE_ACTION_SHA`) need
   re-verification against real upstream tags before first real rollout.
+
+## 25. Flow State, Binding Freshness and Enforcement State (#157)
+
+**Three axes, three existing owners — nothing redeclared.** `Flow State`
+(`draft`/`deferred`/`active`/`retired`) already lives in
+`flow-definition.mjs`'s `FLOW_STATES` (#143); `Binding Freshness`
+(`absent`/`current`/`stale`) is already mechanically derived by
+`drift-gate.mjs`'s `FRESHNESS_STATES` (#148); `Enforcement State`
+(`advisory`/`required`) already lives in `provenance.mjs`'s
+`ENFORCEMENT_LANES` (#146/#153). New module `shared/scripts/lifecycle-
+state.mjs` (43 tests, `lifecycle-state.test.mjs`) re-exports all three
+rather than inventing a fourth copy, and adds only the rules layer: allowed
+Flow State transitions, the nine-requirement Activation checklist,
+brownfield/greenfield enforcement defaults, and Qualifying-Run-based
+promotion. Reference: `shared/references/lifecycle-axes.md`.
+
+**"A failure must never silently rewrite policy" is enforced structurally,
+not by convention.** Each axis has exactly one function that can change it
+(`applyFlowStateChange`, `applyBindingFreshnessReport`,
+`applyEnforcementPromotion`), and each declares a fixed, tiny delta-key set
+(`{to, context}` / `{freshness}` / `{qualifyingRunSummary, approval}`).
+Every one of the three rejects on shape alone — before any transition logic
+runs — when the delta carries a key outside its own set. A real
+test-runner result (`{passed, bindingId, failureReason}`) shares no key
+name with any of the three sets, so it cannot even be constructed as an
+argument that would express a state change to any of them; there is no
+parameter path from "a test failed" into a state change to close off,
+because none exists to begin with. On success each function spreads the
+caller's record and replaces exactly its own key, so the other two axes
+pass through unmodified by construction. There is also no reverse-direction
+function anywhere (no "demote enforcement", no "mark stale") — the
+guarantee is the absence of the function, not a guard sitting in front of
+one.
+
+**Activation: nine requirements, all checked, first-unmet named.**
+`checkActivationRequirements(evidence)` runs all nine of the ticket's named
+requirements unconditionally (approved product behaviour, deterministic
+observability, stable interaction points, isolated data and cleanup,
+enforceable boundaries, a passing Capability Gate, a verified candidate
+Binding, current provenance, both approvals — the last one reusing
+`authority.mjs`'s `qaOwnerGate`/`technicalOwnerGate` shape directly rather
+than a bespoke boolean pair) and reports every unmet one, naming the first
+as the refusal reason. `decideFlowActivation` mirrors #150's
+`activationDecision` shape: no path returns `activate: true` with any
+requirement unmet. Note: DESIGN-dynamic-qa-spec.md §8 restates the same
+requirements at slightly finer granularity (splitting "generated/adopted
+candidate" from "isolated verification" where the ticket's own text
+combines them as "a verified candidate Binding") — not a real conflict, the
+ticket's nine-item list is what is implemented, per the run brief's
+tie-break rule.
+
+**Flow State transitions** follow DESIGN-dynamic-qa-spec.md §8's table
+exactly (`retired` never appears as a `from`, which is the whole terminal
+rule). `active -> deferred` refuses when `suspension.reason` is
+`test-failure`/`flaky`/`slow`/`inconvenient` — suspension is an exceptional
+reviewed decision the flow genuinely cannot run, never a red-suite escape
+hatch. `-> retired` requires `retirement.approvedBy` plus
+`bindingRemoved: true` and `ciEnrollmentRemoved: true` together, and
+returns an `auditRecord` on success — retirement is a reviewed contract
+change, never implicit.
+
+**Brownfield vs. greenfield:** `resolveActivationEnforcementDefault`
+returns `advisory` for `"brownfield"`, `required` for `"greenfield"`, and
+refuses (`enforcementState: null`) on anything else rather than guessing a
+third default.
+
+**Promotion models exactly the ticket's own gate, not the pilot's full
+measurement.** DESIGN-dynamic-qa-spec.md §8's full Burn-in Qualification
+(14 days, 20 Qualifying Runs, five commits, 100 executions, ≤1%
+flake/false-positive, PR-fast p95 budget, continuous safety/provenance
+health, ...) is explicitly the pilot's job (#171-175) — nobody fabricates
+that measurement here. `decidePromotion({ qualifyingRunSummary, approval })`
+requires both `qualifyingCount >= MIN_QUALIFYING_RUNS` (20) and an explicit
+`{ granted: true, approver }`; the parameter shape has no `elapsedDays` or
+`greenStreak` field at all, so neither can promote alone — the exclusion is
+structural, same technique as the cross-axis-write guard above.
+
+**Seams left for #161 and #172:** no on-disk storage/schema wiring (this
+module operates on plain in-memory lifecycle records and evidence a caller
+assembles); no `qa-setup`/`qa-generate` `SKILL.md` wiring (neither file was
+touched, per this ticket's coordination note); the nine activation
+booleans (`capabilityGatePassed`, `provenanceCurrent`, etc.) are entirely
+caller-supplied — wiring them to real `runCapabilityGate` (#150) and
+`evaluateBindingDrift` (#148) results is left to the caller; quarantine and
+Failure Owner/Repeatability are explicitly out of scope (#158's territory)
+and this module's guarantees hold regardless of how #158 eventually
+classifies a failure, because no failure-shaped object can be expressed as
+a delta to any axis to begin with.
