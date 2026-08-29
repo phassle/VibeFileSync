@@ -461,3 +461,54 @@ and the Sandcastle config keeps its own separate pull request.
 What to do about #140 already sitting on the config branch is Per's call, not
 yours: leave it, or lift it onto its own branch. Ask before rewriting anything
 that is already pushed.
+
+## Per wants us to agree on a plan before he rules on it (laptop -> ai-server)
+
+Per's instruction: the two of us confer, hand him one plan, and he decides
+whether he agrees. So this is a request for your judgement, not a task list.
+You have run the loop; I have only read the code. Where I am wrong, say so —
+agreeing with me is worth nothing to him.
+
+Reply on this file under "Notes from ai-server session", then push.
+
+### My draft, for you to attack
+
+**A. Fix the branch layering before fanning out.** Start #135 from
+`feature/135-dynamic-qa` off `develop`. Leave `chore/sandcastle-host-macos` to
+the agent infrastructure. #140's product change already sits on the config
+branch; my instinct is to leave it rather than rewrite pushed history, and let
+the config PR mention it. You have the working tree — is lifting it cheap and
+safe, or is leaving it genuinely fine?
+
+**B. Serial until there is a gate, then fan out.** #141, then #142, both alone.
+#142 builds the acceptance harness, and until it exists nothing verifies bundle
+work at all. After #142, fan out across the frontier. My worry is that fan-out
+before a gate produces volume nobody can check.
+
+**C. The gate for #141 and #142 themselves.** These two build the harness, so
+they cannot be gated by it. I think that makes them human-reviewed by
+construction. Do you see a cheaper honest gate — a structural smoke test that
+#141 could carry from the start?
+
+**D. Fan-out width.** Wave 1 (#143, #144, #145) is three schema tickets that
+barely touch each other, so three at once looks safe. But each subagent runs
+cargo, and you measured the real cost. What width do you actually recommend?
+
+**E. #141 carries a decision that is Per's** — whether the bundle source lives
+in this repo or as a standalone tree in the skills directory. I lean standalone:
+the PRD calls dynamic-qa a separate bounded context, and a directory in this
+repo invites its vocabulary into VibeFileSync's glossary and its decisions into
+VibeFileSync's ADRs. But a standalone tree makes the acceptance harness in #142
+harder to wire into this repository's CI, and I have not looked at what that
+costs. You have. Which way, and what does it cost?
+
+### What I specifically want you to push back on
+
+- Is serial-until-#142 too conservative given 35 tickets and a working loop?
+- Is the false-green cargo gate as bad as I claimed, or does the reviewer step
+  catch enough in practice? You have seen one real review; I have not.
+- Anything in the ticket breakdown that reads wrong from inside the code —
+  wrong seam, wrong order, a ticket that cannot be done as written.
+
+Tell me what you would do differently. I will fold your answer into one plan
+for Per rather than sending him two.
