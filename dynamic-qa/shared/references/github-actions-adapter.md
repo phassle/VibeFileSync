@@ -8,18 +8,22 @@ destabilise an existing merge gate.
 
 ## Modules
 
-- `shared/scripts/github-actions-workflow.mjs` — pure renderer
-  (`renderAdvisoryPullRequestLane`) plus a reusable hardening detector
-  (`checkWorkflowHardening`) that names, individually, any missing/violated
-  hardening property in arbitrary rendered/mutated workflow YAML text.
+- `shared/scripts/github-actions-workflow.mjs` — pure renderers
+  (`renderAdvisoryPullRequestLane`, and #154's `renderNightlyFullSuiteLane`,
+  `renderManualTriggerLane`, `renderMergeGroupLane`) plus a reusable
+  hardening detector (`checkWorkflowHardening(yaml, { lane, trigger })`)
+  that names, individually, any missing/violated hardening property in
+  arbitrary rendered/mutated workflow YAML text, lane- and trigger-aware.
 - `shared/scripts/github-actions-adapter.mjs` — the seven-point
   provider-adapter contract: detection (`detectProviderConfiguration`),
   capability evidence shaping (`deriveCapabilityEvidence`), planning
-  (`planAdvisoryPullRequestLane`, which composes the Capability Gate with
-  the renderer and never renders while a blocker is open), the supported
-  trigger list (`SUPPORTED_TRIGGERS`), run-reference resolution
-  (`resolveRunReference`), and post-render profile enforcement
-  (`checkGeneratedConfigEnforcesProfile`).
+  (`planAdvisoryPullRequestLane` plus #154's `planNightlyFullSuiteLane`,
+  `planManualTriggerLane`, `planMergeGroupLane`, all of which compose the
+  Capability Gate with their renderer and never render while a blocker is
+  open), the supported trigger list (`SUPPORTED_TRIGGERS`, now all four),
+  run-reference resolution (`resolveRunReference`), post-render profile
+  enforcement (`checkGeneratedConfigEnforcesProfile`), and #154's trust
+  classification (`classifyLaneContentSource`, `checkLaneTrustInvariant`).
 - `shared/scripts/junit-report.mjs` — a restricted-subset JUnit XML reader
   (no third-party dependency), used by:
   - `shared/scripts/github-actions-annotations-cli.mjs` — native GitHub
@@ -70,9 +74,10 @@ without measured runtime evidence.
 
 - **Nightly full suite, manual/provider-API trigger, merge-group trigger**
   (DESIGN-dynamic-qa-spec.md §8's other three Provider-native CI exposures)
-  are NOT built by this ticket — `SUPPORTED_TRIGGERS` names only
-  `pull_request`; `DEFERRED_TRIGGERS` names the other three explicitly as an
-  open seam, not silently folded into the PR lane.
+  are now built (#154) — `SUPPORTED_TRIGGERS` names all four; `DEFERRED_TRIGGERS`
+  is empty. See `shared/references/ci-lanes.md` for the per-lane prose (gating
+  semantics, the trust-asymmetry classification, and the manual trigger's
+  no-inputs guarantee).
 - **Impact-path-based Binding selection** ("a pull request runs only the
   Bindings relevant to the change") is NOT implemented here — this
   renderer's `testCommand` is a precomputed, already-scoped command string a
@@ -84,10 +89,12 @@ without measured runtime evidence.
   deliberately scoped to dynamic-qa's own schemas, not arbitrary
   third-party GitHub Actions YAML.
 - **Required-lane and quarantine-lane rendering** (adapter contract point 3
-  names all three: advisory, required, quarantine) are NOT built by this
-  ticket — only `renderAdvisoryPullRequestLane` exists. A later ticket
-  should add sibling renderers reusing the same hardening detector rather
-  than duplicating it.
+  names all three: advisory, required, quarantine). #154 added one REQUIRED
+  renderer (`renderMergeGroupLane`, since a merge-group trigger's entire
+  purpose is to gate the queue) reusing the same hardening detector via a
+  new `lane: "required"` option; a PR lane graduating from advisory to
+  required after burn-in, and quarantine-lane rendering, remain open for a
+  later ticket.
 - **Action-pin freshness**: `CHECKOUT_ACTION_SHA` / `SETUP_NODE_ACTION_SHA`
   in `github-actions-workflow.mjs` are placeholders shaped as real 40-hex
   commit SHAs (the deterministic core has zero network access and cannot

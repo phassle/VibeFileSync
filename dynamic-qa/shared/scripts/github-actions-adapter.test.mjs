@@ -14,10 +14,16 @@ import {
   deriveCapabilityEvidence,
   checkNodeRuntimeCapabilityDeclared,
   planAdvisoryPullRequestLane,
+  planNightlyFullSuiteLane,
+  planManualTriggerLane,
+  planMergeGroupLane,
+  classifyLaneContentSource,
+  checkLaneTrustInvariant,
   resolveRunReference,
   checkGeneratedConfigEnforcesProfile,
   NODE_RUNTIME_CAPABILITY,
   SUPPORTED_TRIGGERS,
+  DEFERRED_TRIGGERS,
   PROVIDER_IDENTITY,
 } from "./github-actions-adapter.mjs";
 import { checkWorkflowHardening } from "./github-actions-workflow.mjs";
@@ -73,10 +79,11 @@ test("detectProviderConfiguration detects an already-present dynamic-qa workflow
   assert.equal(result.hasDynamicQaWorkflow, true);
 });
 
-// --- point 4: only the safe trigger is built this ticket -------------------
+// --- point 4: #154 completes the trigger set --------------------------------
 
-test("only pull_request is a supported trigger this ticket built", () => {
-  assert.deepEqual([...SUPPORTED_TRIGGERS], ["pull_request"]);
+test("all four Provider-native CI triggers are supported after #154; nothing remains deferred", () => {
+  assert.deepEqual([...SUPPORTED_TRIGGERS], ["pull_request", "schedule", "workflow_dispatch", "merge_group"]);
+  assert.deepEqual([...DEFERRED_TRIGGERS], []);
 });
 
 // --- the Node-runtime caveat: Safety Blocker + deferral, never a skip -----
@@ -203,4 +210,162 @@ test("resolveRunReference is a pure function of its input, requiring no real Git
   const ref1 = resolveRunReference({});
   assert.equal(ref1.repository, undefined);
   assert.equal(ref1.workflow.url, undefined);
+});
+
+// --- #154: the three completing lanes --------------------------------------
+
+function environmentEvidenceFor(profile, { nodeRuntimeAvailable = true } = {}) {
+  return deriveCapabilityEvidence({
+    runnerClass: RUNNER_CLASS,
+    enforcedRead: profile.paths.allowedRead,
+    enforcedWrite: profile.paths.allowedWrite,
+    enforcedCommands: profile.commands.allowed,
+    enforcedBoundaryIds: profile.effects.allowedBoundaryIds,
+    resources: profile.resources,
+    nodeRuntimeAvailable,
+  });
+}
+
+test("planNightlyFullSuiteLane renders a hardened, advisory (continue-on-error) nightly workflow once every capability is evidenced", () => {
+  const profile = fullProfile();
+  const result = planNightlyFullSuiteLane({
+    profile,
+    environmentEvidence: environmentEvidenceFor(profile),
+    workflowConfig: workflowConfig(),
+  });
+  assert.equal(result.rendered, true, JSON.stringify(result));
+  assert.equal(result.state, "activatable");
+  assert.equal(result.path, ".github/workflows/dynamic-qa-nightly.yml");
+  assert.match(result.yaml, /^\s*schedule:/m);
+  assert.match(result.yaml, /continue-on-error:\s*true/);
+  assert.equal(checkWorkflowHardening(result.yaml, { lane: "advisory", trigger: "schedule" }).valid, true);
+});
+
+test("planNightlyFullSuiteLane defers (never skips) when the Node-runtime capability is unmet, exactly like the PR lane", () => {
+  const profile = fullProfile();
+  const result = planNightlyFullSuiteLane({
+    profile,
+    environmentEvidence: environmentEvidenceFor(profile, { nodeRuntimeAvailable: false }),
+    workflowConfig: workflowConfig(),
+  });
+  assert.equal(result.rendered, false);
+  assert.equal(result.state, "deferred");
+  assert.ok(result.blockers.some((b) => b.capability === NODE_RUNTIME_CAPABILITY));
+});
+
+test("planManualTriggerLane renders a hardened, advisory, zero-input workflow_dispatch lane", () => {
+  const profile = fullProfile();
+  const result = planManualTriggerLane({
+    profile,
+    environmentEvidence: environmentEvidenceFor(profile),
+    workflowConfig: workflowConfig(),
+  });
+  assert.equal(result.rendered, true, JSON.stringify(result));
+  assert.match(result.yaml, /^\s*workflow_dispatch:\s*\{\}/m);
+  assert.ok(!result.yaml.includes("inputs:"));
+  assert.equal(checkWorkflowHardening(result.yaml, { lane: "advisory", trigger: "workflow_dispatch" }).valid, true);
+});
+
+test("planManualTriggerLane's rendered lane fails enforcement if inputs are mutated in (proving the check is real, not decorative)", () => {
+  const profile = fullProfile();
+  const result = planManualTriggerLane({
+    profile,
+    environmentEvidence: environmentEvidenceFor(profile),
+    workflowConfig: workflowConfig(),
+  });
+  const mutated = result.yaml.replace("workflow_dispatch: {}", "workflow_dispatch:\n    inputs:\n      testCommand:\n        required: false");
+  const enforcement = checkGeneratedConfigEnforcesProfile(profile, mutated, { lane: "advisory", trigger: "workflow_dispatch" });
+  assert.equal(enforcement.valid, false);
+  assert.ok(enforcement.errors.some((e) => e.code === "dispatch.inputs-not-permitted"));
+});
+
+test("planMergeGroupLane renders a REQUIRED lane (no continue-on-error) that keeps required checks gating queued merges", () => {
+  const profile = fullProfile();
+  const result = planMergeGroupLane({
+    profile,
+    environmentEvidence: environmentEvidenceFor(profile),
+    workflowConfig: workflowConfig(),
+  });
+  assert.equal(result.rendered, true, JSON.stringify(result));
+  assert.equal(result.path, ".github/workflows/dynamic-qa-merge-group.yml");
+  assert.match(result.yaml, /^\s*merge_group:/m);
+  assert.ok(!/continue-on-error:\s*true/.test(result.yaml), "a required merge-group lane must not mask its own failure");
+  assert.equal(checkWorkflowHardening(result.yaml, { lane: "required", trigger: "merge_group" }).valid, true);
+});
+
+test("planMergeGroupLane defers (never skips) when the Node-runtime capability is unmet, exactly like every other lane", () => {
+  const profile = fullProfile();
+  const result = planMergeGroupLane({
+    profile,
+    environmentEvidence: environmentEvidenceFor(profile, { nodeRuntimeAvailable: false }),
+    workflowConfig: workflowConfig(),
+  });
+  assert.equal(result.rendered, false);
+  assert.equal(result.state, "deferred");
+  assert.ok(result.blockers.some((b) => b.capability === NODE_RUNTIME_CAPABILITY));
+});
+
+test("every lane's renderer still uses minimal permissions, SHA-pinned actions, and no secrets/OIDC/write/cache/self-hosted (hardening does not weaken for the new lanes)", () => {
+  const profile = fullProfile();
+  const evidence = environmentEvidenceFor(profile);
+  const cfg = workflowConfig();
+  for (const [plan, lane, trigger] of [
+    [planNightlyFullSuiteLane, "advisory", "schedule"],
+    [planManualTriggerLane, "advisory", "workflow_dispatch"],
+    [planMergeGroupLane, "required", "merge_group"],
+  ]) {
+    const result = plan({ profile, environmentEvidence: evidence, workflowConfig: cfg });
+    assert.equal(result.rendered, true, JSON.stringify(result));
+    const hardening = checkWorkflowHardening(result.yaml, { lane, trigger });
+    assert.equal(hardening.valid, true, JSON.stringify(hardening.errors));
+    assert.ok(!result.yaml.includes("secrets."));
+    assert.ok(!/id-token:\s*write/.test(result.yaml));
+    assert.ok(!/runs-on:\s*self-hosted/.test(result.yaml));
+  }
+});
+
+// --- #154: the trust asymmetry, modeled via trust-zones.mjs, not copied ---
+
+test("classifyLaneContentSource treats nightly and merge-group as reviewed-base-branch (trusted), and pull_request/workflow_dispatch as branch (untrusted)", () => {
+  assert.equal(classifyLaneContentSource("schedule"), "reviewed-base-branch");
+  assert.equal(classifyLaneContentSource("merge_group"), "reviewed-base-branch");
+  assert.equal(classifyLaneContentSource("pull_request"), "branch");
+  assert.equal(classifyLaneContentSource("workflow_dispatch"), "branch");
+});
+
+test("the same permissive identity/paths/network shape is REJECTED for pull_request/workflow_dispatch content but ACCEPTED for schedule/merge_group content — the asymmetry trust-zones.mjs models is real, not decorative", () => {
+  const permissive = {
+    credentials: { scopes: ["contents:write"] },
+    paths: { allowedRead: ["/"], allowedWrite: ["/"] },
+    network: { mode: "open" },
+  };
+
+  const prResult = checkLaneTrustInvariant("pull_request", permissive);
+  assert.equal(prResult.valid, false);
+  assert.ok(prResult.errors.some((e) => e.error === "trust-invariant.untrusted-content-with-privileged-identity"));
+
+  const manualResult = checkLaneTrustInvariant("workflow_dispatch", permissive);
+  assert.equal(manualResult.valid, false);
+
+  const nightlyResult = checkLaneTrustInvariant("schedule", permissive);
+  assert.equal(nightlyResult.valid, true, JSON.stringify(nightlyResult.errors));
+
+  const mergeGroupResult = checkLaneTrustInvariant("merge_group", permissive);
+  assert.equal(mergeGroupResult.valid, true, JSON.stringify(mergeGroupResult.errors));
+});
+
+test("every lane this adapter actually renders satisfies the hard security invariant regardless of its trust classification, because none of them uses the extra room trust would permit", () => {
+  const profile = fullProfile();
+  const evidence = environmentEvidenceFor(profile);
+  const cfg = workflowConfig();
+  const minimalShape = { credentials: {}, paths: { allowedRead: ["/repo"], allowedWrite: [] }, network: { mode: "none" } };
+
+  for (const trigger of ["pull_request", "schedule", "workflow_dispatch", "merge_group"]) {
+    const result = trigger === "schedule" ? planNightlyFullSuiteLane({ profile, environmentEvidence: evidence, workflowConfig: cfg })
+      : trigger === "workflow_dispatch" ? planManualTriggerLane({ profile, environmentEvidence: evidence, workflowConfig: cfg })
+      : trigger === "merge_group" ? planMergeGroupLane({ profile, environmentEvidence: evidence, workflowConfig: cfg })
+      : planAdvisoryPullRequestLane({ profile, environmentEvidence: evidence, workflowConfig: cfg });
+    assert.equal(result.rendered, true, JSON.stringify(result));
+    assert.equal(checkLaneTrustInvariant(trigger, minimalShape).valid, true);
+  }
 });

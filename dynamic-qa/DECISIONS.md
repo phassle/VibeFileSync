@@ -1709,3 +1709,92 @@ Playwright trace/DOM/screenshot capture pipeline feeds this module's
 `shared/references/diagnostics-and-hardening.md`'s closing section for the
 exact placeholder text a later coordinated edit should add to that
 skill's step 5.
+## 23. Nightly, manual and merge-group lanes (#154)
+
+Completes DESIGN-dynamic-qa-spec.md §8's four Provider-native CI exposures:
+#153 built `pull_request`; this ticket adds `schedule` (nightly full suite),
+`workflow_dispatch` (manual/provider trigger), and `merge_group`.
+`SUPPORTED_TRIGGERS` in `github-actions-adapter.mjs` now names all four;
+`DEFERRED_TRIGGERS` is empty.
+
+**Three new renderers in `github-actions-workflow.mjs`**
+(`renderNightlyFullSuiteLane`, `renderManualTriggerLane`,
+`renderMergeGroupLane`) and three matching plan functions in
+`github-actions-adapter.mjs` (`planNightlyFullSuiteLane`,
+`planManualTriggerLane`, `planMergeGroupLane`), each composing the
+Node-runtime declaration check, the Capability Gate, and its own renderer
+exactly like #153's `planAdvisoryPullRequestLane` — no default-open path for
+any of the four lanes. `renderAdvisoryPullRequestLane` itself is untouched
+(additive-only edit, since #155 also edits this file concurrently).
+
+**Gating semantics differ by lane, deliberately.** Nightly and manual stay
+ADVISORY (`continue-on-error: true`) — neither is tied to a merge decision at
+the moment it runs. Merge-group is REQUIRED — it deliberately omits
+`continue-on-error`, because the entire point of a merge-group trigger (spec
+§8, SPEC-135 User Story 68) is that its result gates the merge queue's
+required checks; masking its failure would defeat the lane's reason for
+existing. `checkWorkflowHardening` gained a `lane` option
+(`"advisory"` | `"required"`, default `"advisory"` — unchanged #153
+behaviour) so it can flag BOTH directions: `advisory.not-continue-on-error`
+when an advisory lane is missing it, and the new
+`required.continue-on-error-present` when a required lane wrongly has it.
+The repository operator must still add the merge-group job's name to branch
+protection's required-status-checks list — this adapter renders the workflow,
+it does not reach into repository settings.
+
+**A manual/provider trigger cannot change policy by construction, not
+convention.** `renderManualTriggerLane` emits `workflow_dispatch: {}` with NO
+`inputs:` block at all — there is nothing in the trigger for a coding agent
+or MCP integration to set, so a request cannot influence the command, runner,
+permissions, or identity this renderer already fixed from the Execution
+Profile. `checkWorkflowHardening` gained a `trigger` option and a new
+`dispatch.inputs-not-permitted` check that fires if mutated YAML adds inputs
+back in, and a `trigger.missing-declared-event` check (replacing #153's
+PR-only `trigger.missing-safe-pull-request-event`) generalizes "the expected
+event is actually declared" across all four triggers. `pull_request_target`
+stays forbidden unconditionally, regardless of trigger.
+
+**The trust asymmetry is modeled via `trust-zones.mjs`, not copied blindly.**
+New `classifyLaneContentSource(triggerName)` in `github-actions-adapter.mjs`
+maps `pull_request`/`workflow_dispatch` to `"branch"` (untrusted — a fork PR
+head, or a manual dispatch against a caller-selected ref this adapter cannot
+verify is reviewed) and `schedule`/`merge_group` to `"reviewed-base-branch"`
+(trusted — the default branch tip, or a merge queue's already-individually-
+approved constituent PRs). `checkLaneTrustInvariant` composes this with
+`checkHardSecurityInvariant` (#151, reused). The classification is real, not
+decorative: an identical permissive identity/paths/network shape is accepted
+for `schedule`/`merge_group` content and rejected for `pull_request`/
+`workflow_dispatch` content (tested). The deliberate conclusion, however, is
+that every lane this ticket actually renders keeps the same minimal identity
+(no secrets, no OIDC, no write permission, no privileged cache, no
+self-hosted runner) regardless of trust zone — none of the four lanes has a
+functional need for more than checkout + deterministic test run + JUnit/
+annotations/summary publication. Trust classification says what would be
+PERMITTED; least privilege says none of the extra room is USED.
+
+**`checkGeneratedConfigEnforcesProfile` gained an optional third parameter**
+(`{ lane, trigger }`, both defaulting to #153's original values) so each
+lane's post-render enforcement check runs against its own correct gating and
+trigger expectations. Additive; every existing call site (`profile, yaml`)
+is unaffected.
+
+**Sharding is still not introduced.** All three new renderers keep #153's
+single precomputed `testCommand` seam — nightly's is expected to be the full
+active portfolio rather than an impacted subset, but which string to pass is
+a caller/adapter concern, not this ticket's. No runtime measurement exists
+yet (the pilot, #171-175, has not run), so no matrix strategy is added,
+matching spec §8 / SPEC-135 User Story 70 exactly.
+
+**Documentation:** prose lives in the new `shared/references/ci-lanes.md`
+(per-lane gating rationale, the trust-asymmetry writeup, and a suggested —
+not applied — addition to `qa-generate/SKILL.md`'s step 5 note, since that
+file is #168's territory in this run). `shared/references/
+github-actions-adapter.md` updated to reflect all four triggers now
+supported and one REQUIRED renderer added.
+
+**Left for later tickets:** PR-lane graduation from advisory to required
+after burn-in, and quarantine-lane rendering (adapter contract point 3 names
+all three: advisory, required, quarantine — this ticket adds only the one
+new REQUIRED renderer, for merge-group). Impact-path-based Binding selection,
+full semantic inventory of third-party workflow YAML, and action-pin
+freshness re-verification remain exactly as #153 left them.
