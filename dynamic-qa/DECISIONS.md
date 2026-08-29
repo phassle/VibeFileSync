@@ -687,3 +687,137 @@ in this ticket deletes that record automatically.
   provenance recorded — not as a separate schema-version-string registry.
   A cosmetic reformat of a schema JSON file does not move its digest
   (`contentDigest` canonicalizes key order); a real content change does.
+## 15. Execution Profiles and the Capability Gate (#150)
+
+**Modules.** `shared/scripts/execution-profile.mjs` (fail-closed validator +
+`checkExecutionProfileHonoursBoundaries`) and `shared/scripts/capability-gate.mjs`
+(`runCapabilityGate`, `activationDecision`), +55 Tier 1 tests across
+`execution-profile.test.mjs` and `capability-gate.test.mjs`. Schema:
+`shared/schemas/dynamic-qa-execution-profile-v1.schema.json`. No fixture
+directory was added — every case is exercised through inline JS fixtures in
+the two test files (a plain object mutated per case reads more clearly here
+than a YAML file per case would, and the profile has no restricted-YAML
+authoring surface of its own yet — `qa-setup`'s eventual stage 7 will decide
+whether Execution Profiles are hand-authored YAML like Flow Definitions or
+machine-assembled the way Provenance Manifests are).
+
+**The artifact is deliberately two layers, matching every other schema in
+this bundle.** `execution-profile.mjs` validates that one profile is
+well-formed policy — the eight enforceable categories the ticket names
+(paths, commands, environments, network, identities, effects, resources,
+evidence) are all present and internally consistent. `capability-gate.mjs`
+is a second, independent check: does the *actual environment* prove it can
+enforce what the profile declares? A profile can be schema-valid and still
+fail the gate (e.g. it declares `exact-allowlist` correctly, but the runner
+reports `externallyEnforced: false`). Conflating these two would let a
+well-written profile stand in for evidence that was never collected.
+
+**A missing capability never degrades to a skip — this is structural, not
+convention.** `runCapabilityGate` calls all eight `check*` functions
+unconditionally, in a fixed order, and concatenates every blocker found;
+there is no early return and no code path that omits a category because a
+piece of environment evidence happened to be absent (absence itself
+produces a blocker). `activationDecision(gateResult, extraBlockers)` is the
+only function callers should use to decide whether to activate, and there
+is no code path through it that returns `activate: true` alongside a
+non-empty blocker list — `blockers.length > 0` always short-circuits to
+`{ activate: false, state: "deferred", blockers }`. A Safety Blocker is
+`{ category, capability, message }`: `capability` is always the exact stable
+name of the missing/mismatched thing (`network.egress-externally-enforced`,
+`identities.no-denied-identity-active`, or the profile's own declared
+`evidence.capabilities[].capability` string for provider-adapter evidence),
+never a generic "gate failed".
+
+**Network is the security-invariant category, modelled explicitly rather
+than left as a preference.** `network.mode` defaults to `"none"`; when it is
+`"none"` the schema-shape validator (`assertKnownKeys`) refuses any other
+network key at all, so a profile cannot leave stray allowlist config lying
+around next to a `"none"` declaration. `"exact-allowlist"` requires, all
+simultaneously and all literally `true`/non-empty: a non-empty `allowlist`
+of exact single-host `https://` origins (`classifyOriginRisk` in
+`execution-profile.mjs` — exported for `capability-gate.mjs` to reuse rather
+than re-deriving — classifies each origin as `exact | wildcard | metadata |
+internal | malformed`; anything but `exact` is refused at both the profile
+level and, redundantly, at the capability-gate level as belt-and-braces),
+`dnsRecheck`, `redirectRecheck`, `denyMetadataRange`, `denyInternalRange`,
+`denyPublicRange`, and `externallyEnforced`, plus a named
+`enforcementMechanism`. **`externallyEnforced` is the one field that encodes
+"a permissive hosted runner does not satisfy exact egress" as a fixed
+comparison, not a judgement call**: it must be reported `true` by something
+outside the test process itself (a network policy, egress proxy, or
+firewall); a runner that only relies on the test code's own good behaviour
+reports `false` (or omits the field) and the Capability Gate blocks it with
+`network.egress-externally-enforced`, leaving the flow `deferred`.
+
+**Honourability (explicitly handed to this ticket by #145) reuses
+`resolveBoundaryTreatment` directly, never a fork of the lookup.**
+`checkExecutionProfileHonoursBoundaries(profile, flowBoundaries)` checks two
+directions: every id in `profile.effects.allowedBoundaryIds` must resolve to
+something other than `"forbidden"` against the flow's own declared
+boundaries (an undeclared boundary resolves `"forbidden"` by construction,
+per #145 — a profile that permits it anyway is unhonourable); and every flow
+boundary declared `real` with non-`"none"` side effects must both appear in
+`allowedBoundaryIds` and have the profile itself declare
+`effects.namespace`/`effects.cleanup` — a profile that omits the isolation a
+real-side-effect boundary requires cannot honour it either. This function
+returns the same `{ valid, errors }` shape as every other validator in this
+module; a caller wires its `errors` into `activationDecision`'s
+`extraBlockers` to fold honourability into the same "no open blocker, no
+activation" gate.
+
+**Provenance's `executionProfile.id` (#146) stays an opaque reference by
+design — this ticket does not touch `provenance.mjs` or its schema.** #146
+already requires generation to name a profile by semantic id
+(`preflight.mjs`'s `missing-execution-profile-id` check) and left the
+artifact and its digest to this ticket. `provenance.mjs`'s
+`executionProfile.digest` field is still optional; a later ticket wiring
+`buildBindingRecord`'s caller to also pass
+`contentDigest(validatedExecutionProfileData)` can fill it in without a
+schema change (the provenance schema's `executionProfile` object already
+allows `additionalProperties: true` beyond its required `id`).
+
+**Reference doc and the `qa-setup` SKILL.md placeholder — integrated by the
+run's central editor, not by this ticket.** Per the run's strict
+coordination rule, this ticket does not touch `qa-setup/SKILL.md` or
+`qa-generate/SKILL.md`. It adds
+`shared/references/execution-profiles.md` (the prose walkthrough of the
+schema, the eight-category Capability Gate, the Safety Blocker shape, and
+the network/honourability invariants above) and reports the exact
+placeholder line in `qa-setup/SKILL.md`'s "Stages not yet built" section for
+the central editor to replace:
+
+> `7. **Define safe execution (Execution Profiles, Capability Gate)** —
+> placeholder, same scope.`
+
+**Seams left, explicitly, for #151, #153, #166:**
+- No stage of `qa-setup/SKILL.md` yet calls `validateExecutionProfile`,
+  `checkExecutionProfileHonoursBoundaries`, `runCapabilityGate`, or
+  `activationDecision` — this ticket builds the deterministic core only, per
+  the run brief's "implement only your ticket" rule. Whichever ticket wires
+  `qa-setup`'s stage 7 (safe-execution design) and the activation-approval
+  flow should call these four functions directly rather than reimplementing
+  any of their logic.
+- `preflight.mjs` (#146) still only checks that an Execution Profile ID is a
+  valid semantic ID string — it does not load, validate, or gate the
+  profile itself. A ticket wiring real activation (this looks like #153's
+  territory — Flow State / Enforcement State independence and the
+  activation approvals SPEC-135 story 63 describes) should call
+  `validateExecutionProfile` and `runCapabilityGate` from inside (or
+  alongside) `runGenerationPreflight`, and should treat a non-empty
+  `activationDecision(...).blockers` result exactly like this ticket's
+  other `{ ready: false, reason, issues }` failures — never proceed past an
+  open Safety Blocker.
+- Environment evidence (`capability-gate.mjs`'s second `environment`
+  argument) is entirely caller-supplied here; no ticket yet discovers it
+  from a real sandbox or a real GitHub Actions runner. The provider-adapter
+  contract (SPEC-135 story 100, DESIGN-dynamic-qa-spec.md's "provider
+  adapter... Execution Profile validation") is the natural place to
+  populate it for real, and should shape its adapter output to exactly this
+  module's `environment` parameter shape rather than inventing a second one.
+- No YAML authoring/rendering surface exists yet for
+  `qa/execution-profiles/<profile-id>.yaml` (no `execution-profile-yaml.mjs`
+  mirroring `flow-yaml.mjs`). Tests exercise `validateExecutionProfile`
+  against plain JS objects; a ticket that needs to read/write the file from
+  disk should add a thin restricted-YAML parse/render pair the same way
+  `flow-definition.mjs` and `flow-yaml.mjs` do for Flow Definitions, rather
+  than growing that concern inside `execution-profile.mjs` itself.
