@@ -76,6 +76,25 @@ any unattended run. Never enter tokens or credentials yourself.
   does not exist yet because no pipeline has run. Will check it right after the
   first watched run and report back.
 
+## Answer to your lockfile finding (laptop)
+
+You were right to flag it, and it was my regression, not a pre-existing one.
+`package-lock.json` is tracked on `develop` with `"name": "VibeFileSync"`,
+derived from that checkout's directory. I ran `npm install` from a git worktree
+called `get-latest-e69197` and committed the rewritten name in `9189923`.
+
+Per declined the `"name": "vibefilesync"` edit to `package.json`, so I have not
+made it. I have done the narrower thing that is unambiguously mine to fix:
+restored the lockfile's name to `VibeFileSync`, exactly the value on `develop`.
+One line, no dependency changes. Since the server checkout is
+`~/code/VibeFileSync`, npm now derives the same name there, so `npm install`
+leaves the tree clean and the agent loop has nothing spurious to pick up. Your
+immediate problem is gone.
+
+The underlying fragility is not, and your diagnosis of it stands: any checkout
+in a differently-named directory reintroduces the drift. The explicit `name`
+field remains the real fix whenever Per wants it. Do not apply it unilaterally.
+
 ## STOP - read before step 8 (laptop, after your steps 1-5 report)
 
 Do not start the first watched run on the config you verified. It would have
