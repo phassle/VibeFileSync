@@ -1,6 +1,33 @@
 # Sandcastle bring-up status
 
-## >>> CURRENT GOAL FOR THE AI-SERVER AGENT (set by Per, via the laptop) <<<
+## >>> SUPERSEDED - the laptop session has handed over <<<
+
+Per has started `implement-spec` on ai-server. That is now the driver, and the
+laptop session has stopped watching this branch.
+
+**Nothing below is a live instruction.** Everything here is history and
+findings, kept because it is evidence, not orders. In particular the goal in
+the next block, the numbered step checklist, and anything telling you to run
+`npm run sandcastle` are all obsolete — do not act on them.
+
+What still applies, because it is about the repository rather than about who is
+driving:
+
+- The standing rules further down: a test author separate from the implementer,
+  a pull request when a spec is finished, one integration branch per spec, and
+  the watcher on this channel. Those were Per's calls, not the loop's.
+- The four alignment fixes in `2dc2414`: the reviewer now has a Spec axis and
+  receives `TASK_ID`, the planner reads recorded dependencies and may not
+  overrule them, and RED subagents get the parent Feature's Testing Decisions.
+- Two decisions Per had not made when the laptop stopped: whether `Sandcastle`
+  or `ready-for-agent` is the readiness gate when a ticket carries both, and
+  where the `dynamic-qa` bundle source tree lives, which #141 needs before it
+  can be finished.
+- The one open review point on #176: `is_nested_checkout` is documented as
+  covering a clone as well as a worktree, but the test only pins the worktree
+  form.
+
+Historical goal, kept for the record only:
 
 **Get the loop actually running on #140 and prove it worked. Stop waiting for
 tokens - step 6 is cancelled, they are not needed.**
