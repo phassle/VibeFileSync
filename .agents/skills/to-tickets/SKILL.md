@@ -74,6 +74,8 @@ Do NOT close or modify any parent issue.
 
 **Blocked by:** the numbers/titles of the tickets that gate this one, or "None — can start immediately".
 
+**CRAP score:** the estimated complexity/maintenance burden for this ticket, expressed as a number or a low/medium/high estimate.
+
 **Status:** ready-for-agent
 
 - [ ] Acceptance criterion 1
@@ -90,6 +92,10 @@ A reference to the parent issue on the tracker (if the source was an existing is
 ## What to build
 
 The end-to-end behaviour this ticket makes work, from the user's perspective — not layer-by-layer implementation.
+
+## CRAP score
+
+The estimated complexity/maintenance burden for this ticket, expressed as a number or a low/medium/high estimate.
 
 ## Acceptance criteria
 

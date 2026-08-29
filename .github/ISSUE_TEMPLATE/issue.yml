@@ -27,6 +27,14 @@ body:
     validations:
       required: true
 
+  - type: input
+    id: crap-score
+    attributes:
+      label: CRAP score
+      description: Estimated complexity/maintenance burden for this ticket (for example 1-10, or low/medium/high).
+    validations:
+      required: false
+
   - type: textarea
     id: acceptance-criteria
     attributes:
