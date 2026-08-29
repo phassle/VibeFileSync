@@ -114,6 +114,7 @@ enum PairCommand {
     },
     /// List configured Folder pairs.
     List {
+        /// Emit the pair listing as JSON (schema `vibefilesync.pairs/v1`).
         #[arg(long)]
         json: bool,
         /// Classify each side's volume state (advisory; does volume I/O).

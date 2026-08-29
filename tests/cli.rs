@@ -602,6 +602,28 @@ fn pair_list_json_emits_the_versioned_schema() {
 }
 
 #[test]
+fn pair_list_help_names_the_json_schema() {
+    let fx = Fixture::new();
+
+    let json_output = fx.cmd().args(["pair", "list", "--json"]).output().unwrap();
+    assert_eq!(json_output.status.code(), Some(EXIT_OK), "{json_output:?}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("valid JSON output");
+    let schema = value["schema"]
+        .as_str()
+        .expect("--json payload names its schema");
+
+    let output = fx.cmd().args(["pair", "list", "--help"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(schema),
+        "--help should name the pairs schema ({schema}): {stdout}"
+    );
+}
+
+#[test]
 fn pair_add_pins_both_volume_uuids_into_the_config_file() {
     let fx = Fixture::new();
     fx.add_photos_pair();
