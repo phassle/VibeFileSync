@@ -50,17 +50,54 @@ driver that decides what happens next:
 - Reading long files or ADRs to answer a specific question: send a subagent
   with the question.
 
-Keep in your own context: the issue text, the decision you are making, the
-edits you are writing, and the failures you are actively fixing. Write the code
-yourself - do not delegate the edit and then trust a summary that it went in.
-Verify the diff.
+Keep in your own context: the issue text, the decision you are making, and the
+failures you are actively resolving. You own the decisions; the subagents own
+the volume. Always verify the resulting diff yourself rather than trusting a
+subagent's summary that the edit went in.
 
-If applicable, use RGR to complete the task.
+## The test and the implementation come from different subagents
 
-1. RED: write one test
-2. GREEN: write the implementation to pass that test
-3. REPEAT until done
-4. REFACTOR the code
+This one is not negotiable. **Never let a single subagent write both the test
+and the code it tests.** An agent holding both sides will, when the test fails,
+quietly adjust the test until it passes - not from dishonesty, but because
+making the pair agree is the shortest path and it can see both sides. The test
+then encodes what the code does instead of what the issue asked for, and it
+passes forever without protecting anything. That failure is invisible in a
+green run, which is exactly what makes it dangerous.
+
+So split the work:
+
+1. **RED - a test subagent** writes one failing test from the issue and the
+   Expected behaviour, and never sees your implementation plan. Give it the
+   issue text and the relevant existing test conventions, not your intended
+   diff. Have it confirm the test fails, and report *how* it fails - a test
+   that passes before the change, or fails for an unrelated reason such as a
+   compile error, is not a red test.
+2. **GREEN - an implementation subagent** makes that test pass without editing
+   it. State plainly that the test file is read-only for this subagent. If it
+   reports the test is wrong, that comes back to you as a claim to judge, not
+   as a licence to edit.
+3. **REPEAT** for the next behaviour, with fresh subagents each time.
+4. **REFACTOR** once the behaviour is covered, with the tests held fixed.
+
+If a test genuinely does need to change - the issue was misread, or the test
+asserts something the spec never asked for - **you** make that call in your own
+context and say so in the commit message. Never let the agent that is trying to
+turn the test green be the one that decides the test was wrong.
+
+Run the four feedback-loop commands in a third subagent, separate from both, so
+the run that judges the work is not made by the agent that produced it.
+
+Refactoring is not part of the red-green loop. It happens after the behaviour is
+covered, with the tests held fixed.
+
+## Test only at seams the spec already agreed
+
+Do not invent a seam. When this issue has a parent Feature, its
+`## Testing Decisions` section names the modules to be tested and the prior art
+to follow - that is the agreed seam, and the RED subagent must be given it
+along with the issue text. If no parent Feature says, ask rather than guessing:
+a test at an unagreed seam locks in a shape nobody approved.
 
 # FEEDBACK LOOPS
 

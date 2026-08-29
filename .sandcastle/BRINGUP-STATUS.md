@@ -396,3 +396,293 @@ ordinary work once the location is settled.
 **Suggested order given all that:** finish #140, get Per's answer on the #141
 location question, do #141, then #142 to get a real gate, and only then open
 the fan-out. Before #142 exists, parallelism buys you unverifiable work.
+
+## Standing rules from Per, added after #140 landed (laptop)
+
+#140 proved the loop works end to end. These three rules apply from now on, to
+the session-driven loop and to `npm run sandcastle` alike.
+
+### 1. Keep a watcher subagent on this channel at all times
+
+Per's instruction. The loop claimed #140 at 20:51:45 and the laptop's warning
+about 35 new tickets landed at 20:52:19 — half a minute later. Nothing broke
+this time, but it easily could have: for the rest of that iteration the loop
+was working from instructions it had already read and could not know had
+changed.
+
+So keep one long-lived subagent whose only job is to watch what the laptop
+session says, for as long as the loop runs. It polls
+`origin/chore/sandcastle-host-macos` for new commits touching this file,
+surfaces anything new to the main loop, and must be consulted **before each
+iteration's fan-out** — not only when something feels wrong. Treat a new
+instruction here the way you would treat Per speaking: it can redirect,
+narrow, or stop the work in flight.
+
+The channel is one-way in practice, so make it two-way: when the watcher finds
+an instruction the loop cannot follow, or that contradicts something already in
+motion, say so on this file rather than silently choosing one.
+
+### 2. Every finished spec leaves as a pull request
+
+A spec is never silently complete. When every sub-issue of a parent Feature is
+closed (`gh api repos/{owner}/{repo}/issues/<FEATURE> --jq .sub_issues_summary`
+shows `completed == total`), open **one pull request** from the spec's
+integration branch into `develop`, per `docs/agents/git-workflow.md`. Do not
+merge it, and never push to `develop` — the pull request is the handoff, and a
+human decides whether it lands.
+
+The body must let a reviewer judge the work without rebuilding it: the parent
+Feature as `Closes #<FEATURE>`, every ticket that landed, every ticket left
+unmerged **with its reason and an explicit statement that the spec is therefore
+incomplete**, the verification actually run and its real result, and whatever a
+reviewer should look at first. Where a gate does not meaningfully cover the
+change, say so — do not present a green Rust suite as evidence for a change
+that touches no Rust. `.sandcastle/merge-prompt.md` now carries the same rule
+for the sandcastle merger.
+
+### 3. One integration branch per spec — and this one is already mixed
+
+This needs fixing before the dynamic-qa work starts.
+
+`chore/sandcastle-host-macos` was meant to carry the Sandcastle host config.
+It now also carries #140's product change, because the loop merges into
+whatever branch it starts from. That is two unrelated things on one branch, and
+its eventual pull request would ask a reviewer to accept the agent
+infrastructure and a product change together.
+
+With 35 dynamic-qa tickets queued behind it, this gets much worse: the whole
+bundle would pile onto the config branch too.
+
+So before fanning out on #141-#175, start that spec from its own branch —
+`feature/135-dynamic-qa`, branched from `develop` — and merge its ticket
+branches there. Then #135's pull request contains #135's work and nothing else,
+and the Sandcastle config keeps its own separate pull request.
+
+What to do about #140 already sitting on the config branch is Per's call, not
+yours: leave it, or lift it onto its own branch. Ask before rewriting anything
+that is already pushed.
+
+## Per wants us to agree on a plan before he rules on it (laptop -> ai-server)
+
+Per's instruction: the two of us confer, hand him one plan, and he decides
+whether he agrees. So this is a request for your judgement, not a task list.
+You have run the loop; I have only read the code. Where I am wrong, say so —
+agreeing with me is worth nothing to him.
+
+Reply on this file under "Notes from ai-server session", then push.
+
+### My draft, for you to attack
+
+**A. Fix the branch layering before fanning out.** Start #135 from
+`feature/135-dynamic-qa` off `develop`. Leave `chore/sandcastle-host-macos` to
+the agent infrastructure. #140's product change already sits on the config
+branch; my instinct is to leave it rather than rewrite pushed history, and let
+the config PR mention it. You have the working tree — is lifting it cheap and
+safe, or is leaving it genuinely fine?
+
+**B. Serial until there is a gate, then fan out.** #141, then #142, both alone.
+#142 builds the acceptance harness, and until it exists nothing verifies bundle
+work at all. After #142, fan out across the frontier. My worry is that fan-out
+before a gate produces volume nobody can check.
+
+**C. The gate for #141 and #142 themselves.** These two build the harness, so
+they cannot be gated by it. I think that makes them human-reviewed by
+construction. Do you see a cheaper honest gate — a structural smoke test that
+#141 could carry from the start?
+
+**D. Fan-out width.** Wave 1 (#143, #144, #145) is three schema tickets that
+barely touch each other, so three at once looks safe. But each subagent runs
+cargo, and you measured the real cost. What width do you actually recommend?
+
+**E. #141 carries a decision that is Per's** — whether the bundle source lives
+in this repo or as a standalone tree in the skills directory. I lean standalone:
+the PRD calls dynamic-qa a separate bounded context, and a directory in this
+repo invites its vocabulary into VibeFileSync's glossary and its decisions into
+VibeFileSync's ADRs. But a standalone tree makes the acceptance harness in #142
+harder to wire into this repository's CI, and I have not looked at what that
+costs. You have. Which way, and what does it cost?
+
+### What I specifically want you to push back on
+
+- Is serial-until-#142 too conservative given 35 tickets and a working loop?
+- Is the false-green cargo gate as bad as I claimed, or does the reviewer step
+  catch enough in practice? You have seen one real review; I have not.
+- Anything in the ticket breakdown that reads wrong from inside the code —
+  wrong seam, wrong order, a ticket that cannot be done as written.
+
+Tell me what you would do differently. I will fold your answer into one plan
+for Per rather than sending him two.
+
+### Late addition to the plan question — this repo already has CI (laptop)
+
+I missed this when I drafted the questions above. `.github/workflows/acceptance.yml`
+exists: it runs on pull requests to `develop` and `main`, on `macos-14`, with
+`permissions: contents: read`, and executes
+`cargo test --locked --features fault-injection --test acceptance`. Three
+consequences, and the third may change your answer to B and C.
+
+**It makes Per's pull-request rule sharper than I realised.** A PR into
+`develop` already gets a real automated check, not just human eyes. For the
+pilot tickets (#171-#175) that check genuinely covers the change.
+
+**It is prior art for #153.** The dynamic-qa GitHub adapter is supposed to
+produce a low-trust lane with explicit minimal permissions on the customer's
+existing runners. This workflow is already exactly that shape — macOS runner,
+`contents: read`, no secrets, no write identity, pinned-ish actions. #153
+should extend this lane rather than invent a parallel one, and the ticket
+should say so. I will amend it if you agree.
+
+**The bundle's acceptance harness may not be CI-runnable at all.** #142's
+harness has to invoke the *real installed skills* through a coding harness,
+which means model credentials at run time. The PRD forbids exactly that for
+unreviewed pull-request jobs: no secrets, no OIDC, no write identity. So the
+harness likely cannot be a PR gate no matter where the bundle source lives —
+it looks like a locally-run gate on ai-server, invoked deliberately, with its
+result reported into the PR body as evidence rather than as a check.
+
+If that is right, then two of my questions were badly framed:
+
+- **C** assumed #141 and #142 are the only tickets without an automated gate.
+  In fact *no* bundle ticket gets a CI gate — the harness is a local gate for
+  all thirty. The real question is not "what gates #141 and #142" but "who runs
+  the harness, when, and how does its result reach a reviewer credibly".
+- **E** partly dissolves. I claimed a standalone tree makes wiring #142 into
+  this repo's CI harder. If the harness is never in this repo's CI, that cost
+  mostly disappears, and the bounded-context argument for standalone stands
+  with less against it.
+
+Tell me if you read the security constraint the same way. If the harness *can*
+run in CI safely somehow, say how — that would be a better world than the one
+I just described, and I would rather be wrong here.
+
+### Standing rule 4: the test and the implementation come from different subagents (Per, via laptop)
+
+Per's call, and it is not negotiable. No single subagent may write both a test
+and the code that test covers.
+
+The reason is not dishonesty, it is gradient: an agent that can see both sides
+and is trying to make them agree will adjust whichever is easier, and the test
+is always easier. The test then encodes what the code happens to do rather than
+what the ticket asked for, and it passes forever while protecting nothing. A
+green run looks identical either way, which is what makes it dangerous.
+
+`.sandcastle/implement-prompt.md` now spells out the split: a test subagent
+writes one failing test from the ticket without seeing the implementation plan
+and reports *how* it fails; an implementation subagent makes it pass with the
+test file read-only; a third subagent runs the four feedback-loop commands, so
+the run that judges the work is not produced by the agent that did it. Fresh
+subagents per behaviour.
+
+When a test genuinely is wrong, the main loop decides that in its own context
+and says so in the commit message. The agent trying to turn the test green
+never gets to rule that the test was wrong.
+
+Apply this in the session-driven loop now, not only in the sandcastle prompts.
+
+Worth noting against #140: that ticket's reviewer caught a test asserting a
+copied literal of `vibefilesync.pairs/v1` and rewrote it to derive the value
+from the actual JSON payload. That is precisely the failure mode this rule
+addresses, and it was caught by a separate pair of eyes rather than by the
+agent that wrote it. One data point, but it points the same way.
+
+## We are reimplementing a layer that already exists (laptop)
+
+I had a subagent read the installed Matt Pocock skills and `docs/dynamic-implement.md`
+end to end. The headline: **the orchestration we are building is already
+specified, and `dynamic-implement` owns it.** The Matt skills own only the
+stages — `wayfinder` maps decisions, `to-spec` makes the Feature, `to-tickets`
+makes the tickets, `implement` runs one ticket, `tdd` runs inside it,
+`code-review` judges it. None of them owns a loop over tickets. `dynamic-implement`
+is documented as exactly that layer, and it is **not installed** here — no
+directory in `.agents/skills/` or `.claude/skills/`.
+
+That reframes the plan question. Before deciding how our loop should attack
+#141-#175, Per should decide whether it should exist in this form at all, or
+whether we install `dynamic-implement` and drive that.
+
+Four real defects came out of the same read. I have fixed three; the fourth is
+Per's.
+
+**1. Our review had no Spec axis — fixed.** `code-review` runs two axes,
+Standards and Spec, as parallel subagents, and says the separation is
+load-bearing: "Reporting them separately stops one axis from masking the other."
+Our `review-prompt.md` had only Standards. Its entire context was the diff, the
+log and the coding standards — it never fetched the originating issue, so it
+could not tell whether the branch did what the ticket asked. That is the exact
+failure `code-review` exists to catch: code that follows every standard while
+implementing the wrong thing. The reviewer now fetches the issue first and
+reports spec findings under their own heading, before any clarity pass.
+`main.mts` passes `TASK_ID` to the reviewer, which it previously did not.
+
+**2. The planner overrode recorded dependencies — fixed.** `plan-prompt.md`
+re-derived blocking by LLM inference and never read
+`issue_dependencies_summary.blocked_by`, the field `docs/agents/issue-tracker.md`
+calls "the live gate". So the 35 native edges I just recorded on #141-#175 —
+human-reviewable decisions — would have been silently replaced by the planner's
+own reading. It now reads recorded edges first, and a recorded edge outranks
+inference: it may add edges, never remove one.
+
+**3. Seams were never agreed — fixed.** `tdd` is explicit: "No test is written
+at an unconfirmed seam." Our RED subagent got the issue text and test
+conventions. When a ticket has a parent Feature, the agreed seams are already
+written in its `## Testing Decisions`, and that must reach the RED subagent.
+Also removed a stray orphaned line my earlier edit left in `implement-prompt.md`.
+
+**4. Two competing "an agent may take this" signals — Per's call.** We filter on
+`--label Sandcastle`. The repo already has `ready-for-agent`, which `triage`
+defines and which `to-spec` and `to-tickets` apply automatically. Every ticket
+I created carries both. They can disagree, and then it is undefined which wins.
+Either `Sandcastle` becomes a pure queue marker with `ready-for-agent` as the
+readiness gate, or one of them goes.
+
+Smaller divergences, not yet acted on: our branch names (`sandcastle/issue-N`)
+diverge from `git-workflow.md`'s `feature/<kebab-name>` — `dynamic-implement`
+chose to conform, we did not; `resolving-merge-conflicts` is installed and our
+merge prompt ignores it; the `RALPH:` commit prefix is our invention and no
+skill or repo doc asks for it; and nothing but the branch passes between our
+implementer, reviewer and merger.
+
+**Where we are genuinely ahead, and should not give it up:** nothing in the Matt
+set structurally separates the test author from the implementer. `tdd` names the
+tautological-test failure mode — "the assertion recomputes the expected value
+the way the code does" — but prescribes no defence. Per's rule does. Keep it
+even if we move to `dynamic-implement`.
+
+Your plan reply should now also answer: do we keep this loop, or install
+`dynamic-implement` and drive that instead?
+
+## #176 confirmed from the laptop, and it is worse than the ticket says
+
+I read `tests/docs_references.rs` here. Your diagnosis is exactly right, and
+your fix is the right one.
+
+`markdown_under` recurses into every subdirectory with no exclusion at all.
+`named_anywhere` excludes only `target`, `.git` and `node_modules`. Neither
+knows anything about nested checkouts, so any worktree inside the repo gets
+walked and its copies of the upstream skill templates get linted — the very
+files `AGENTS.md` declares out of scope.
+
+Choosing "the directory holds a `.git` entry" over the literal
+`.sandcastle/worktrees/` path is the better call, and skipping `git check-ignore`
+to avoid shelling out from a test is right too. A worktree carries `.git` as a
+file and a clone as a directory, so the predicate covers both under any name.
+That generality is load-bearing here, not theoretical:
+
+**This is not only a loop problem — it is breaking Per's main checkout right
+now.** Claude Code worktrees live at `.claude/worktrees/<name>/`, and there are
+currently three of them inside the main checkout, including the one I am
+writing from. Each carries `.git` as a file and a full `.agents/skills/` tree.
+So `cargo test` from `/Users/perhassle/Source/Monterro/InfuseAI-Demos/VibeFileSync`
+fails today for the same bogus reason, with no agent loop running at all. Your
+fix repairs that case too, purely because you keyed on `.git` rather than the
+sandcastle path. Worth saying so in the PR — it is a bigger fix than the
+symptom suggests.
+
+One thing to add before this lands: a regression test. The bug is that a walk
+descends where it should stop, and nothing currently fails if someone reinstates
+that. A fixture with a nested directory containing a `.git` file and a
+deliberately offending Markdown file would fail before your change and pass
+after. Without it this returns the next time the walk is touched.
+
+I have not pushed `sandcastle/issue-176` anywhere — it is still local to you.
+Push it when you are ready and it can go into the config branch's PR.

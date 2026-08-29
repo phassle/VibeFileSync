@@ -1,8 +1,20 @@
 # TASK
 
-Review the code changes on branch `{{BRANCH}}` and improve code clarity, consistency, and maintainability while preserving exact functionality.
+Review the code changes on branch `{{BRANCH}}`.
+
+This runs in two parts, and the order matters. **First** review against the spec,
+because code that follows every standard while implementing the wrong thing is
+still wrong, and a clarity pass will not notice. **Then** improve clarity,
+consistency and maintainability while preserving exact functionality.
 
 # CONTEXT
+
+## The originating issue - what this change was supposed to do
+
+!`gh issue view {{TASK_ID}} --json number,title,body,labels --jq '"#\(.number) \(.title)\n\n\(.body)"'`
+
+If that issue has a parent Feature, read it too: its acceptance criteria and its
+`## Testing Decisions` are the contract this branch is judged against.
 
 ## Branch diff
 
@@ -13,6 +25,15 @@ Review the code changes on branch `{{BRANCH}}` and improve code clarity, consist
 !`git log {{BASE_BRANCH}}..{{BRANCH}} --oneline`
 
 # REVIEW PROCESS
+
+0. **Check the change against the spec, and report that separately.** Does the
+   branch do what the issue asked - every acceptance criterion, not most of
+   them? Is anything asserted by a test that the issue never asked for? Is any
+   criterion unmet, or met only in appearance? Report spec findings under their
+   own heading and do not let them be reworded into style findings; a spec
+   failure and a standards failure are different failures and one must never
+   mask the other. If an acceptance criterion is unmet, say so plainly and do
+   not paper over it with a refactor.
 
 1. **Understand the change**: Read the diff and commits above to understand the intent.
 
