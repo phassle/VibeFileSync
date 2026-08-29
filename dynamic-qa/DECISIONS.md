@@ -546,3 +546,73 @@ formed input. Anyone wiring these modules into the real generation flow
 (the run coordinator's central `qa-generate/SKILL.md` edit, or a later
 ticket) still has to write that discovery/derivation logic; it is out of
 this ticket's scope because it is genuinely interpretive, not computable.
+## 16. Negative controls (#152)
+
+**Decision.** A new module, `shared/scripts/negative-controls.mjs`, is the
+whole of the negative-control gate: "prove that each assertion still fails
+for the violation it is supposed to catch" (tickets/152.md) is split into a
+pure derivation half and a pure judgment half, with the actual
+harness-specific execution left as a documented seam — see the module's own
+footer comment and `shared/references/negative-controls.md`.
+
+**Derivation reuses the Flow contract, never invents a violation.**
+`deriveDeclaredViolation` reads only what #143/#145 already validate: the
+outcome's own `tolerance.kind` (spec 5.1's seven v1 kinds) and, when
+declared, the flow's `role: "owned"` boundary (#145's vocabulary — the
+boundary the outcome is actually proving something about). Each tolerance
+kind gets its own tech-neutral violation statement: `numeric`/`temporal`
+name the exact epsilon window the observed value must move outside of;
+`presentation` requires breaking a non-ignorable aspect (content, values,
+behavior, accessibility, counts), never an ignored one (layout, style,
+position); `unordered-set` requires an actual membership change, not
+reordering; `custom` has no deterministic notion of what invalidates an
+approved comparison, so it surfaces the approver's own `reason`/
+`approved_by` rather than inventing one, and is still marked as requiring a
+control (`requiresManualStatement: true`), never exempted.
+`buildNegativeControlPlan` walks every outcome via
+`expected-outcome-coverage.mjs`'s own `collectExpectedOutcomeIds` — a third
+declaration-order walk was never written.
+
+**Judgment is fail-closed on the reported execution mode, not just the
+result.** `judgeNegativeControl` accepts a `NegativeControlReport` only when
+`mode` is the exact literal `"executed"` — no allowance for "probably ran"
+exists, so a report claiming `"simulated"`, `"skipped"`, `"assumed"`, or
+simply omitting `mode` is rejected as `not-executed` by the same code path,
+regardless of what `appliedViolation` claims. Among genuinely executed
+reports: `"assertion-passed"` is rejected as `assertion-did-not-fail` (the
+always-true-assertion case the ticket exists to catch), and `"crash"`/
+`"timeout"` are rejected as `unrelated-failure` — the acceptance criterion
+"the control exercises the declared violation, not an unrelated failure
+such as a crash or timeout" is a distinct rejection reason from "did not
+fail", not folded into it, so a review packet can tell the two apart.
+
+**Coverage is per Expected Outcome, matching #146's own proof model.**
+`checkNegativeControlCoverage` requires one accepted control per
+`{stepId, outcomeId}` an assertion mapping references — multiple assertions
+proving the same outcome share that outcome's one control, exactly as
+`expected-outcome-coverage.mjs` treats coverage as per-outcome, not
+per-assertion. A missing report is a distinct, named error from a rejected
+one, and a later weaker report (e.g. a `"simulated"` report following a
+genuine `"executed"` rejection) never silently overwrites an already-good
+verdict for the same key, nor can a later report resurrect a key whose only
+verdict is a rejection.
+
+**Not built here, and not #152's to build:** actually executing an
+assertion against a mutated fixture in a real harness (API/CLI/browser);
+wiring this module into `qa-generate/SKILL.md` step 6 (prose integration is
+handed back centrally per the run brief's coordination rule — see
+`shared/references/negative-controls.md` for the exact replacement text and
+placeholder); neighbor-flow verification and the drift gate itself, both
+still #148's territory per #146's own seam note.
+
+**Seam left for #160 (guarded repair).** Repair's own verify step
+(DESIGN-dynamic-qa-spec.md §7 repair-workflow step 6: "verify the exact
+failure, a deterministic negative control, neighboring tests, protected-
+contract digests") should call `buildNegativeControlPlan` and
+`judgeNegativeControl`/`checkNegativeControlCoverage` directly — the same
+Expected Outcome/tolerance/boundary contract is read-only during repair, so
+the same derivation applies unchanged. Nothing repair-specific (e.g.
+guarding against the repair candidate widening a tolerance to make its own
+control pass more easily) is built here; #160 owns making sure a repair
+candidate cannot satisfy this gate by changing the contract instead of the
+code.
