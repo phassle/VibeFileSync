@@ -31,7 +31,8 @@ Do not force-push. Do not rebase other people's commits away. Never commit
       Note: GREEN: 104 + 11 + 4 passed, 0 failed. Also ran the other two loop commands: `cargo fmt --all -- --check` clean and `cargo clippy --all-targets --all-features -- -D warnings` clean. So all four feedback-loop commands are verified green on the host.
 - [x] 5. **`cargo test --features fault-injection --test acceptance` green**
       Note: GREEN: 2 passed, 0 failed in 12.59s (volume_state_classifier..., full_crash_and_fault_matrix...). Needs the --features fault-injection flag exactly as documented.
-- [ ] 6. `.sandcastle/.env` filled by Per; `git status --porcelain .sandcastle/.env` empty
+- [x] 6. ~~`.sandcastle/.env` filled by Per~~ NOT REQUIRED - see "Step 6 is
+      cancelled" below. Host CLI auth is inherited. Do not wait for tokens.
       Note: BLOCKED on Per. .sandcastle/.env created from .env.example but both token values are still empty. `git status --porcelain .sandcastle/.env` is empty, so the ignore rule works.
 - [x] 7. `Sandcastle` label exists; Per picked the first issue
       Note: DONE. Label already existed (colour #F9A825, desc 'Issues for Sandcastle to work on') - left as is, did not recreate. Label already existed (colour #F9A825, desc 'Issues for Sandcastle to work on') - left as is, did not recreate. Backlog had no small ticket, so on Per's instruction a new one was drafted and approved: #140 'pair list --json: document the flag and name its schema in --help'. It is the ONLY issue carrying the label, so the planner will see exactly one.
@@ -75,6 +76,68 @@ any unattended run. Never enter tokens or credentials yourself.
 - The CARGO_TARGET_DIR question is still open here too - ~/.cache/vibesync-sandcastle
   does not exist yet because no pipeline has run. Will check it right after the
   first watched run and report back.
+
+## Step 6 is cancelled - no `.env`, no tokens (laptop)
+
+Per's call, and the code backs it: the loop runs on his existing Claude
+subscription and the host's already-authenticated `gh`. Stop waiting for
+tokens and proceed to step 8.
+
+Why this is safe, verified against `@ai-hero/sandcastle@0.12.0`:
+
+1. **A missing `.env` is not an error.** `parseEnvFile` in `index.js` wraps the
+   read in `catchAll(() => succeed(null))` and returns `{}` when the file is
+   absent. No throw, no warning.
+2. **The runtime never asks for a token.** Neither `CLAUDE_CODE_OAUTH_TOKEN`
+   nor `ANTHROPIC_API_KEY` appears anywhere in `dist/index.js` or its chunks.
+   Every hit is in `dist/main.js`, which is the `sandcastle init` scaffolding
+   CLI that writes `.env.example` and prints setup advice. It is not on the
+   path `main.mts` executes.
+3. **The agent provider injects nothing that could shadow host auth.**
+   `claudeCode("opus", {permissionMode})` returns an empty `env`, so there is
+   no blank `ANTHROPIC_API_KEY` to override the subscription.
+4. **The host environment is inherited wholesale.** `noSandbox` builds
+   `processEnv = { ...process.env, ...createOptions.env }` for every `spawn`.
+   `HOME` comes along, so the `claude` CLI finds its own stored credentials and
+   `gh` finds `~/.config/gh/hosts.yml`. Both are already logged in on
+   ai-server per your step 1.
+
+This is a consequence of the noSandbox switch, not an oversight in the runbook:
+the token dance exists because a Docker container has no access to host
+keychains. Running on the host, it is redundant. The runbook's Part 3 is stale
+for this setup - I will not edit the runbook (it lives in the OnPrem-AI
+project), but do not follow it on this point.
+
+The empty `.sandcastle/.env` you created is harmless: `resolveEnv` only
+iterates keys present in the file, falls back to `process.env[key]` when the
+value is empty, and drops the key entirely when both are empty. So it
+contributes nothing rather than injecting a blank token. Leave it or delete
+it, either is fine. It stays untracked regardless.
+
+## Implementer now delegates to subagents (laptop, Per's design call)
+
+Per's shape for the loop: the implementer's main context IS the loop, and
+subagents do the building. `implement-prompt.md` now says so explicitly -
+delegate codebase exploration, the four feedback-loop command runs, and any
+long file reads to subagents, and keep only the issue, the decision, the edits
+and the live failures in the main context. It still writes the code itself and
+verifies the diff rather than trusting a subagent's summary.
+
+The reason this matters here specifically: 100 iterations on one context, and
+`cargo clippy --all-targets --all-features` on a cold target dir emits
+thousands of lines. A couple of those runs would push the issue text out of
+the window well before iteration 100.
+
+Two things to watch on the first run and report back:
+
+- **Fan-out.** Each pipeline can now spawn several subagents, so
+  `SANDCASTLE_CONCURRENCY=2` is no longer two processes. Keep the first run at
+  `CONCURRENCY=1` as planned. Subagents inside one pipeline share that
+  branch's `CARGO_TARGET_DIR`, so parallel cargo invocations serialise on that
+  branch's lock rather than corrupting anything - slow, not dangerous.
+- **Rate limits.** Subagents multiply subscription usage. If the run dies with
+  a quota or 429 error rather than a code failure, say so plainly in step 8's
+  note; that is a capacity finding, not a config bug.
 
 ## Answer to your lockfile finding (laptop)
 

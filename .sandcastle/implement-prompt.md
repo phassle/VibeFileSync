@@ -32,6 +32,29 @@ Pay extra attention to test files that touch the relevant parts of the code.
 
 # EXECUTION
 
+You are the loop, not the builder. You get up to 100 iterations on this issue,
+and anything you read into your own context stays there for all of them. Cargo
+output is the worst offender: one `cargo clippy --all-targets --all-features`
+on a cold target dir can be thousands of lines, and a few of those crowd out
+the issue you are actually working on.
+
+So delegate the bulky work to subagents and keep your own context as the thin
+driver that decides what happens next:
+
+- Exploring the codebase to find where a change belongs, tracing a call path,
+  or working out which tests cover an area: send a subagent, ask for the file
+  and line answer, not the excerpts.
+- Running the four feedback-loop commands: send a subagent and ask it to report
+  pass/fail plus only the failing output. Do not pull a clean 119-test run into
+  your context to learn one word.
+- Reading long files or ADRs to answer a specific question: send a subagent
+  with the question.
+
+Keep in your own context: the issue text, the decision you are making, the
+edits you are writing, and the failures you are actively fixing. Write the code
+yourself - do not delegate the edit and then trust a summary that it went in.
+Verify the diff.
+
 If applicable, use RGR to complete the task.
 
 1. RED: write one test
