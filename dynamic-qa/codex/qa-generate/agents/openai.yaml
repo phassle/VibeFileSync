@@ -1,0 +1,6 @@
+interface:
+  display_name: "QA Generate"
+  short_description: "Generate, adopt, or repair deterministic QA Bindings"
+  default_prompt: "Use $qa-generate <flow-id> to generate a Binding, $qa-generate --all-ready for every ready flow, or $qa-generate repair --evidence <path> to diagnose a failure."
+policy:
+  allow_implicit_invocation: false
