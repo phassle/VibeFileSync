@@ -1,0 +1,36 @@
+# Violates rule: the owned outcome under test cannot be declared simulated
+# (or forbidden). role: owned + treatment: simulated is refused -- a fake
+# cannot prove itself.
+schema: dynamic-qa-flow-v1
+id: owned-outcome-simulated-flow
+revision: 1
+title: "Boundary policy violation: owned outcome declared simulated"
+intent: "Prove the owned-outcome-cannot-be-simulated rule rejects."
+criticality: high
+state: draft
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/18"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "vibesync CLI"
+    treatment: simulated
+    behavior: "A fake CLI stands in for the thing under test."
+    side_effects: "none"
+    role: owned
+steps:
+  - id: given-a
+    kind: given
+    intent: "i"
+  - id: when-b
+    kind: when
+    intent: "i"
+  - id: then-c
+    kind: then
+    intent: "i"
+    outcomes:
+      - id: outcome-a
+        expect: "exact one."

@@ -1,0 +1,41 @@
+# Violates rule: a boundary with real, non-none side effects must declare
+# isolation.namespace and isolation.cleanup, so test order and interrupted
+# cleanup cannot corrupt later runs. Here it declares neither.
+schema: dynamic-qa-flow-v1
+id: missing-isolation-flow
+revision: 1
+title: "Boundary policy violation: real side effects without isolation"
+intent: "Prove a real, side-effecting boundary without isolation is rejected."
+criticality: high
+state: draft
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/18"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "vibesync CLI"
+    treatment: real
+    behavior: "Invoke the CLI's Update mode against a temporary folder pair."
+    side_effects: "none"
+    role: owned
+  - id: safetynet-archive
+    system: "the local SafetyNet archive directory"
+    treatment: real
+    behavior: "Writes a preserved-version folder before Publish replaces the destination."
+    side_effects: "Creates one Run folder under the SafetyNet root."
+steps:
+  - id: given-a
+    kind: given
+    intent: "i"
+  - id: when-b
+    kind: when
+    intent: "i"
+  - id: then-c
+    kind: then
+    intent: "i"
+    outcomes:
+      - id: outcome-a
+        expect: "exact one."

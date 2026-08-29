@@ -5,23 +5,45 @@
 // real | simulated | forbidden treatment, tech-neutral behavior, and
 // side-effect policy").
 //
-// EXTENSION SEAM for #145 (Boundary Declarations): this module only checks
-// *shape* — a well-formed, stable-ID, one-of-three-treatments declaration.
-// It deliberately does NOT enforce the deeper policy #145 owns: that the
-// flow's own owned outcome can never be declared `simulated`, that
-// undeclared external reach fails closed rather than defaulting to `real`,
-// or that a flow whose declarations cannot be honoured against an Execution
-// Profile is refused. #145 is expected to import `validateBoundaryDeclaration`
-// / `validateBoundaries` from here and layer its cross-cutting policy checks
-// on top (e.g. by calling this module first, then walking the returned
-// boundaries alongside the flow's steps/outcomes and the Execution Profile),
-// rather than re-implementing or forking the shape check.
+// This module checks *shape* only — a well-formed, stable-ID,
+// one-of-three-treatments declaration, plus two optional fields (`role`,
+// `volatile`) and an optional `isolation` block whose *presence* this module
+// validates but whose *requirement* is policy, not shape:
+//
+//   - `role`: "owned" | "dependency" (default "dependency" when absent).
+//     Which single boundary is the owned service/outcome under test is a
+//     reviewed, human-authored decision, never inferred from `system` or
+//     `behavior` text — see boundary-policy.mjs for why.
+//   - `volatile`: boolean (default false when absent). Marks a boundary as
+//     inherently non-deterministic or third-party (time, randomness,
+//     payments, an external service, unverified behaviour) — again a
+//     reviewed field, not a keyword guess against free text.
+//   - `isolation`: `{ namespace, cleanup }`, both non-empty strings — the
+//     per-run namespace and cleanup-capability statement for a boundary with
+//     real side effects.
+//
+// #145 (boundary-policy.mjs) owns the actual policy: that the owned outcome
+// must stay real, that a volatile boundary can never be real, that a
+// forbidden boundary's declaration must be honourable, that undeclared reach
+// fails closed, and that real side effects require isolation. Import
+// `validateBoundaryDeclaration` / `validateBoundaries` from here and layer
+// policy on top — do not fork this shape check.
 
 import { isValidSemanticId } from "./id-rules.mjs";
 
 export const BOUNDARY_TREATMENTS = Object.freeze(["real", "simulated", "forbidden"]);
+export const BOUNDARY_ROLES = Object.freeze(["owned", "dependency"]);
 
-const ALLOWED_KEYS = new Set(["id", "system", "treatment", "behavior", "side_effects"]);
+const ALLOWED_KEYS = new Set([
+  "id",
+  "system",
+  "treatment",
+  "behavior",
+  "side_effects",
+  "role",
+  "volatile",
+  "isolation",
+]);
 
 /**
  * Validates one boundary declaration's shape. Returns an array of
@@ -67,6 +89,37 @@ export function validateBoundaryDeclaration(boundary, path) {
       ...path,
       "side_effects",
     ]);
+  }
+
+  if ("role" in boundary && !BOUNDARY_ROLES.includes(boundary.role)) {
+    fail(`role must be one of ${BOUNDARY_ROLES.join(" | ")} (got ${JSON.stringify(boundary.role)})`, [
+      ...path,
+      "role",
+    ]);
+  }
+
+  if ("volatile" in boundary && typeof boundary.volatile !== "boolean") {
+    fail("volatile must be a boolean", [...path, "volatile"]);
+  }
+
+  if ("isolation" in boundary) {
+    const isolation = boundary.isolation;
+    const isolationPath = [...path, "isolation"];
+    if (isolation === null || typeof isolation !== "object" || Array.isArray(isolation)) {
+      fail("isolation must be a mapping with namespace and cleanup", isolationPath);
+    } else {
+      for (const key of Object.keys(isolation)) {
+        if (key !== "namespace" && key !== "cleanup") {
+          fail(`unknown key ${JSON.stringify(key)}`, [...isolationPath, key]);
+        }
+      }
+      if (typeof isolation.namespace !== "string" || isolation.namespace.trim() === "") {
+        fail("isolation.namespace must describe the per-run namespace", [...isolationPath, "namespace"]);
+      }
+      if (typeof isolation.cleanup !== "string" || isolation.cleanup.trim() === "") {
+        fail("isolation.cleanup must describe the cleanup capability", [...isolationPath, "cleanup"]);
+      }
+    }
   }
 
   return issues;

@@ -1,0 +1,63 @@
+# Fixture: a valid Flow Definition whose boundaries satisfy every #145
+# policy rule.
+#
+#   - vibesync-cli: role: owned, treatment: real -- the owned outcome under
+#     test, kept real at the cheapest safe layer.
+#   - system-clock: volatile: true, treatment: simulated -- time is
+#     inherently non-deterministic, so it is simulated, never real.
+#   - production-paths: treatment: forbidden, side_effects: none -- an
+#     honourable forbidden declaration.
+#   - safetynet-archive: treatment: real, non-none side effects, with
+#     isolation.namespace / isolation.cleanup declared.
+schema: dynamic-qa-flow-v1
+id: boundary-policy-valid
+revision: 1
+title: "Boundary policy: a fully compliant declaration set"
+intent: "Prove that a flow whose boundaries satisfy every #145 rule validates cleanly."
+criticality: high
+state: draft
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/18"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "vibesync CLI"
+    treatment: real
+    behavior: "Invoke the CLI's Update mode against a temporary folder pair."
+    side_effects: "none"
+    role: owned
+  - id: system-clock
+    system: "the system clock"
+    treatment: simulated
+    behavior: "An injected, fixed clock stands in for wall-clock time."
+    side_effects: "none"
+    volatile: true
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or home-directory path is read or written."
+    side_effects: "none"
+  - id: safetynet-archive
+    system: "the local SafetyNet archive directory"
+    treatment: real
+    behavior: "Writes a preserved-version folder before Publish replaces the destination."
+    side_effects: "Creates one Run folder under a disposable temporary SafetyNet root."
+    isolation:
+      namespace: "one mktemp -d root per test run, never a shared or fixed path"
+      cleanup: "the test harness removes the temporary root on both success and failure"
+steps:
+  - id: given-changed-destination
+    kind: given
+    intent: "A folder pair named 'documents' uses Update mode, and the destination has different content than the source."
+  - id: when-review-and-run
+    kind: when
+    intent: "The QA Owner reviews the Compare output and approves Run."
+  - id: then-destination-matches-source
+    kind: then
+    intent: "The destination content matches the source after Run completes."
+    outcomes:
+      - id: destination-matches-source
+        expect: "The destination report file reads '${case.newContent}'."
