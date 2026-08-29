@@ -180,6 +180,261 @@ jobs:
 `;
 }
 
+// --- ticket #154: nightly, manual/provider, and merge-group lanes ---------
+//
+// DESIGN-dynamic-qa-spec.md §8 names four Provider-native CI exposures;
+// #153 built the first (`pull_request`, above). This section adds the other
+// three as independent, additive renderers — `renderAdvisoryPullRequestLane`
+// above is untouched, per the run's "keep edits additive and localized,
+// do not restructure existing functions" instruction, since #155 also
+// edits this file concurrently.
+//
+// Trust asymmetry (modeled explicitly, not copied blindly from the PR
+// lane): DESIGN-dynamic-qa-spec.md §11 zone 3 ("low-trust-ci") groups
+// "ordinary PR/nightly runs" together, and github-actions-adapter.mjs's
+// `classifyLaneContentSource` extends that classification to all four
+// triggers via trust-zones.mjs's own vocabulary — `pull_request` and
+// `workflow_dispatch` (manual/provider) content is `"branch"` (untrusted:
+// a fork PR head, or a caller-selected ref a manual dispatch could point
+// at anything), while `schedule` (nightly) and `merge_group` content is
+// `"reviewed-base-branch"` (trusted: the default branch tip, or a merge
+// queue's already-individually-approved constituent PRs). That
+// classification genuinely changes what `checkHardSecurityInvariant` would
+// PERMIT — but every lane this module renders still uses the same minimal
+// identity (no secrets, no OIDC, no write permission, no privileged cache,
+// no self-hosted runner) regardless of which zone its content classifies
+// into, because none of these lanes has a functional need for more: they
+// only check out, run deterministic tests, and publish JUnit/annotations/
+// summary. Trust classification says what would be ALLOWED; least
+// privilege says none of it should be USED. See
+// github-actions-adapter.test.mjs for tests proving the asymmetry is real
+// (an identical permissive config is accepted for schedule/merge_group
+// content and rejected for pull_request/workflow_dispatch content) even
+// though this renderer never exercises the extra room it would allow.
+//
+// What DOES differ per lane, deliberately:
+//   - nightly (`schedule`) and manual (`workflow_dispatch`) are ADVISORY —
+//     `continue-on-error: true` at the job level, exactly like the PR lane,
+//     because neither is tied to a merge being gated (nightly runs against
+//     an already-landed commit; a manual/provider run is requested
+//     evidence, not enforcement). A failure is observed, never gates.
+//   - merge-group (`merge_group`) is REQUIRED — it deliberately omits
+//     `continue-on-error`, because the entire point of a merge-group
+//     trigger is that its result gates the merge queue's required checks
+//     (spec §8: "merge-group trigger when the repository uses a merge
+//     queue" / User Story 68: "required checks continue gating queued
+//     merges"). Job failure here must be a real, unmasked failure.
+//   - manual (`workflow_dispatch`) declares NO inputs at all. This is how
+//     "a coding agent can request deterministic regression evidence
+//     without owning QA policy" is enforced structurally rather than by
+//     convention: there is nothing in the trigger for a requester to set,
+//     so a request cannot smuggle in a different command, runner,
+//     permission, or identity than the one this renderer already fixed.
+//     checkWorkflowHardening's `dispatch.inputs-not-permitted` check names
+//     a violation of this if a caller adds inputs to mutated YAML.
+//
+// Sharding: none of these three renderers introduce a matrix strategy.
+// Each still takes a single precomputed `testCommand` string, exactly
+// #153's seam — "sharding only after measured runtime need" (spec §8,
+// User Story 70) and no runtime measurement exists yet (the pilot,
+// #171-175, has not run). Nightly's `testCommand` is expected to be the
+// full active portfolio rather than an impacted subset, but that is a
+// caller/adapter concern (which command string to pass in), not a
+// sharding concern.
+
+export const DEFAULT_NIGHTLY_CRON = "0 3 * * *"; // 03:00 UTC daily; a customer may override
+
+function renderCommonSteps({ nodeVersion, driftGateScript, annotationsScript, summaryScript, testCommand, junitPath, testStepName }) {
+  return `      - name: Checkout
+        uses: ${CHECKOUT_ACTION_REF}
+        with:
+          persist-credentials: false
+
+      - name: Set up Node (explicit runtime; never assumed ambient on the runner)
+        uses: ${SETUP_NODE_ACTION_REF}
+        with:
+          node-version: "${nodeVersion}"
+
+      - name: Deterministic drift gate (runs before tests)
+        run: node ${driftGateScript}
+
+      - name: ${testStepName}
+        run: ${testCommand}
+
+      - name: Publish native annotations
+        if: always()
+        run: node ${annotationsScript} ${junitPath}
+
+      - name: Publish job summary
+        if: always()
+        run: node ${summaryScript} ${junitPath} >> "$GITHUB_STEP_SUMMARY"
+`;
+}
+
+function validateCommonConfig(fnName, { runsOn, nodeVersion, testCommand, junitPath }) {
+  if (!nonEmptyString(runsOn)) throw new Error(`${fnName}: runsOn is required (reuse an existing runner label)`);
+  if (!nonEmptyString(nodeVersion)) throw new Error(`${fnName}: nodeVersion is required — the Node runtime must be declared explicitly, never assumed`);
+  if (!nonEmptyString(testCommand)) throw new Error(`${fnName}: testCommand is required`);
+  if (!nonEmptyString(junitPath)) throw new Error(`${fnName}: junitPath is required and must be an exact path, never a glob`);
+  if (junitPath.includes("*")) throw new Error(`${fnName}: junitPath must be an exact path — wildcard artifact lists are forbidden`);
+}
+
+/**
+ * Renders the nightly full-suite lane. ADVISORY (continue-on-error: true —
+ * nothing merges off the back of a scheduled run, so nothing needs gating);
+ * `testCommand` is expected to run the full active portfolio rather than an
+ * impacted subset (a caller/adapter concern, not enforced by this
+ * renderer). Same fixed hardening as the PR lane: minimal permissions,
+ * `persist-credentials: false`, SHA-pinned actions, no secrets/OIDC/write/
+ * privileged-cache/self-hosted-runner.
+ */
+export function renderNightlyFullSuiteLane(config = {}) {
+  const {
+    workflowName = "dynamic-qa nightly full suite",
+    cron = DEFAULT_NIGHTLY_CRON,
+    runsOn,
+    nodeVersion,
+    timeoutMinutes = DEFAULT_TIMEOUT_MINUTES,
+    testCommand,
+    junitPath,
+    driftGateScript = "dynamic-qa/shared/scripts/drift-gate-cli.mjs",
+    annotationsScript = "dynamic-qa/shared/scripts/github-actions-annotations-cli.mjs",
+    summaryScript = "dynamic-qa/shared/scripts/github-actions-summary-cli.mjs",
+  } = config;
+
+  validateCommonConfig("renderNightlyFullSuiteLane", { runsOn, nodeVersion, testCommand, junitPath });
+  if (!nonEmptyString(cron)) throw new Error("renderNightlyFullSuiteLane: cron is required and must be a non-empty cron expression");
+
+  return `# Generated by dynamic-qa's GitHub Actions adapter (ticket #154). This is the
+# nightly full-suite lane: it observes broader critical-flow coverage
+# continuously and never gates a merge (continue-on-error is set at the
+# job level — no merge is happening off a scheduled run). Do not hand-edit
+# generated Bindings or this workflow without re-running
+# dynamic-qa/qa-generate; drift will be detected and blocks before the next
+# test run.
+name: ${workflowName}
+
+on:
+  schedule:
+    - cron: "${cron}"
+
+permissions:
+  contents: read
+
+jobs:
+  dynamic-qa-nightly:
+    name: dynamic-qa nightly full suite (does not gate the merge)
+    runs-on: ${runsOn}
+    timeout-minutes: ${timeoutMinutes}
+    continue-on-error: true
+    steps:
+${renderCommonSteps({ nodeVersion, driftGateScript, annotationsScript, summaryScript, testCommand, junitPath, testStepName: "Run the full active portfolio" })}`;
+}
+
+/**
+ * Renders the manual/provider-API trigger lane (`workflow_dispatch`).
+ * ADVISORY (continue-on-error: true — a requested run produces evidence,
+ * it does not itself enforce anything) and, deliberately, carries NO
+ * `inputs:` at all: "a coding agent can request deterministic regression
+ * evidence without owning QA policy" is enforced by construction — there
+ * is nothing in the trigger for a requester to set, so a dispatch cannot
+ * change which command, runner, or identity this lane executes with.
+ */
+export function renderManualTriggerLane(config = {}) {
+  const {
+    workflowName = "dynamic-qa manual/provider trigger",
+    runsOn,
+    nodeVersion,
+    timeoutMinutes = DEFAULT_TIMEOUT_MINUTES,
+    testCommand,
+    junitPath,
+    driftGateScript = "dynamic-qa/shared/scripts/drift-gate-cli.mjs",
+    annotationsScript = "dynamic-qa/shared/scripts/github-actions-annotations-cli.mjs",
+    summaryScript = "dynamic-qa/shared/scripts/github-actions-summary-cli.mjs",
+  } = config;
+
+  validateCommonConfig("renderManualTriggerLane", { runsOn, nodeVersion, testCommand, junitPath });
+
+  return `# Generated by dynamic-qa's GitHub Actions adapter (ticket #154). This is the
+# manual/provider trigger lane: a coding agent or MCP integration can
+# request deterministic regression evidence (via the Actions UI, \`gh
+# workflow run\`, or the REST API) WITHOUT owning QA policy — this trigger
+# declares no inputs, so a request cannot change the command, runner, or
+# identity fixed below. ADVISORY (continue-on-error is set): a requested
+# run produces evidence, it never itself gates a merge. Do not hand-edit
+# generated Bindings or this workflow without re-running
+# dynamic-qa/qa-generate; drift will be detected and blocks before the next
+# test run.
+name: ${workflowName}
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dynamic-qa-manual:
+    name: dynamic-qa manual/provider trigger (does not gate the merge)
+    runs-on: ${runsOn}
+    timeout-minutes: ${timeoutMinutes}
+    continue-on-error: true
+    steps:
+${renderCommonSteps({ nodeVersion, driftGateScript, annotationsScript, summaryScript, testCommand, junitPath, testStepName: "Run the requested deterministic Bindings" })}`;
+}
+
+/**
+ * Renders the merge-group lane (`merge_group`), for repositories using a
+ * GitHub merge queue. REQUIRED — deliberately the only one of the four
+ * lanes that omits `continue-on-error`: the entire point of a merge-group
+ * trigger is that its result gates the merge queue's required checks
+ * (spec §8 / User Story 68), so a failure here must be a real, unmasked
+ * job failure. The repository operator must still add this job's `name:`
+ * to branch protection's required-status-checks list — this renderer emits
+ * the workflow, it does not itself reach into repository settings (spec's
+ * "discovery is read-only... nothing is touched until separate approvals"
+ * invariant applies here too).
+ */
+export function renderMergeGroupLane(config = {}) {
+  const {
+    workflowName = "dynamic-qa merge-group required check",
+    runsOn,
+    nodeVersion,
+    timeoutMinutes = DEFAULT_TIMEOUT_MINUTES,
+    testCommand,
+    junitPath,
+    driftGateScript = "dynamic-qa/shared/scripts/drift-gate-cli.mjs",
+    annotationsScript = "dynamic-qa/shared/scripts/github-actions-annotations-cli.mjs",
+    summaryScript = "dynamic-qa/shared/scripts/github-actions-summary-cli.mjs",
+  } = config;
+
+  validateCommonConfig("renderMergeGroupLane", { runsOn, nodeVersion, testCommand, junitPath });
+
+  return `# Generated by dynamic-qa's GitHub Actions adapter (ticket #154). This is
+# the merge-group REQUIRED lane: unlike the advisory PR/nightly/manual
+# lanes, this job does NOT set continue-on-error — its result must actually
+# gate the merge queue's required checks (add this job's name to branch
+# protection's required-status-checks list). Do not hand-edit generated
+# Bindings or this workflow without re-running dynamic-qa/qa-generate;
+# drift will be detected and blocks before the next test run.
+name: ${workflowName}
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  dynamic-qa-merge-group:
+    name: dynamic-qa merge-group required check
+    runs-on: ${runsOn}
+    timeout-minutes: ${timeoutMinutes}
+    steps:
+${renderCommonSteps({ nodeVersion, driftGateScript, annotationsScript, summaryScript, testCommand, junitPath, testStepName: "Run relevant deterministic Bindings" })}`;
+}
+
 // --- the hardening detector -------------------------------------------------
 
 function namedIssue(code, message) {
@@ -187,6 +442,13 @@ function namedIssue(code, message) {
 }
 
 const USES_LINE_RE = /^\s*-?\s*uses:\s*([^\s#]+)/gm;
+
+const EXPECTED_TRIGGER_KEY = Object.freeze({
+  pull_request: SAFE_PR_TRIGGER,
+  schedule: "schedule",
+  workflow_dispatch: "workflow_dispatch",
+  merge_group: "merge_group",
+});
 
 /**
  * Scans rendered (or arbitrarily mutated) GitHub Actions workflow YAML text
@@ -197,11 +459,25 @@ const USES_LINE_RE = /^\s*-?\s*uses:\s*([^\s#]+)/gm;
  * check should look like (mirrors restricted-yaml.mjs's own "accept only
  * the safe subset" ethos, applied here to detection rather than parsing).
  *
+ * `options.lane` (default `"advisory"`): `"advisory"` requires
+ * `continue-on-error: true` (unchanged #153 behaviour); `"required"`
+ * (#154, the merge-group lane) requires the OPPOSITE — the absence of
+ * `continue-on-error: true`, because a required lane's whole purpose is to
+ * actually gate. `options.trigger` (default `"pull_request"`, #153's only
+ * lane): which of the four Provider-native CI events this text is expected
+ * to declare (`"pull_request"`, `"schedule"`, `"workflow_dispatch"`, or
+ * `"merge_group"`) — `pull_request_target` is forbidden unconditionally
+ * regardless of `trigger`. `trigger: "workflow_dispatch"` additionally
+ * requires the `on:` block to declare no `inputs:` at all (#154's manual
+ * lane: "a request cannot change policy" is enforced by there being
+ * nothing for a request to set).
+ *
  * Returns `{ valid, errors }`; every violation gets its own named `code` so
  * a Tier 1 test (or a real CI drift check) can assert on exactly which
  * property was violated, never a single generic "unsafe workflow" flag.
  */
-export function checkWorkflowHardening(yamlText) {
+export function checkWorkflowHardening(yamlText, options = {}) {
+  const { lane = "advisory", trigger = SAFE_PR_TRIGGER } = options;
   const issues = [];
   const text = typeof yamlText === "string" ? yamlText : "";
 
@@ -233,17 +509,38 @@ export function checkWorkflowHardening(yamlText) {
     }
   }
 
-  // 4. safe PR event only — pull_request_target is never used.
+  // 4. pull_request_target is forbidden unconditionally, regardless of
+  //    which lane/trigger this text belongs to; the expected trigger event
+  //    for THIS lane must be declared.
   if (new RegExp(`\\b${FORBIDDEN_PR_TRIGGER}\\b`).test(text)) {
     issues.push(namedIssue("trigger.unsafe-pull-request-target", `${FORBIDDEN_PR_TRIGGER} grants base-repository secrets/token to untrusted fork PR code and must never be used`));
   }
-  if (!new RegExp(`^\\s*${SAFE_PR_TRIGGER}:`, "m").test(text)) {
-    issues.push(namedIssue("trigger.missing-safe-pull-request-event", `no ${SAFE_PR_TRIGGER} trigger found`));
+  const expectedTriggerKey = EXPECTED_TRIGGER_KEY[trigger] ?? SAFE_PR_TRIGGER;
+  if (!new RegExp(`^\\s*${expectedTriggerKey}:`, "m").test(text)) {
+    issues.push(namedIssue("trigger.missing-declared-event", `no ${expectedTriggerKey} trigger found (expected for trigger=${JSON.stringify(trigger)})`));
   }
 
-  // 5. advisory lane never gates the merge.
-  if (!/continue-on-error:\s*true/.test(text)) {
+  // 5. gating semantics depend on the lane: an advisory lane
+  //    (pull_request/nightly/manual) must never be able to fail the merge
+  //    gate; a required lane (#154's merge-group) must actually be able to,
+  //    so continue-on-error must be ABSENT there.
+  const hasContinueOnError = /continue-on-error:\s*true/.test(text);
+  if (lane === "advisory" && !hasContinueOnError) {
     issues.push(namedIssue("advisory.not-continue-on-error", "the job does not set continue-on-error: true — an advisory lane must never be able to fail the merge gate"));
+  }
+  if (lane === "required" && hasContinueOnError) {
+    issues.push(namedIssue("required.continue-on-error-present", "the job sets continue-on-error: true — a required lane (e.g. merge-group) must actually be able to fail and gate the merge queue, not mask its own failure"));
+  }
+
+  // 8. a manual/provider (workflow_dispatch) trigger declares no inputs at
+  //    all — "a request cannot change policy" is enforced by there being
+  //    nothing in the trigger for a requester to set.
+  if (trigger === "workflow_dispatch") {
+    const onSectionMatch = /^on:\n([\s\S]*?)\n\n/m.exec(text);
+    const onSection = onSectionMatch ? onSectionMatch[1] : text;
+    if (/inputs:/.test(onSection)) {
+      issues.push(namedIssue("dispatch.inputs-not-permitted", "workflow_dispatch declares inputs — a manual/provider trigger must not be able to influence which command, runner, or identity the lane executes with"));
+    }
   }
 
   // 6. unreviewed PR jobs get no secrets, OIDC, protected environment, write
