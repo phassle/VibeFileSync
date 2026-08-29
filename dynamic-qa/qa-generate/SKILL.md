@@ -6,11 +6,12 @@ metadata:
   version: "{{BUNDLE_VERSION}}"
 ---
 
-STATUS: skeletal build. This `SKILL.md` establishes the explicit-invocation
-contract, the installation precondition, and placeholders for the stages spec
-issue #135 assigns to later tickets (#143 onward). It does not yet implement
-generation, adoption, or repair behavior — that content is deliberately not
-invented here. See `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 7. qa-generate
+STATUS: partial build. #146 lands the walking-skeleton generation path for
+one explicit Flow ID: preflight validation, the smallest conforming Binding
+in the customer's existing layout, the assertion↔Expected-Outcome-ID
+completeness gate, the forbidden-pattern gate, and the Provenance Manifest.
+`--all-ready` and `repair` remain placeholders for later tickets (build-scope
+items 4 and 6). See `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 7. qa-generate
 SKILL.md outline` (run notes) for the full target workflow this file will grow
 into. Repair is a mode of this skill; no separate `qa-heal` skill exists or
 will exist.
@@ -67,30 +68,92 @@ do not invoke `dynamic-skills-setup` yourself:
 This mirrors `dynamic-implement`'s own manual-setup-entry table exactly;
 `qa-generate` does not define a setup command of its own.
 
-## Stages not yet built (placeholders for later tickets)
+## Stages built by #146 (single explicit `<flow-id>`), and stages still placeholders
 
-Each numbered stage below is a placeholder. Do not invent its content here;
-implement it in the ticket that owns it.
+`--all-ready` (looping this workflow per ready flow, stopping per flow on its
+own blocker) and `repair` remain placeholders for a later ticket. Everything
+below is single explicit-Flow-ID generation, real as of #146.
 
 ### Generation mode
 
-1. **Validate** schemas, Flow State, approvals, origin tickets, data, Execution
-   Profile, Capability Gate, source commit, existing harness, and current
-   provenance — placeholder for ticket(s) under build-scope item 4
-   (`qa-generate generation/adoption, level selection, Flow-to-Binding mapping,
-   provenance, and candidate verification`).
-2. **Reuse or generate** the smallest conforming Binding — placeholder, same
-   scope.
-3. **Infer the cheapest deterministic level** — placeholder, same scope.
-4. **Map every assertion** to stable Flow step and Expected Outcome IDs —
-   placeholder, same scope.
-5. **Update provenance and CI enrollment** in the same patch — placeholder,
-   same scope; also build-scope item 5 (`deterministic drift/result tooling
-   plus GitHub Actions adapter`).
-6. **Verify the candidate** on the pinned source commit — placeholder, same
-   scope.
-7. **Present one review packet, emit a patch, and stop** — placeholder, same
-   scope.
+1. **Preflight.** Call `runGenerationPreflight` from
+   `dynamic-qa/shared/scripts/preflight.mjs` with the flow's source text and
+   filename, the repository's `qa/data` directory, the two approval booleans
+   evidenced by the repository's own review/approval history (see that
+   module's header comment — `qa-generate` supplies this evidence, it does
+   not re-derive it), the Execution Profile ID this generation targets (an ID
+   only — the Execution Profile artifact itself is #150's), the exact pinned
+   source commit SHA, the existing-harness descriptor (framework, test
+   directory, deterministic run command) discovered from the repository, and
+   the current `qa/provenance.json` if one exists. On `{ ready: false }`,
+   **stop immediately** and report the exact `reason` code and `issues` —
+   never proceed, never guess, never retry with different inputs. On
+   `{ ready: true }`, the returned `flowData` and `dataSets` are what every
+   later step below uses; do not re-parse the flow or re-resolve its data
+   sets.
+2. **Reuse or generate the smallest conforming Binding.** Inspect the
+   existing test layout and framework (from the preflight `harness`
+   descriptor) for a deterministic test already proving every Expected
+   Outcome from step 1's `flowData`; adopt it if so. Otherwise author the
+   smallest new Binding file that fits the existing layout's conventions —
+   this is the one genuinely generative part of this workflow, and belongs
+   here in prose, not in the deterministic core. #147 owns the actual
+   adoption-detection heuristics; until then, treat "no obviously matching
+   existing test" as "generate new".
+3. **Infer the cheapest deterministic level.** Placeholder pending #147's
+   inference machinery. Until then, honor `flowData.test_level` exactly: an
+   `inferred` selection with no override machinery yet available means
+   choosing the cheapest layer this skill can directly verify (prefer API/CLI
+   over browser when the flow's boundaries make both faithful); an
+   `override` selection's `value` is authoritative and must be used as-is.
+4. **Map every assertion to stable Flow step and Expected Outcome IDs, then
+   verify.** Build the candidate's assertion list as
+   `{ stepId, outcomeId, location }` entries mirroring exactly which step and
+   outcome each assertion proves, and pass every file the candidate writes
+   plus that assertion list to `verifyCandidateBinding` in
+   `dynamic-qa/shared/scripts/binding-verification.mjs`. This is the checked
+   gate the run brief requires: **the deterministic core decides
+   acceptance, never the model that authored the candidate.** On
+   `{ accepted: false }`, discard the candidate, report the exact
+   `reasons` (`incomplete-outcome-coverage`, `forbidden-pattern-present`) and
+   their `coverage`/`forbidden` detail, and stop — do not patch around a
+   rejected candidate by weakening coverage or silencing a forbidden
+   pattern.
+5. **Build and write the Provenance Manifest in the same patch.** Once
+   accepted, call `buildBindingRecord` then `insertOrUpdateBindingRecord`
+   from `dynamic-qa/shared/scripts/provenance.mjs` with: `flowData` and
+   `dataSets` from step 1; digests of the pinned flow/data JSON Schema files
+   in use; the exact pinned `sourceCommit`; a `generator` object naming
+   `identity: "generated"` (or `"adopted"` plus `adoptedFrom` for step 2's
+   adoption path), the installed `BUNDLE_VERSION`, a content digest
+   identifying the exact generator code, and the coding harness/model that
+   authored the candidate; the discovered `framework`/adapter identity and
+   version; `harnessInputs` naming any config/lockfile paths this generation
+   read, each with its own digest; `outputs` naming every file the candidate
+   wrote, each with its own digest; conservative `impactPaths`; the
+   `enforcementLane` — brownfield candidates are `advisory`; a first active
+   greenfield Binding is `required` unless repo governance records an
+   explicit exception (spec §8); and `executionProfile: { id }` (digest
+   optional until #150 defines the artifact). Write the serialized result
+   (`serializeProvenanceManifest`) to `<repository>/qa/provenance.json` in
+   the same patch as the Binding file(s) — never separately.
+   Deterministic-CI enrollment beyond this manifest write is #148's
+   territory (the drift gate) and not yet built here.
+6. **Verify the candidate.** Run the affected flow's new/adopted test in the
+   approved candidate-verification sandbox (safe execution Trust Zone 2,
+   spec §11) against the pinned source commit. Negative controls, neighbor-
+   flow verification, and the drift gate itself remain placeholders — #148
+   and #152 own that machinery; until it lands, running the new test once
+   and requiring it to pass is the whole of this step.
+7. **Present one review packet, emit a patch, and stop.** Show the level
+   rationale, the Flow-to-Binding mapping (every assertion's stepId/outcomeId
+   pair from step 4), the exact diff (Binding file(s) plus
+   `qa/provenance.json`), the preflight/verification results, and note any
+   residual risk (e.g. level inference not yet built, adoption detection not
+   yet built). Require the same approvals preflight already evidenced —
+   `qa-generate` does not ask again, it reports what it already required.
+   Emit the patch and stop: this skill never merges, activates a required
+   check, or runs anything beyond step 6's single verification pass.
 
 ### Repair mode (`qa-generate repair --evidence ...`)
 
