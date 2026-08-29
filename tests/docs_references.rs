@@ -161,13 +161,14 @@ fn named_anywhere(root: &Path, relative: &Path, name: &str) -> bool {
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let path = entry.path();
-        if !walk_into(&path) {
+        let is_directory = path.is_dir();
+        if is_directory && !walk_into(&path) {
             continue;
         }
         if file_name == name {
             return true;
         }
-        if path.is_dir() && named_anywhere(root, &relative.join(file_name), name) {
+        if is_directory && named_anywhere(root, &relative.join(file_name), name) {
             return true;
         }
     }
@@ -332,17 +333,17 @@ const ATTR_VOL_UUID: u32 = 0;
     assert!(!declares(source, "unsafe"));
 }
 
-/// A git worktree inside this tree is still a whole repository, and both walks have to
-/// stop at its edge. `.sandcastle/main.mts` puts one per issue under
-/// `.sandcastle/worktrees/`, directly below a root `docs` walks, so a loop run turned
-/// this suite red over the upstream skill templates in the *copy* — a failure that says
-/// nothing about the change under test and reads like the agent broke the build.
+/// Both halves of `walk_into`, read by both walks. A directory one walk enters and the
+/// other skips is the hole the shared rule exists to close, so the fixture asks the same
+/// question of each: a nested checkout is not this tree (see `is_nested_checkout` for
+/// what a loop run costs without that), and a vendored directory is not this tree's to
+/// document.
 ///
 /// Pinned against a fixture rather than against the live tree, because the live tree
 /// only has a worktree in it while a loop is running, which is precisely when nobody is
 /// watching this test.
 #[test]
-fn the_walks_stop_at_a_nested_checkout() {
+fn the_walks_stop_at_a_nested_checkout_and_at_excluded_names() {
     let fixture = tempfile::tempdir().expect("a temporary directory");
     let root = fixture.path();
     fs::create_dir_all(root.join("docs")).expect("the fixture's own docs");
@@ -350,10 +351,13 @@ fn the_walks_stop_at_a_nested_checkout() {
 
     let nested = root.join("docs/worktrees/issue-1");
     fs::create_dir_all(nested.join("docs")).expect("the nested checkout's docs");
-    // A worktree records its git directory in a `.git` file; a clone has it as a
-    // directory. Either is enough to say "this is somebody else's tree".
+    // The loop's worktrees carry the marker as a file, so the fixture writes one.
     fs::write(nested.join(".git"), "gitdir: /elsewhere\n").expect("the worktree marker");
     fs::write(nested.join("docs/copied.md"), "").expect("a document the copy carries");
+
+    let vendored = root.join("docs/node_modules");
+    fs::create_dir_all(&vendored).expect("a vendored directory");
+    fs::write(vendored.join("vendored.md"), "").expect("a document this tree does not own");
 
     let mut found = Vec::new();
     markdown_under(root, Path::new("docs"), &mut found);
@@ -361,6 +365,7 @@ fn the_walks_stop_at_a_nested_checkout() {
 
     assert!(named_anywhere(root, Path::new("."), "own.md"));
     assert!(!named_anywhere(root, Path::new("."), "copied.md"));
+    assert!(!named_anywhere(root, Path::new("."), "vendored.md"));
 }
 
 #[test]
