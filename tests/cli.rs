@@ -602,6 +602,20 @@ fn pair_list_json_emits_the_versioned_schema() {
 }
 
 #[test]
+fn pair_list_help_names_the_json_schema() {
+    let fx = Fixture::new();
+
+    let output = fx.cmd().args(["pair", "list", "--help"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_OK), "{output:?}");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("vibefilesync.pairs/v1"),
+        "--help should name the pairs schema: {stdout}"
+    );
+}
+
+#[test]
 fn pair_add_pins_both_volume_uuids_into_the_config_file() {
     let fx = Fixture::new();
     fx.add_photos_pair();
