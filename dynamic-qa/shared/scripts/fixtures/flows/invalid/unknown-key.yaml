@@ -1,0 +1,24 @@
+schema: dynamic-qa-flow-v1
+id: unknown-key-flow
+revision: 1
+title: "Has an unknown top-level key"
+intent: "Should be rejected by schema validation."
+criticality: low
+state: draft
+origin:
+  tickets:
+    - "https://example.com/1"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: b
+    system: s
+    treatment: real
+    behavior: b
+    side_effects: none
+steps:
+  - id: given-a
+    kind: given
+    intent: "irrelevant"
+selector: ".btn-primary"

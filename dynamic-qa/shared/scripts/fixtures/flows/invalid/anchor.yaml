@@ -1,0 +1,23 @@
+schema: dynamic-qa-flow-v1
+id: anchor-flow
+revision: 1
+title: &t "Uses a YAML anchor"
+intent: "Should be rejected before schema validation even runs."
+criticality: low
+state: draft
+origin:
+  tickets:
+    - "https://example.com/1"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: b
+    system: s
+    treatment: real
+    behavior: b
+    side_effects: none
+steps:
+  - id: given-a
+    kind: given
+    intent: "irrelevant"

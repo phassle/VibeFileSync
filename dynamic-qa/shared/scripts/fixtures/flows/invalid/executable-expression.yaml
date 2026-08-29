@@ -1,0 +1,32 @@
+schema: dynamic-qa-flow-v1
+id: executable-expression-flow
+revision: 1
+title: "Expected Outcome uses an expression instead of scalar substitution"
+intent: "Should be rejected by the Expected Outcome text validator, not the YAML parser."
+criticality: low
+state: draft
+origin:
+  tickets:
+    - "https://example.com/1"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: b
+    system: s
+    treatment: real
+    behavior: b
+    side_effects: none
+steps:
+  - id: given-a
+    kind: given
+    intent: "irrelevant"
+  - id: when-b
+    kind: when
+    intent: "irrelevant"
+  - id: then-c
+    kind: then
+    intent: "irrelevant"
+    outcomes:
+      - id: outcome-one
+        expect: "The report reads '${case.name.toUpperCase()}'."

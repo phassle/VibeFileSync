@@ -56,14 +56,15 @@ choosing between them is:
   secret patterns, redirect/DNS-change payloads. All of these are "does this
   parser/validator reject this input", not "does the agent behave correctly"
   — write them as `node:test` cases against the deterministic core.
-- `run.sh` runs `node --test dynamic-qa/shared/scripts` as-is. Today it
-  reports "no test files yet" and exits cleanly — expected until a later
-  ticket lands the first core module. Nothing about running the harness
-  needs to change when that happens.
-- `dynamic-qa/build.sh` does not yet copy `shared/scripts/` into either
-  skill's installed tree (its existing `shared/schemas` / `shared/references`
-  copy-and-byte-diff pattern needs extending the same way) — flagged here and
-  in `PLACEHOLDER.md` for whichever ticket lands the first real module.
+- `run.sh` runs `node --test dynamic-qa/shared/scripts` as-is. It reported "no
+  test files yet" and exited cleanly before #143 landed the first core
+  module (restricted-YAML parsing, Flow Definition schema validation,
+  canonical digests); nothing about running the harness had to change when
+  that happened, and nothing should for the next module either.
+- `dynamic-qa/build.sh` copies `shared/scripts/**/*.mjs` (implementation
+  modules only, not `*.test.mjs` or `fixtures/`) into each skill's installed
+  tree and byte-diffs the two copies, the same way it already handled
+  `shared/schemas` and `shared/references`.
 
 A worked example proving the mechanism itself lives at
 `dynamic-qa/acceptance/selftest/` — see that directory's own README for why

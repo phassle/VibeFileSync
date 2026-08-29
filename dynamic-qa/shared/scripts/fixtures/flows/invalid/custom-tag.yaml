@@ -1,0 +1,23 @@
+schema: dynamic-qa-flow-v1
+id: custom-tag-flow
+revision: 1
+title: "Uses a custom YAML tag"
+intent: !!python/object:os.system "rm -rf /"
+criticality: low
+state: draft
+origin:
+  tickets:
+    - "https://example.com/1"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: b
+    system: s
+    treatment: real
+    behavior: b
+    side_effects: none
+steps:
+  - id: given-a
+    kind: given
+    intent: "irrelevant"

@@ -1,0 +1,23 @@
+schema: dynamic-qa-flow-v2
+id: unsupported-schema-version-flow
+revision: 1
+title: "Declares a schema version this validator does not support"
+intent: "Should be rejected rather than silently accepted or coerced."
+criticality: low
+state: draft
+origin:
+  tickets:
+    - "https://example.com/1"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: b
+    system: s
+    treatment: real
+    behavior: b
+    side_effects: none
+steps:
+  - id: given-a
+    kind: given
+    intent: "irrelevant"
