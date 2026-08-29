@@ -1798,3 +1798,61 @@ all three: advisory, required, quarantine — this ticket adds only the one
 new REQUIRED renderer, for merge-group). Impact-path-based Binding selection,
 full semantic inventory of third-party workflow YAML, and action-pin
 freshness re-verification remain exactly as #153 left them.
+
+## 29. Quarantine overlay (#161)
+
+`shared/scripts/quarantine.mjs` (37 tests), schema
+`shared/schemas/dynamic-qa-quarantine-v1.schema.json`, reference
+`shared/references/quarantine.md`.
+
+**Overlay, not a fourth axis.** This module imports no mutator from
+`lifecycle-state.mjs` (#157) and exports none of its own. A Quarantine
+Record's full key set (`QUARANTINE_KEYS`) shares no key with any of the
+three axes' delta shapes (`{to,context}` / `{freshness}` /
+`{qualifyingRunSummary,approval}`), proven by
+`quarantineSharesNoKeyWithLifecycleAxisDeltas()` and by three tests that
+pass a real Quarantine Record straight into `applyFlowStateChange`,
+`applyBindingFreshnessReport`, and `applyEnforcementPromotion` and confirm
+each refuses it on foreign keys alone.
+
+**Both approvals, always already granted.** `createQuarantineRecord` is the
+only constructor and reuses `authority.mjs`'s `qaOwnerGate`/
+`technicalOwnerGate` shape, tightened so both gates must already be
+`present:true` with a named `identifier` — there is no pending/partial
+state a caller can construct a valid record from. No function anywhere in
+the bundle derives a Quarantine Record automatically from a Diagnosis
+Record or a failed run; quarantine is always this explicit human call.
+
+**Default seven-day expiry, fail-closed on both expiry and malformed
+shape.** `DEFAULT_QUARANTINE_DAYS = 7`; `defaultExpiry(startAt)` computes
+it when a caller omits `expiresAt`. `isQuarantineActive(record, now)`
+returns `{active:false, reason:"expired"}` once `now >= expiresAt`, and
+`{active:false, reason:"malformed"}` for any record failing
+`validateQuarantineRecord` (missing approval, bad timestamp, wrong
+`effectiveLane`, etc.) — both collapse to the same "no exception" outcome
+for every downstream function; there is no third, more permissive state.
+
+**Never counts as pass, coverage, or qualification — proven three ways.**
+`quarantineReportStatus` hard-codes `countsAsPass`/`countsAsCoverage`/
+`countsAsQualifying` to the literal `false` whenever quarantine is active,
+regardless of the caller's own `testPassed` value.
+`contributesToCoverage` returns `false` for any actively-quarantined
+`bindingId`. `excludeQuarantinedFromQualifyingRuns` /
+`summarizeQualifyingRunsExcludingQuarantine` filter matching runs out
+*before* handing the rest to #157's own, unmodified `isQualifyingRun` /
+`summarizeQualifyingRuns` — reusing that Qualifying Run model exactly,
+rather than re-implementing it, to prove a quarantined Binding cannot
+qualify.
+
+**Visibility.** `describeQuarantineForReporting` always names the
+`flowId`/`bindingId` and the exact reason (`active` / `expired` /
+`malformed`), even for a malformed record, with `missingProtection: true`
+on an active quarantine — a quarantined flow never silently disappears
+from a report.
+
+**Coordination note:** neither `SKILL.md` was touched (per this ticket's
+coordination note); the existing repair-mode placeholder text in
+`qa-generate/SKILL.md` ("failure evidence, diagnosis, proposal-only
+repair, negative-control gate, and quarantine validation") is unchanged.
+Failure Evidence Bundle modeling is #159's territory and is not
+duplicated here — `originatingFailureRef` is only a stable pointer.
