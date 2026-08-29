@@ -6,16 +6,18 @@ metadata:
   version: "{{BUNDLE_VERSION}}"
 ---
 
-STATUS: stages 1–5 built (ticket #162: authority and sourced inventory;
+STATUS: stages 1–6 built (ticket #162: authority and sourced inventory;
 ticket #163: posture-specific evidence; ticket #164: risk ranking and
-one-flow interviews). Stages 6–10 remain placeholders for later tickets — do
-not invent their content here. See
+one-flow interviews; ticket #165: portfolio reconciliation and per-flow
+review). Stages 7–10 remain placeholders for later tickets — do not invent
+their content here. See
 `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 6. qa-setup SKILL.md outline` (run
 notes) for the full target workflow this file will grow into,
 `dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2,
-`dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3, and
+`dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3,
 `dynamic-qa/shared/references/candidate-ranking-and-interviews.md` for
-stages 4–5 below.
+stages 4–5, and `dynamic-qa/shared/references/portfolio-reconciliation.md`
+for stage 6 below.
 
 ## Explicit invocation only
 
@@ -306,12 +308,61 @@ flows from one interview, and never a partial one left half-assembled.
 See `shared/references/candidate-ranking-and-interviews.md` for the full
 rationale and the deterministic core's test coverage for each rule above.
 
+## Stage 6: Reconcile the portfolio
+
+Once every selected candidate has been through stage 5, look at the whole
+set together — a pile of independently-sensible interviews can still be an
+incoherent portfolio.
+
+1. **Run reconciliation across every assembled Flow Definition.** Call
+   `shared/scripts/portfolio-reconciliation.mjs`'s `reconcilePortfolio` over
+   the full in-memory set stage 5 produced (nothing has been written to the
+   repository yet). It surfaces, by name: duplicate flows, contradictory
+   Expected Outcomes, conflicting boundary treatments for a shared
+   dependency, colliding isolation namespaces, unresolved Named Data Set
+   references, and candidate CI-lane disagreement over a shared real
+   dependency. Present every named issue plainly — which flows, which
+   field, which values disagree — never a vague "something doesn't match."
+2. **Never resolve a conflict yourself.** `reconcilePortfolio` only reports;
+   it has no "auto-resolve", "prefer the newer one", or "drop the
+   duplicate" mode, and this stage must not invent one in conversation
+   either. Bring each named conflict to the QA Owner (and the Technical
+   Owner for boundary/data/lane conflicts) and let them decide how to
+   change the underlying flow(s) — rename an outcome, reclassify a
+   boundary, adjust a namespace, retire a duplicate. Re-run
+   `reconcilePortfolio` after any change; do not assume a fix worked
+   without seeing the issue disappear from a fresh run.
+3. **Present the exact YAML for each flow, one more time, before approval.**
+   For every flow entering the approved portfolio, call
+   `portfolio-reconciliation.mjs`'s `buildFlowReview(flow, report)` — it
+   renders through the same `flow-yaml.mjs` renderer stage 5 already used,
+   so what the QA Owner reviews here is byte-identical to what a later
+   write would produce, not a paraphrase or a summary. Show the YAML
+   alongside any reconciliation issues still naming that flow.
+4. **Record approval per flow, never as a batch rubber stamp.** Once a
+   flow's reconciliation issues are gone and the QA Owner (or Technical
+   Owner, per `fact.mjs`'s `CONFIRMING_ROLES`) explicitly approves it, call
+   `recordFlowApproval(flowId, report, approval)`. A flow still named in an
+   unresolved issue cannot be approved through this function no matter what
+   the approval record says — it always returns `{ approved: false, state:
+   "draft" }` for that flow. This is what makes SPEC-135 story 39 real:
+   **a flow with unresolved disagreement stays draft and does not enter the
+   approved portfolio; setup does not weaken the contract to finish.**
+5. **Roll approvals up to the portfolio.** Call
+   `evaluatePortfolioApproval(flows, report, approvals)` and present its
+   `approvedFlowIds`/`draftFlowIds` split plainly. A `portfolioFullyApproved:
+   false` result — because one or more flows stayed draft — is a normal,
+   expected stopping point to report, not an error to explain away or a
+   reason to loosen anything.
+
+See `shared/references/portfolio-reconciliation.md` for the full rationale
+and the deterministic core's test coverage for each rule above.
+
 ## Stages not yet built (placeholders for later tickets)
 
 Each numbered stage below is a placeholder. Do not invent its content here;
 implement it in the ticket that owns it.
 
-6. **Reconcile the portfolio** — placeholder, same scope.
 7. **Define safe execution (Execution Profiles, Capability Gate)** — placeholder,
    same scope.
 8. **Establish measurement readiness (Baseline Plan)** — placeholder, same scope.

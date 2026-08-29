@@ -478,3 +478,68 @@ repository) to find duplicates, contradictions, and shared boundaries
 across the whole portfolio. Nothing in this ticket performs cross-flow
 reconciliation; `assembleFlowDefinition`'s single-flow validation is not a
 substitute for it.
+
+## 17. Portfolio reconciliation (#165)
+
+**A new module, `portfolio-reconciliation.mjs`, is the whole-of-portfolio
+computation #164's stage 5 explicitly left open.** It runs six independent
+detectors — duplicate flows, contradictory Expected Outcomes, conflicting
+boundary treatments for a shared dependency, colliding isolation
+namespaces, unresolved Named Data Set references, and candidate-lane
+disagreement over a shared real dependency — plus a state-declaration
+check that folds in whatever the first six found. Every issue names the
+exact flows and fields in conflict; none of them merge, drop, or auto-pick
+a side.
+
+**"Unresolved disagreement keeps a flow draft" (SPEC-135 story 39) is made
+structurally impossible to bypass, not just documented as a rule.**
+`issuesForFlow(report, flowId)` throws rather than returning `[]` when it is
+not given a real `reconcilePortfolio` result, so a caller cannot
+accidentally read "no report" as "no issues." `evaluateFlowForPortfolio`
+and `recordFlowApproval` call it FIRST, before ever inspecting an approval
+record; every "this flow has an outstanding issue" path returns `{
+approved: false, state: "draft" }` and `recordFlowApproval`'s signature
+carries no override, force-approve, or "resolved" parameter that could flip
+that outcome. `evaluatePortfolioApproval` rolls per-flow results up to
+`portfolioFullyApproved`, which is `false` whenever even one flow stayed
+draft — reported as an ordinary, expected stopping point, never an error to
+route around.
+
+**The lane-assignment check compares each flow's OTHER signals, not the
+shared boundary itself.** A shared real, side-effecting boundary alone
+already pushes every flow that declares it toward "nightly" (see
+`classifyCandidateLane`); flagging that agreement as a "conflict" would be
+noise. `findLaneAssignmentConflicts` instead sets the shared boundary
+aside for each flow and asks what its remaining boundaries and test-level
+override would imply — a genuine disagreement about the OTHER signals is
+what gets named, so this stage does not manufacture false conflicts out of
+every flow-plus-flow pair that happens to share a real dependency.
+
+**Exact-YAML review is byte-identical by construction, not by comparison.**
+`buildFlowReview` calls #164's `flow-yaml.mjs` `renderFlowDefinitionYAML`
+directly — it does not wrap, re-implement, or format-adjust it. There is
+exactly one rendering code path in the whole bundle for a Flow Definition's
+YAML text; stage 5's Flow Review, stage 6's portfolio review, and any
+eventual repository write all go through it.
+
+**Data-set and CI-lane checks stay honest about what they don't know.**
+`findDataSetIssues` takes an optional caller-supplied `resolveDataSet`
+function (mirroring #144's "caller supplies `dataSetsDir`" contract) and
+skips the check entirely when omitted, rather than guessing at resolution.
+`classifyCandidateLane`/`findLaneAssignmentConflicts` are explicitly NOT CI
+design — no lane, trigger, or job concept exists in the schema yet (that is
+stage 9, a later ticket); this is only the coherence signal stage 9 will
+need so it does not inherit an unresolved disagreement about how often a
+shared risk should run.
+
+**Only the `qa-setup/SKILL.md` stage 6 placeholder was filled in.** No
+other stage's prose changed, and `qa-generate/SKILL.md` was not touched, per
+the run brief's coordination rule for this ticket.
+
+**Seams left for #166 and #167, explicitly:** neither Execution Profiles,
+the Capability Gate (stage 7), Baseline Plans (stage 8), provider-native CI
+design (stage 9), nor the Setup Review Packet (stage 10) exist yet. This
+ticket's `evaluatePortfolioApproval`/`recordFlowApproval` results
+(`approvedFlowIds`, `draftFlowIds`, per-flow approval records) are the
+handoff shape later stages should read rather than re-deriving "which flows
+are cleared to proceed."
