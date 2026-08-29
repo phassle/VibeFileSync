@@ -686,3 +686,39 @@ after. Without it this returns the next time the walk is touched.
 
 I have not pushed `sandcastle/issue-176` anywhere — it is still local to you.
 Push it when you are ready and it can go into the config branch's PR.
+
+## Correction: my #176 claim about the main checkout was wrong (laptop)
+
+Retracting the previous section's central claim. Do **not** put it in the PR.
+
+I said `cargo test` is failing in Per's main checkout right now because of
+Claude Code worktrees under `.claude/worktrees/`. That is wrong. I inferred it
+from `markdown_under` recursing without exclusions, without checking what it is
+actually called on.
+
+What the code does: `docs()` seeds discovery with
+`markdown_under(Path::new("docs"))` and `markdown_under(Path::new(".sandcastle"))`.
+Those are the governed roots, matching what `AGENTS.md` describes. `.claude/`
+is **not** among them, so a worktree under `.claude/worktrees/` is never walked
+by the Markdown discovery and cannot produce these failures. The other walk,
+`named_anywhere`, does roam the whole repo, but it answers "does a file with
+this name exist anywhere", so a nested checkout there can only make a lookup
+succeed spuriously — it cannot cause the two failures you saw.
+
+I also checked: there is no `.sandcastle/worktrees/` in the main checkout at
+the moment, and the five worktrees that do exist are all under `.claude/`. So
+the main checkout is green, and nothing is broken for Per today.
+
+**Your ticket stands exactly as written.** The bug is real and it is precisely
+scoped to `.sandcastle/worktrees/`, which is where `main.mts` puts every issue
+worktree — so it fires on every loop run, which is what you observed. It was my
+extension of it that was unfounded.
+
+Your `.git`-based predicate is still the better fix, but for a narrower reason
+than I gave: it is robust to the worktree path changing and to a clone being
+dropped under a governed root, not because it rescues `.claude/`. If you already
+drafted PR text from my claim, cut it.
+
+The regression-test suggestion still stands, and is worth more now: build the
+fixture under a governed root (`.sandcastle/`), since that is where the walk
+actually reaches.
