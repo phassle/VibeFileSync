@@ -127,6 +127,20 @@ any unattended run. Never enter tokens or credentials yourself.
   the next machine). I did not apply it - Per declined the edit for now - and I
   reverted the lockfile so the tree is clean. Flagging it rather than leaving
   it silent.
+- PIVOT (Per's call): the `npm run sandcastle` loop is NOT being used for this
+  first run. No `.env`, no tokens, no @ai-hero/sandcastle process. Instead the
+  ai-server Claude session itself acts as the loop, driven by a session goal:
+  poll the `Sandcastle` label, fan out one implementer subagent per unblocked
+  ticket, review, merge into chore/sandcastle-host-macos, re-poll. The
+  Sandcastle config on this branch stays as it is and is still worth keeping -
+  everything about it verified fine - but steps 6/8 of this checklist are not
+  the path being taken right now. The orchestrator mirrors the loop's
+  conventions deliberately: worktree per issue under
+  .sandcastle/worktrees/issue-<N>, branch sandcastle/issue-<N>, per-branch
+  CARGO_TARGET_DIR under ~/.cache/vibesync-sandcastle, `RALPH:` commit prefix,
+  and the same four cargo commands as the gate. So the runtime questions below
+  still get answered, just by a different driver.
+- First subagent is running now on #140.
 - The CARGO_TARGET_DIR question is still open here too - ~/.cache/vibesync-sandcastle
   does not exist yet because no pipeline has run. Will check it right after the
   first watched run and report back.
