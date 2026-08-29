@@ -3002,6 +3002,84 @@ fn metadata_mismatch_publishes_structured_warning_and_exits_zero() {
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn an_xattr_the_os_adds_to_the_destination_alone_is_not_a_metadata_mismatch() {
+    // macOS stamps `com.apple.provenance` on files it writes to an
+    // external volume, after the copy has run. A byte-perfect mirror onto
+    // exFAT reported one warning per file because of it; the copy neither
+    // caused nor could prevent the difference (ADR-0008 §1, amended).
+    let fx = Fixture::new();
+    fx.write_source("provenance.txt", "verified data");
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:xattr -w com.apple.provenance stamped \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let done = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "provenance.txt")
+        .unwrap();
+    assert_eq!(done["warnings"], serde_json::json!([]));
+    assert_eq!(rows.last().unwrap()["warnings"], 0);
+    assert_eq!(rows.last().unwrap()["result"], "success");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn an_xattr_dropped_from_the_temp_still_warns_and_names_the_attribute() {
+    let fx = Fixture::new();
+    fx.write_source("tagged.txt", "verified data");
+    assert!(ProcessCommand::new("xattr")
+        .args(["-w", "com.vibesync.slice3", "kept"])
+        .arg(fx.source.path().join("tagged.txt"))
+        .status()
+        .unwrap()
+        .success());
+    fx.add_photos_pair();
+
+    let output = fx
+        .cmd()
+        .env(
+            "VIBESYNC_TEST_EXEC_AT",
+            "copy_complete:xattr -d com.vibesync.slice3 \"$VIBESYNC_TEST_TEMP\"",
+        )
+        .args(["run", "photos", "--json", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(EXIT_OK));
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let done = rows
+        .iter()
+        .find(|row| row["type"] == "action_done" && row["path"] == "tagged.txt")
+        .unwrap();
+    assert!(done["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning["code"] == "metadata_mismatch"
+            && warning["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("com.vibesync.slice3"))
+    }));
+    assert_eq!(rows.last().unwrap()["warnings"], 1);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn apfs_one_second_mtime_delta_is_an_unexpected_metadata_mismatch() {
     let fx = Fixture::new();
     fx.write_source("metadata.txt", "verified data");
