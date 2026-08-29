@@ -55,6 +55,38 @@ The spec is finished when `completed` equals `total` and no sub-issue is still
 open. If any remain open, do nothing here — you will get another chance after
 the next iteration.
 
+## Tidy the branch before you open it
+
+Agent branches accumulate commits that are process, not change: status notes,
+coordination between machines, "picking this up" and "handing this over". They
+were useful while the work ran. They are noise to a reviewer, and they should
+not reach `develop`.
+
+So immediately before opening the pull request — and **only** then — drop them.
+That timing is the whole point: the spec is finished, so nothing else is
+building on this branch, and a rewrite can no longer strand another machine's
+work. Rewriting a branch while any agent is still committing to it is how that
+agent's work gets lost.
+
+```bash
+git log --oneline <base>..HEAD          # read it before you touch it
+git rebase -i <base>                    # drop the process commits, keep every change
+```
+
+Rules for the tidy-up:
+
+- **Drop only commits that changed nothing a reviewer needs.** If a commit
+  touched source, tests, config or documentation, it stays. When you are not
+  certain a commit is pure process, keep it — a noisy history costs a reviewer
+  a minute, a dropped change costs them the bug.
+- **Verify the tree is identical afterwards.** `git diff <sha-before-rebase> HEAD`
+  must be empty. If it is not, you dropped something real: abort and start over.
+- **Re-run the four cargo commands after the rewrite**, not just before it.
+- **Never rewrite a branch another machine may still be using**, and never
+  force-push anything but this finished spec branch. If you are unsure whether
+  a run is still active, leave the history alone and say so in the pull request
+  instead — an untidy history is a cosmetic problem, a destroyed branch is not.
+
 When it is finished, open one pull request from `{{TARGET_BRANCH}}` into
 `develop`, following this repository's gitflow (`docs/agents/git-workflow.md`):
 
