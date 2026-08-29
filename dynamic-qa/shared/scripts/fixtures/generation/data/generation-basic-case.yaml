@@ -1,0 +1,9 @@
+# Named Data Set referenced by fixtures/generation/flow-active.yaml.
+schema: dynamic-qa-data-v1
+id: generation-basic-case
+revision: 1
+cases:
+  - id: basic-change
+    fields:
+      oldContent: "Original report text"
+      newContent: "Updated report text"

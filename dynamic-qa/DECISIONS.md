@@ -271,3 +271,100 @@ built yet; `boundary-policy.mjs` only validates the Flow Definition's own
 Boundary Declarations for internal consistency. `resolveBoundaryTreatment` is
 written so an Execution Profile validator can reuse it directly rather than
 reimplementing boundary lookup.
+
+## 10. Binding generation and provenance (#146)
+
+**Decision.** #146 adds five new deterministic-core modules under
+`shared/scripts/` — `preflight.mjs`, `provenance.mjs`,
+`expected-outcome-coverage.mjs`, `forbidden-patterns.mjs`, and
+`binding-verification.mjs` — plus `shared/schemas/dynamic-qa-provenance-v1.
+schema.json`. Together they are the whole of what `qa-generate/SKILL.md`'s
+generation mode is now allowed to trust: a candidate Binding is accepted or
+rejected by this code, never solely by the model that authored it.
+
+**Two gates, not one.** `preflight.mjs` is the *pre*-generation gate: given a
+Flow ID, decide whether generation may even be attempted (contract,
+lifecycle, approvals, safety, source identity, harness, provenance — in that
+order, each with its own stable `reason` code). `binding-verification.mjs`
+(composing `expected-outcome-coverage.mjs` and `forbidden-patterns.mjs`) is
+the *post*-generation gate: given a candidate's assertions and files, decide
+whether it may be accepted. Splitting these matters because the ticket's own
+framing is "if the core cannot verify that every Expected Outcome ID is
+covered and no forbidden pattern is present, generation fails" — that check
+has to run on whatever the generative (agentic) step actually produced, not
+on the flow it was asked to realize.
+
+**"Approved" is an explicit input, not a re-derived judgment.** No approvals
+field exists on the Flow Definition schema (approvals are a Git/review-
+process fact, not repository YAML — `qa-setup`'s Setup Review Packet is the
+actual authority). `preflight.mjs` therefore takes
+`approvals: { qaOwner, technicalOwner }` as caller-supplied evidence and
+refuses to proceed without both being explicitly `true`. It does not
+re-implement the approval gate, only refuses to generate without evidence of
+it. Likewise, Flow State `active` stands in for "activation conditions
+approved" — the "deferred flow + complete Activation Proposal" resumption
+path DESIGN-dynamic-qa-spec.md §7 step 1 describes is out of scope until
+#150's Execution Profile / Capability Gate machinery exists; `deferred` and
+`retired` both stop with `flow-not-active` for now, same as `draft`.
+
+**Digest reuse, not a second scheme.** `provenance.mjs` computes every digest
+(`flowDigest`, each data set's digest) via `canonical-digest.mjs`'s
+`contentDigest`, over the same validated data models #143/#144 already
+produce — never over raw YAML text, never via a new hash function.
+
+**Deterministic ordering is a checked invariant, not a writer habit.**
+`provenance.mjs` fixes each record's key order (`RECORD_KEY_ORDER`) and sorts
+every order-insignificant collection (`bindings` by `flowId`, `dataSets` by
+`id`, `outputs`/`configPaths`/`lockfilePaths` by `path`, `impactPaths`
+lexicographically) before serializing, AND `validateProvenanceManifest`
+rejects an out-of-order collection as invalid — so a hand-edited or
+differently-assembled manifest cannot silently pass by getting re-sorted on
+the way out. `generatedAt` is caller-supplied (an injected clock), never
+`Date.now()`, so identical inputs always serialize to identical bytes.
+
+**Revision monotonicity is claimed here, per #143's open note.** #143 left
+"monotonic non-decrease across revisions" to "the provenance/drift-gate
+ticket (#146/#148)". `provenance.mjs` exports `checkRevisionMonotonic`
+(reused by `preflight.mjs`'s own gate) rather than leaving it to #148 — #148
+should call this function directly on future re-generation rather than
+reimplementing the lookup, exactly as `resolveBoundaryTreatment` set the
+precedent for #145.
+
+**Forbidden-pattern detection is exact API-name/marker matching, not
+sentiment.** `forbidden-patterns.mjs` flags fixed sleeps (`time.sleep`,
+`Thread.sleep`, Playwright `waitForTimeout`/`networkidle`, a numeric Cypress
+`cy.wait`, the `setTimeout(resolve, N)` JS sleep idiom, shell `sleep N`),
+stub/placeholder markers (`TODO`, `FIXME`, "not implemented",
+`NotImplementedError`, a literal `PLACEHOLDER`, an always-true assertion),
+and skip/pending markers (`.skip(`, `x`-prefixed suites, `.todo(`,
+`@pytest.mark.skip`, `@Disabled`, `@Ignore`, `unittest.skip`, `pending(`) —
+by fixed regex, one detector function per family so each is independently
+Tier-1-tested, deliberately excluding a Cypress *alias* wait (`cy.wait('@x')`)
+since that is a real network readiness signal, not a fixed sleep.
+
+**Seams left for later tickets, explicitly:**
+- **#147** (test-level inference / adoption): `qa-generate/SKILL.md`'s step
+  3 hard-codes "honor `flowData.test_level` as-is, prefer the cheapest layer
+  this skill can directly verify" — no inference machinery. Step 2's
+  "reuse an existing test" path is a placeholder ("no obviously matching
+  existing test" → generate new); #147 owns real adoption detection.
+- **#148** (drift gate): consumes `qa/provenance.json`; should call
+  `checkRevisionMonotonic` and `validateProvenanceManifest` directly rather
+  than reimplementing them. Deterministic-CI enrollment beyond the
+  provenance write itself (spec §7 step 5's other half) is #148's, not
+  built here.
+- **#150** (Execution Profiles / Capability Gate): `executionProfileId` is
+  taken as an opaque, caller-supplied semantic ID and required to be
+  present; no Execution Profile artifact is read, validated, or
+  capability-gated here. `provenance.mjs`'s `executionProfile.digest` field
+  is optional until #150 defines what to digest.
+- **#152** (negative controls): `qa-generate/SKILL.md` step 6 notes negative
+  controls are not yet run; the hook is "verify the candidate once" only.
+- **#149** (Browser Binding conventions): untouched; #146's Tier 2 fixture
+  and worked SKILL.md example are both non-browser (a small `node:test`
+  Binding), deliberately, to avoid inventing selector/hook conventions that
+  are #149's to define.
+
+**Revision monotonicity ownership, stated plainly (per the run brief's
+ask):** #146 (this ticket) owns and implements it, in `provenance.mjs`,
+exported for #148 to reuse.
