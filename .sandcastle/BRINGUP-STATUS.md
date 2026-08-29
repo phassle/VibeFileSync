@@ -91,6 +91,18 @@ any unattended run. Never enter tokens or credentials yourself.
   `claudeCode` / `createSandbox` / `run` / `Output` all resolve. So if the
   loop fails at startup, it is not the import path — look at `.env` loading
   or the `onSandboxReady` hook running `cargo fetch --locked` instead.
+- Config claims re-verified against the repo itself, all correct, do not
+  re-check: `Cargo.toml` really does declare
+  `[[test]] name = "acceptance"` with `required-features = ["fault-injection"]`
+  (so the flag is mandatory, plain `cargo test` silently skips that suite);
+  the `fault-injection` feature exists and is empty; `.sandcastle/.env.example`
+  carries exactly `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN`;
+  `.sandcastle/.gitignore` excludes `.env`, `logs/` and `worktrees/`; and the
+  planner's `--label Sandcastle` filter is intact. `src/run.rs` does declare
+  `F_FULLFSYNC = 51` and an `extern "C"` `copyfile` block, so the noSandbox
+  decision is sound, not a guess.
+- Note `cargo clippy --all-targets --all-features` enables `fault-injection`
+  and therefore does compile the acceptance suite. That is intended.
 - Remaining unknown at runtime: whether `noSandbox`'s `env` is actually
   forwarded into the agent's shell, i.e. whether `CARGO_TARGET_DIR` takes
   effect. Cheap check on the server once a pipeline has run:
