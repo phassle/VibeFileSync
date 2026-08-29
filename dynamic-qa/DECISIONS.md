@@ -478,3 +478,71 @@ repository) to find duplicates, contradictions, and shared boundaries
 across the whole portfolio. Nothing in this ticket performs cross-flow
 reconciliation; `assembleFlowDefinition`'s single-flow validation is not a
 substitute for it.
+
+## 13. Test level inference and adoption (#147)
+
+Two new modules in `shared/scripts/`: `level-inference.mjs`
+(`selectTestLevel`) and `adoption.mjs` (`evaluateAdoptionCandidate`,
+`adoptionGeneratorFields`), plus their `node:test` suites. New prose in
+`shared/references/test-level-and-adoption.md`, built into both skills by
+the existing generic `references/shared` copy step — no `build.sh` change
+was needed. **`qa-generate/SKILL.md` itself is untouched by this ticket**,
+per the run brief's strict coordination rule (concurrent tickets #148,
+#150, #152, #165 are all touching that file's neighboring steps); the
+implementer's report to the run coordinator carries the exact replacement
+text for steps 2 and 3 and the exact placeholder prose it replaces.
+
+**Adoption reuses #146's coverage checker; it does not duplicate it.**
+`evaluateAdoptionCandidate` calls `expected-outcome-coverage.mjs`'s
+`checkAssertionCoverage` on the existing candidate's own claimed
+`{ stepId, outcomeId, location }` assertion list — the identical function
+and identical shape generation's own step 4 already uses to gate a freshly
+authored Binding. "Provable, not optimistic" (the run brief's phrase) is
+realized structurally: adoption can only succeed by passing the same
+completeness gate a generated Binding must pass, never by a separate,
+looser heuristic. A candidate proving only some outcomes, or claiming an
+assertion against an outcome the flow does not declare, is
+`partial-coverage` and never adopted; an absent or shape-invalid candidate
+(no assertion list to check at all) is `no-candidate` /
+`unverifiable-candidate` and generation proceeds. Discovering the candidate
+and its claimed assertion list from repository source is left to the
+skill's own judgment (this is the one place in this ticket's scope that is
+genuinely interpretive, not computable) — this module only judges a claim
+once discovery hands it one.
+
+**Level inference has no fixed level hierarchy anywhere in the module.** A
+candidate is `{ id, safe, provesAllOutcomes, observable, cost }`, where `id`
+is an open-ended level name and the three booleans gate elimination
+strictly before cost is ever summed. `cost` is five caller-supplied
+non-negative numbers — `reuse`, `runtime`, `fixtureComplexity`,
+`boundaryFidelity`, `maintenance` — matching the run brief and ticket text
+verbatim; `boundaryFidelity` is a cost input here, not an elimination gate,
+because a level that can technically prove an outcome only by simulating
+away the flow's owned boundary is *expensive*, not automatically
+disqualified (a level that cannot prove the outcome at all is `incomplete`
+and eliminated regardless of its cost numbers). The lowest total wins, ties
+break by ascending `id`. Two tests exist specifically to prove "no universal
+API-vs-CLI ranking": one flow shape where `api` wins on cost, and a second,
+opposite-shaped flow where `cli` wins with the identical two ids present —
+the winner is a pure function of the cost numbers, never a hard-coded
+preference.
+
+**A Test Level Override is explicit, reviewed, and still elimination-gated.**
+`options.override = { levelId, reviewed, reason }` bypasses cost ranking,
+never elimination or the review requirement: `reviewed` must be `true` as
+caller-supplied evidence (never defaulted, never inferred from a "seems
+important" heuristic — the same discipline #145 already established for
+`role`/`volatile`), `reason` must be non-empty, and `levelId` must name a
+candidate that survived elimination. Naming an eliminated or absent level,
+or omitting/falsifying `reviewed`, fails closed (`ok: false`) rather than
+silently falling back to inference.
+
+**Assumption later implementers inherit:** this ticket does not define how
+`qa-generate` discovers a candidate's `{ stepId, outcomeId, location }`
+list from existing repository test source, nor how it derives each
+level candidate's `safe`/`observable`/cost numbers for a concrete flow —
+both are skill-prose judgment calls the two modules above take as already-
+formed input. Anyone wiring these modules into the real generation flow
+(the run coordinator's central `qa-generate/SKILL.md` edit, or a later
+ticket) still has to write that discovery/derivation logic; it is out of
+this ticket's scope because it is genuinely interpretive, not computable.
