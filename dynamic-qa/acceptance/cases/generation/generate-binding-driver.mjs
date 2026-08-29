@@ -42,8 +42,25 @@ const techApproved = process.env.TECH_APPROVED === "true";
 
 const flowSource = readFileSync(path.join(repo, "qa", "flows", `${flowId}.yaml`), "utf8");
 const dataSetsDir = path.join(repo, "qa", "data");
+const executionProfilesDir = path.join(repo, "qa", "execution-profiles");
 const testDir = "tests/e2e";
 const testFilePath = `${testDir}/${flowId}.spec.mjs`;
+
+// A Capability Gate environment that fully matches this fixture's
+// qa/execution-profiles/pilot-profile.yaml (#153's own generated GitHub
+// Actions adapter, github-actions-adapter.mjs's deriveCapabilityEvidence,
+// is the real source of this shape in production; this driver hand-builds
+// it since the fixture repo has no real CI run to derive it from).
+const environmentEvidence = {
+  paths: { enforcedRead: ["/repo"], enforcedWrite: ["/repo/tmp"] },
+  commands: { enforced: ["node --test tests/e2e"] },
+  environments: { runnerClass: "github-hosted-ubuntu", disposable: true, sandbox: "vm" },
+  resources: { maxProcesses: 4, maxCpuSeconds: 60, maxMemoryMb: 512, maxFileSizeMb: 10, maxWallTimeSeconds: 120 },
+  identities: { active: ["ci-bot"] },
+  network: { mode: "none" },
+  effects: { enforcedBoundaryIds: ["checkout-service"], namespaceIsolation: true, cleanupCapability: true },
+  evidence: [{ capability: "runtime.node-available", status: "met" }],
+};
 
 const preflight = runGenerationPreflight({
   flowSource,
@@ -51,6 +68,8 @@ const preflight = runGenerationPreflight({
   dataSetsDir,
   approvals: { qaOwner: qaApproved, technicalOwner: techApproved },
   executionProfileId: "pilot-profile",
+  executionProfilesDir,
+  environmentEvidence,
   sourceCommit: "b".repeat(40),
   harness: { framework: "node:test", testDir, command: `node --test ${testDir}` },
   existingProvenanceManifest: null,

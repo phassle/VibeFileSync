@@ -1087,3 +1087,124 @@ DESIGN-dynamic-qa-spec.md §11 zone 4 names — gets the general
 - `qa-setup/SKILL.md`'s stage 7 prose integration is deferred to the
   coordinator — see the exact replacement text and placeholder reported
   separately.
+
+## 20. GitHub Actions adapter and the advisory PR lane (#153)
+
+**GitHub Actions is the first named provider adapter**
+(DESIGN-dynamic-qa-spec.md §9). Two new modules split the concern the same
+way #150 split Execution Profile shape from Capability Gate enforcement:
+`shared/scripts/github-actions-workflow.mjs` is the pure renderer plus a
+reusable hardening detector; `shared/scripts/github-actions-adapter.mjs` is
+the seven-point provider-adapter contract (detect, prove capability
+evidence, render without deciding policy, name supported triggers, publish
+JUnit/annotations/summary, resolve a run reference, validate that generated
+configuration enforces the profile). Only the advisory pull-request lane is
+built. Required and quarantine lane rendering (contract point 3 names all
+three) are an explicit seam for a later ticket, reusing the same hardening
+detector rather than duplicating it.
+
+**The hardening detector is the acceptance mechanism, not just the
+renderer's own self-check.** `checkWorkflowHardening(yamlText)` scans
+arbitrary rendered/mutated workflow YAML text (a targeted line-scanner, not
+a general YAML parser — no dependency added) and names, individually, any
+of: missing/non-minimal `permissions`, a checkout step missing
+`persist-credentials: false`, a tag-pinned (not full-40-hex-SHA-pinned)
+action, the unsafe `pull_request_target` trigger, a job missing
+`continue-on-error: true` (which is how the advisory lane is structurally
+prevented from ever failing the merge gate — GitHub Actions' own documented
+job-level mechanism, not a policy convention this bundle merely asks for), a
+referenced secret, a requested OIDC `id-token: write` permission, a
+declared protected environment, a granted write permission scope, a
+privileged cache action, or a self-hosted runner label. Every one of these
+has its own Tier 1 test that mutates one property at a time and asserts the
+exact named code — proving each is *individually* detected, never bundled
+into one generic "unsafe" flag.
+
+**No third-party action beyond `actions/checkout` and `actions/setup-node`,
+both full-commit-SHA pinned.** Native GitHub Actions annotations and the job
+summary are produced by this bundle's own zero-dependency scripts
+(`github-actions-annotations-cli.mjs`, `github-actions-summary-cli.mjs`)
+reading a restricted-subset JUnit XML parser (`junit-report.mjs`, refuses an
+`<!ENTITY` declaration and any processing instruction beyond the XML
+declaration) rather than adding and pinning a third-party JUnit-reporter
+action — one fewer supply-chain dependency to pin, verify, and keep current.
+**Action-pin freshness is an explicit, named assumption, not a silent
+claim**: the deterministic core has zero network access and cannot itself
+resolve "the current commit behind tag vX" — the two SHAs shipped are
+placeholders shaped as real pins, flagged in the module header for
+re-verification before the generated workflow is ever enabled for a real
+repository (the pilot, #171-175, is deliberately not being run yet).
+
+**The Node-runtime caveat is a Safety Blocker, never a silent skip.** Node
+is guaranteed on a developer machine and a GitHub-hosted runner, but not
+automatically on a minimal self-hosted runner. The renderer always emits an
+explicit `actions/setup-node` step (never assumes an ambient `node`); the
+adapter additionally requires the Execution Profile to declare a
+`runtime.node-available` capability at all
+(`checkNodeRuntimeCapabilityDeclared` — #150's generic Capability Gate only
+checks a capability that IS named, so a profile author omitting it entirely
+would otherwise sail through unblocked) and the environment to report that
+exact capability `met`. `planAdvisoryPullRequestLane` composes this check
+with `runCapabilityGate`/`activationDecision` (#150, reused) and never
+returns a rendered workflow while either has an open blocker — the missing/
+unmet case returns `{ rendered: false, state: "deferred", blockers }`,
+mirroring #150's own "no default-open path" invariant exactly.
+
+**The Result Envelope schema is defined** (#151 explicitly left this open):
+`shared/schemas/dynamic-qa-result-envelope-v1.schema.json` plus
+`shared/scripts/result-envelope.mjs`. Small, non-executable (a closed schema
+with no free-form script/command/path/URL field defined at all — nothing
+here a privileged lane could "run"), schema-validated, and independently
+size-bounded (`MAX_ENVELOPE_BYTES` = 16 KiB, checked separately from shape
+validity — an oversized-but-shape-valid envelope is still refused).
+`validatePrivilegedResultEnvelopeArtifact` composes
+`trust-zones.mjs`'s `checkPrivilegedLaneArtifact` (#151) as the sole zone
+gate — reused, never duplicated — before this module's own shape/size
+checks run.
+
+**`preflight.mjs`'s safety check (step 4) now validates the actual
+Execution Profile artifact and proves it enforceable, not just an ID
+string** (#150's explicit hand-off: "preflight.mjs still only checks the
+profile ID is a valid semantic string, not the artifact"). Four sub-checks,
+in order, none skippable: 4a. the id is a valid semantic string (unchanged);
+4b. `<executionProfilesDir>/<id>.yaml` resolves and passes
+`validateExecutionProfile` (#150, reused) — reason
+`invalid-execution-profile`; 4c. the resolved profile honours the flow's
+own Boundary Declarations via `checkExecutionProfileHonoursBoundaries`
+(#150, reused) — reason `execution-profile-boundary-mismatch`; 4d.
+`environmentEvidence` is now a REQUIRED input (never optional — an absent
+environment is its own distinct failure, `missing-environment-evidence`,
+never silently skipped, per #150's "absence of an environment section is
+itself a blocker" note) and, once present, `runCapabilityGate`/
+`activationDecision` (#150/#151, reused) must pass or the call fails
+closed with reason `execution-profile-capability-blocked` and `issues` set
+to the exact named blockers. `runGenerationPreflight`'s success payload now
+also returns the resolved `executionProfile`. `qa-generate/SKILL.md`'s step
+1 prose was updated to match (this is squarely preflight.mjs's own
+description, not qa-setup/qa-generate stage territory the concurrent
+tickets own).
+
+**Sharding is not introduced.** `renderAdvisoryPullRequestLane`'s
+`testCommand` is a single precomputed command string; the seam for a
+matrix strategy exists (a caller could pass several `testCommand`s once
+measured runtime data justifies it) but nothing here adds one.
+
+**Seams left for #154, #155, #157, #158, #168:**
+- Nightly full suite, manual/provider-API trigger, and merge-group trigger
+  (DESIGN-dynamic-qa-spec.md §8's other three Provider-native CI exposures)
+  are named (`DEFERRED_TRIGGERS`) but not built — only `pull_request`
+  (`SUPPORTED_TRIGGERS`).
+- Impact-path-based Binding selection ("only the Bindings relevant to the
+  change") is not implemented — `testCommand` is caller-precomputed.
+- Required-lane and quarantine-lane rendering are not built — only
+  `renderAdvisoryPullRequestLane` exists.
+- Full semantic inventory of an existing arbitrary workflow's content
+  (adapter contract point 1) stays filename-level only —
+  `detectProviderConfiguration` never parses third-party workflow YAML.
+- Wiring `planAdvisoryPullRequestLane`'s invocation into
+  `qa-generate/SKILL.md`'s own step sequence is left to a coordinated
+  follow-up — see `shared/references/github-actions-adapter.md` for the
+  exact contract a wiring step should call, and that SKILL.md's step 5 note
+  for the placeholder pointer.
+- Action-pin SHAs (`CHECKOUT_ACTION_SHA`, `SETUP_NODE_ACTION_SHA`) need
+  re-verification against real upstream tags before first real rollout.
