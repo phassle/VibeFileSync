@@ -1550,3 +1550,84 @@ Failure Owner/Repeatability are explicitly out of scope (#158's territory)
 and this module's guarantees hold regardless of how #158 eventually
 classifies a failure, because no failure-shaped object can be expressed as
 a delta to any axis to begin with.
+## 27. qa-setup stage 9 provider-native CI design (#168)
+
+**Ordering is structural, not a convention.** `shared/scripts/ci-design.mjs`'s
+`designProviderNativeCI` throws unless
+`portfolioApproval.portfolioFullyApproved === true` (#165's own field) —
+there is no code path that reaches lane assignment, the smallest-diff
+choice, or the proposal artifact for a portfolio with any flow still in
+`draftFlowIds`. This is deliberately stronger than #166's per-flow gate:
+SPEC-135 story 45 is about the whole portfolio, not one flow's readiness.
+
+**Real lane assignment is this ticket's own job, not #165's
+`classifyCandidateLane`.** #165 was explicit that its lane signal
+(`pr-fast-candidate` / `nightly-candidate`) is a coherence check only, with
+no lane/trigger concept in its schema. `assignFlowLane` treats that signal
+as one input among three: the required trigger it implies, whether the
+flow's own #166 `designExecutionProfile` result actually activated, and
+whether #153's GitHub Actions adapter can render that trigger today
+(`SUPPORTED_TRIGGERS` vs. `DEFERRED_TRIGGERS`). A flow failing either of
+the latter two never gets a lane; `assigned: false` always names why
+(`execution-profile-not-activatable` or
+`trigger-not-yet-supported-by-adapter`, with the exact deferred-trigger
+label in the second case).
+
+**Not hard-coded to "only pull_request exists."** `LANE_TRIGGERS` names all
+four Provider-native CI exposures (PR-fast, nightly-full, manual,
+merge-queue) up front. Availability is decided at call time against
+caller-supplied `supportedTriggers`/`deferredTriggers` (defaulted to, never
+copied from, #153's own exported lists) — this is the concrete seam for
+#154's concurrent work: once the adapter's `SUPPORTED_TRIGGERS` grows, this
+module's lane assignment widens automatically, with a dedicated test
+(`assignFlowLane picks up a newly supported trigger with no code change`)
+proving it.
+
+**Smallest diff is decided on real numbers, not a reflexive new file.**
+`summarizeCiInventory` groups #162's own CI Facts
+(`inventory-ci.mjs`'s `scanCiWorkflows`) by each fact's own `evidence`
+field to reconstruct which existing workflow already has which
+trigger/runner. `chooseSmallestDiff` scores every workflow with a real,
+hosted runner as an amend candidate (its estimated diff is the job-block
+slice of the exact YAML `renderAdvisoryPullRequestLane`, #153, would
+produce for a new file, plus a small named constant only when the required
+trigger is not already present) against that same renderer's actual
+full-file line count, and prefers amend on a tie or smaller estimate.
+Applied to this repository, `.github/workflows/acceptance.yml` already has
+a matching `pull_request` trigger and a real hosted runner (`macos-14`) —
+amending it, not adding `dynamic-qa.yml`, is what stage 9 proposes here. A
+self-hosted-only workflow is never proposed as an amend target. Tested both
+ways: amend-preferred (an eligible, matching existing workflow) and
+new-file (no eligible workflow inventoried, and separately, a self-hosted-
+only workflow).
+
+**The proposal cites only real, inventoried infrastructure.**
+`namedInfrastructure` (runners, environments, triggers, existing workflow
+paths) is read straight from the CI Facts summary, never invented.
+`runnerMatchesInventory` separately flags when an Execution Profile's own
+`runnerClass` was never actually observed in the CI inventory, rather than
+silently treating an unobserved runner as reusable.
+
+**`qa-setup/SKILL.md` stage 9 is filled in.** Its own STATUS line and stage
+8 cross-reference are corrected too (ticket #167 had already landed stage
+8's content but left STATUS saying "stages 1–7 built... 8–10 remain
+placeholders" — a stale line this ticket did not want stage 10's future
+implementer to trust).
+
+**Only the advisory lane is ever proposed** (`enforcementState:
+"advisory"` on every assigned lane) — #153 built no required/quarantine
+renderer, and inventing an enforcement state this module cannot actually
+render would be exactly the kind of guess the run brief forbids.
+
+**Seams left for #169 and beyond:**
+- No actual amend-renderer exists — this module decides whether to amend
+  and estimates its size, but producing the exact merged YAML for an
+  existing third-party workflow file is left to whichever ticket wires
+  this proposal into a real patch (stage 10's Setup Review Packet, or a
+  later `qa-generate` step).
+- Nightly-full, manual/API, and merge-group lanes stay `assigned: false`
+  until #154 lands their triggers in the adapter.
+- `github-actions-workflow.mjs` and `github-actions-adapter.mjs` are
+  untouched by this ticket — #154/#155's concurrent edits to those modules
+  land independently; this ticket only ever calls their exported
+  functions/constants.
