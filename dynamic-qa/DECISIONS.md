@@ -1389,3 +1389,77 @@ measured runtime data justifies it) but nothing here adds one.
   for the placeholder pointer.
 - Action-pin SHAs (`CHECKOUT_ACTION_SHA`, `SETUP_NODE_ACTION_SHA`) need
   re-verification against real upstream tags before first real rollout.
+
+## 26. Failure diagnosis axes (#158)
+
+**Failure Owner and Repeatability are two genuinely independent axes, and
+Failure Class is derived, never assigned** (DESIGN-dynamic-qa-spec.md §5.6
+and §12). `shared/scripts/diagnosis.mjs`'s `deriveFailureClass(owner,
+repeatability)` is the single source of truth for the full 4 x 3 = 12
+combinations — the design table's own collapsed rows ("Product / any",
+"Binding or Environment / intermittent") are expanded here explicitly so
+every combination has exactly one documented answer, not an inferred one.
+Schema: `shared/schemas/dynamic-qa-diagnosis-v1.schema.json` (human-readable
+contract only, same split as every other schema in this bundle — the actual
+hand-written, fail-closed validation is `validateDiagnosisRecord`).
+
+**A retry pass never proves flake — enforced structurally, not by
+convention.** The Diagnosis Record's `repeatabilityBasis` field names what
+actually grounds a repeatability call (`retry-pass | reproduction |
+hypothesis-probe | historical-evidence | external-report |
+insufficient-evidence`). `validateDiagnosisRecord` rejects any record where
+`repeatabilityBasis === "retry-pass"` and `repeatability !== "unknown"` — a
+single passing retry can justify neither "intermittent" (flake) nor
+"deterministic" (fixed). The retry itself is still recorded honestly, as an
+attempt of `kind: "retry"` in the record's own `attempts` list; nothing in
+this module derives a repeatability conclusion from that list.
+
+**A failed attempt stays failed, by construction of an append-only API, not
+by promise.** `attempts` only grows via `appendAttempt`, which re-freezes
+every prior entry and copies it verbatim rather than editing in place,
+and refuses a second `kind: "original"` attempt outright (there is no
+function anywhere in this module that can replace or edit an existing
+entry). `assertOriginalAttemptStaysFailed(before, after)` compares the
+`original` attempt across two attempts-list snapshots and throws on any
+field drift, including a changed verdict. Verified across the full
+retry -> repair-verification -> quarantine-check sequence in
+`diagnosis.test.mjs`.
+
+**Routing by owner is structural, not a policy note.** A Product Regression
+carries no Binding-mutation field anywhere on the Diagnosis Record schema —
+there is nowhere to put one, so a test cannot hide changed behaviour even
+by accident. An Environment Failure (`owner: "environment"`) requires a
+non-empty `failedCapability` — the validator rejects a vague "infra
+flaked". Binding Defect is the only class this ticket makes eligible for
+repair.
+
+**Repair eligibility defaults to ineligible.** `isRepairEligible(record)`
+first runs the record through `validateDiagnosisRecord` (a malformed record
+is ineligible, full stop), then requires simultaneously `status ===
+"confirmed"`, `owner === "binding"`, and `failureClass ===
+"binding-defect"`. This is narrower than "any confirmed Binding-owned
+diagnosis": the `binding` + `intermittent` (Test Flake) combination is
+confirmed and Binding-owned but is **not** granted general repair
+eligibility here — DESIGN-dynamic-qa-spec.md §12's policy table names a
+distinct, narrower "optional Binding stabilization" action for that row,
+left for #159/#160 to build if they choose to. `isRepairEligible` never
+throws; an input it cannot make sense of is ineligible, not an exception a
+caller must remember to catch.
+
+**`qa-generate/SKILL.md` was not touched** (owned elsewhere per run
+coordination). Its repair-mode step 3 placeholder — "Diagnose Failure Owner
+and Repeatability, emit a Diagnosis Record — placeholder, same scope." —
+and step 4's gate placeholder are the exact seams a later wiring ticket
+should replace with calls into `deriveFailureClass` /
+`validateDiagnosisRecord` / `isRepairEligible`. See
+`shared/references/failure-diagnosis.md` for the full routing table and
+the seam note.
+
+**Not built here (left for #159/#160/#157):** the actual repair proposal,
+negative-control gate, and Repair Review Packet (#159/#160); Quarantine
+Record shape and expiry (#157's territory — Flow State / Binding Freshness
+/ Enforcement State lifecycle axes are deliberately not modelled by this
+module); a Failure Evidence Bundle schema/validator (referenced by DESIGN
+§5.6 as a companion artifact, distinct from the Diagnosis Record this
+ticket builds); and wiring this module's functions into
+`qa-generate/SKILL.md`'s actual step sequence.
