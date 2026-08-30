@@ -62,7 +62,10 @@ case_assert() {
   done
 
   # Self-contained: each skill survives its sibling's install being removed
-  # entirely, and never references a path into that sibling.
+  # entirely, and never references a path into that sibling. Checked in both
+  # directions — removing only qa-generate and scanning only qa-setup would
+  # miss a regression where qa-generate reaches into qa-setup, since that
+  # direction was never exercised.
   rm -rf "$FIXTURE_HOME/.agents/skills/qa-generate"
   assert_file_exists "$FIXTURE_HOME/.agents/skills/qa-setup/SKILL.md" \
     "qa-setup became unusable after qa-generate's install was removed"
@@ -71,6 +74,9 @@ case_assert() {
   fi
 
   # Version-consistent: shared and Codex builds agree with BUNDLE_VERSION.
+  # Read before the reversed self-containedness check below, which removes
+  # qa-setup's install — qa-setup is still intact at this point (only
+  # qa-generate was removed above).
   local bundle_version
   bundle_version="$(tr -d '[:space:]' < "$DYNAMIC_QA_ROOT/BUNDLE_VERSION")"
   local shared_version codex_version
@@ -78,6 +84,18 @@ case_assert() {
   codex_version="$(_skill_md_version "$FIXTURE_HOME/.codex/skills/qa-setup/SKILL.md")"
   assert_eq "qa-setup shared build version matches BUNDLE_VERSION" "$bundle_version" "$shared_version"
   assert_eq "qa-setup Codex build version matches BUNDLE_VERSION" "$bundle_version" "$codex_version"
+
+  # Reversed: reinstall both, then remove qa-setup and scan qa-generate.
+  if ! "$DYNAMIC_QA_ROOT/install.sh" --target "$FIXTURE_HOME" > "$FIXTURE_LOG/install-reinstall.log" 2>&1; then
+    cat "$FIXTURE_LOG/install-reinstall.log" >&2
+    case_fail "install.sh --target failed reinstalling before the reversed self-containedness check; see $FIXTURE_LOG/install-reinstall.log"
+  fi
+  rm -rf "$FIXTURE_HOME/.agents/skills/qa-setup"
+  assert_file_exists "$FIXTURE_HOME/.agents/skills/qa-generate/SKILL.md" \
+    "qa-generate became unusable after qa-setup's install was removed"
+  if grep -rIl -e '\.\./qa-setup' "$FIXTURE_HOME/.agents/skills/qa-generate" >/dev/null 2>&1; then
+    case_fail "qa-generate still references a path into the now-absent qa-setup install"
+  fi
 
   # Side-effect free: install.sh only ever writes under FIXTURE_HOME, never
   # under FIXTURE_REPO (the stand-in customer repository) — nothing about

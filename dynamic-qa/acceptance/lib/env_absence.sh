@@ -34,6 +34,18 @@ DYNAMIC_QA_FORBIDDEN_PROCESS_PATTERNS="claude codex ollama chromium chrome playw
 # appear in an unrelated environment variable's *value* (a real hazard: a
 # sandboxed run's own tmp/HOME path can legitimately contain a harness name
 # such as "claude" with nothing whatsoever running).
+#
+# <command...> is started in the background so its process tree can be
+# sampled WHILE it runs, not before it starts (a command started and waited
+# on synchronously has no descendants yet at the moment a scan would run).
+# The command's own process and every descendant it spawns are sampled
+# repeatedly until it exits, so a forbidden process that only lives for part
+# of the command's run is still observed. The command's real exit status is
+# preserved end to end: `wait` recovers it from the backgrounded job, the
+# inner shell re-exits with it, and env_absence_run_scrubbed returns it as
+# its own exit status (the last statement `env -i ... /bin/sh -c '...'`
+# already propagated this before backgrounding was introduced; the explicit
+# `exit "$status"` below keeps that guarantee true afterward).
 env_absence_run_scrubbed() {
   local log_file="$1"; shift
   [ "$1" = "--" ] && shift
@@ -53,11 +65,29 @@ env_absence_run_scrubbed() {
     DYNAMIC_QA_PROC_FILE="$proc_file" \
     /bin/sh -c '
       env > "$DYNAMIC_QA_ENV_FILE"
-      pid=$$
-      if command -v pgrep >/dev/null 2>&1; then
-        pgrep -P "$pid" | while read -r child; do ps -o comm= -p "$child" 2>/dev/null; done > "$DYNAMIC_QA_PROC_FILE"
-      fi
-      "$@"
+      : > "$DYNAMIC_QA_PROC_FILE"
+
+      "$@" &
+      cmd_pid=$!
+
+      # Sample the command process and its descendants at least once, then
+      # keep sampling until the command has exited. A do-while shape (sample
+      # first, check afterward) guarantees at least one sample even for a
+      # command that finishes before the loop gets to check it again.
+      while :; do
+        ps -o comm= -p "$cmd_pid" 2>/dev/null >> "$DYNAMIC_QA_PROC_FILE"
+        if command -v pgrep >/dev/null 2>&1; then
+          pgrep -P "$cmd_pid" 2>/dev/null | while read -r child; do
+            ps -o comm= -p "$child" 2>/dev/null
+          done >> "$DYNAMIC_QA_PROC_FILE"
+        fi
+        kill -0 "$cmd_pid" 2>/dev/null || break
+        sleep 0.02
+      done
+
+      wait "$cmd_pid"
+      status=$?
+      exit "$status"
     ' _ "$@" > "$out_file" 2>&1
 
   # log_file itself stays as a manifest pointing at the three real files, so

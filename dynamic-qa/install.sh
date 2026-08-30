@@ -28,20 +28,25 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="${DYNAMIC_QA_DIST:-"$HERE/dist"}"
 
-TARGET="${DYNAMIC_QA_TARGET:-}"
-AGENTS_ROOT="${DYNAMIC_QA_AGENTS_ROOT:-}"
-CODEX_ROOT="${DYNAMIC_QA_CODEX_ROOT:-}"
-OPENCODE_ROOT="${DYNAMIC_QA_OPENCODE_ROOT:-}"
-CLAUDE_ROOT="${DYNAMIC_QA_CLAUDE_ROOT:-}"
+# CLI_* hold ONLY what was explicitly passed as a flag on the command line —
+# never an environment-variable default — so precedence between an explicit
+# --target and an inherited DYNAMIC_QA_*_ROOT environment variable can be
+# decided correctly below instead of the two being indistinguishable once
+# merged into one variable.
+TARGET_CLI=""
+AGENTS_ROOT_CLI=""
+CODEX_ROOT_CLI=""
+OPENCODE_ROOT_CLI=""
+CLAUDE_ROOT_CLI=""
 SKIP_CLAUDE_SYMLINKS=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --target) TARGET="$2"; shift 2 ;;
-    --agents-root) AGENTS_ROOT="$2"; shift 2 ;;
-    --codex-root) CODEX_ROOT="$2"; shift 2 ;;
-    --opencode-root) OPENCODE_ROOT="$2"; shift 2 ;;
-    --claude-root) CLAUDE_ROOT="$2"; shift 2 ;;
+    --target) TARGET_CLI="$2"; shift 2 ;;
+    --agents-root) AGENTS_ROOT_CLI="$2"; shift 2 ;;
+    --codex-root) CODEX_ROOT_CLI="$2"; shift 2 ;;
+    --opencode-root) OPENCODE_ROOT_CLI="$2"; shift 2 ;;
+    --claude-root) CLAUDE_ROOT_CLI="$2"; shift 2 ;;
     --no-claude-symlinks) SKIP_CLAUDE_SYMLINKS=1; shift 1 ;;
     *)
       echo "install.sh: unknown argument: $1" >&2
@@ -55,11 +60,37 @@ fail() {
   exit 1
 }
 
-if [ -n "$TARGET" ]; then
-  AGENTS_ROOT="${AGENTS_ROOT:-$TARGET/.agents/skills}"
-  CODEX_ROOT="${CODEX_ROOT:-$TARGET/.codex/skills}"
-  OPENCODE_ROOT="${OPENCODE_ROOT:-$TARGET/.config/opencode/commands}"
-  CLAUDE_ROOT="${CLAUDE_ROOT:-$TARGET/.claude/skills}"
+# Precedence, highest first:
+#   1. an explicit --agents-root/--codex-root/--opencode-root/--claude-root
+#      flag on the command line, per root.
+#   2. an explicit --target flag on the command line (applies to whichever
+#      roots did not get their own explicit flag above). This deliberately
+#      outranks a DYNAMIC_QA_*_ROOT environment variable: tests/smoke.sh (and
+#      any other caller) passes --target expecting install.sh to write ONLY
+#      under that target, and an inherited env var must never silently
+#      redirect part of the install outside it.
+#   3. the matching DYNAMIC_QA_<ROLE>_ROOT environment variable.
+#   4. the DYNAMIC_QA_TARGET environment variable, same per-root fill-in as
+#      an explicit --target, for whichever roots are still unset.
+#   5. the real default under $HOME.
+if [ -n "$TARGET_CLI" ]; then
+  AGENTS_ROOT="${AGENTS_ROOT_CLI:-$TARGET_CLI/.agents/skills}"
+  CODEX_ROOT="${CODEX_ROOT_CLI:-$TARGET_CLI/.codex/skills}"
+  OPENCODE_ROOT="${OPENCODE_ROOT_CLI:-$TARGET_CLI/.config/opencode/commands}"
+  CLAUDE_ROOT="${CLAUDE_ROOT_CLI:-$TARGET_CLI/.claude/skills}"
+else
+  AGENTS_ROOT="${AGENTS_ROOT_CLI:-${DYNAMIC_QA_AGENTS_ROOT:-}}"
+  CODEX_ROOT="${CODEX_ROOT_CLI:-${DYNAMIC_QA_CODEX_ROOT:-}}"
+  OPENCODE_ROOT="${OPENCODE_ROOT_CLI:-${DYNAMIC_QA_OPENCODE_ROOT:-}}"
+  CLAUDE_ROOT="${CLAUDE_ROOT_CLI:-${DYNAMIC_QA_CLAUDE_ROOT:-}}"
+
+  TARGET_ENV="${DYNAMIC_QA_TARGET:-}"
+  if [ -n "$TARGET_ENV" ]; then
+    AGENTS_ROOT="${AGENTS_ROOT:-$TARGET_ENV/.agents/skills}"
+    CODEX_ROOT="${CODEX_ROOT:-$TARGET_ENV/.codex/skills}"
+    OPENCODE_ROOT="${OPENCODE_ROOT:-$TARGET_ENV/.config/opencode/commands}"
+    CLAUDE_ROOT="${CLAUDE_ROOT:-$TARGET_ENV/.claude/skills}"
+  fi
 fi
 
 AGENTS_ROOT="${AGENTS_ROOT:-$HOME/.agents/skills}"

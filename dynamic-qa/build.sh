@@ -28,6 +28,47 @@ DIST="${DYNAMIC_QA_DIST:-"$HERE/dist"}"
 SKILLS="qa-setup qa-generate"
 VERIFY_ONLY=0
 
+# --- DYNAMIC_QA_DIST validation -----------------------------------------
+#
+# build_shared() below does `rm -rf "$DIST"` before writing the build. An
+# override that names any writable directory would make that an arbitrary
+# `rm -rf` of whatever the caller (or a hostile env) pointed it at. Resolve
+# DIST to its real path and fail closed unless it is $HERE itself or a
+# descendant of $HERE — the only trees this script is allowed to delete.
+validate_dist_is_descendant_of_here() {
+  local candidate="$DIST" resolved parent
+
+  # DIST may not exist yet on a first build; resolve as far up the path as
+  # already exists, then re-append the not-yet-created tail, so a fresh
+  # "$HERE/dist" (or a fresh "$HERE/dist/deeper") still validates without
+  # requiring a prior mkdir.
+  local tail=""
+  while [ ! -d "$candidate" ]; do
+    case "$candidate" in
+      */*)
+        tail="/$(basename "$candidate")$tail"
+        candidate="$(dirname "$candidate")"
+        ;;
+      *)
+        # No more path separators to strip — nothing on this path exists.
+        candidate="."
+        tail="/$DIST$tail"
+        break
+        ;;
+    esac
+  done
+
+  resolved="$(cd "$candidate" && pwd)$tail"
+
+  case "$resolved" in
+    "$HERE"|"$HERE"/*)
+      ;;
+    *)
+      fail "DYNAMIC_QA_DIST ($DIST) resolves to $resolved, which is not $HERE itself or a descendant of it — refusing to build, because build.sh rm -rf's this directory. Point DYNAMIC_QA_DIST at a path under $HERE, or unset it to use the default."
+      ;;
+  esac
+}
+
 for arg in "$@"; do
   case "$arg" in
     --verify-only) VERIFY_ONLY=1 ;;
@@ -201,15 +242,22 @@ write_manifest() {
   local manifest="$DIST/BUNDLE_MANIFEST.json"
   local digest_input=""
   local rel f h
-  # Canonical digest: sorted relative-path list under dist/shared, each file
-  # hashed, digests concatenated in path order, then hashed again. Excludes
+  # Canonical digest: sorted relative-path list across every emitted build —
+  # dist/shared, dist/codex, and dist/opencode alike — each file hashed,
+  # digests concatenated in path order, then hashed again. Excludes
   # timestamps and machine-local paths, same shape as capabilities.json's
-  # per-harness ladder fingerprint.
+  # per-harness ladder fingerprint. BUNDLE_MANIFEST.json itself is the only
+  # exclusion (it does not exist yet at this point, but is excluded by name
+  # regardless, so a later re-verify over an already-manifested dist/ hashes
+  # the same input): every other emitted artifact — including the Codex
+  # overlays and OpenCode command adapters BUNDLE_MANIFEST.json declares as
+  # separate builds — is part of the canonical digest, so two bundles that
+  # differ only in adapter content are never assigned the same digest.
   local filelist
-  filelist="$(cd "$DIST/shared" && find . -type f | sort)"
+  filelist="$(cd "$DIST" && find . -type f ! -name 'BUNDLE_MANIFEST.json' | sort)"
   while IFS= read -r rel; do
     [ -z "$rel" ] && continue
-    f="$DIST/shared/$rel"
+    f="$DIST/$rel"
     h="$(sha256_of_file "$f")"
     digest_input="$digest_input$rel:$h;"
   done <<EOF
@@ -233,6 +281,7 @@ EOF
 
 main() {
   local version
+  validate_dist_is_descendant_of_here
   version="$(read_bundle_version)"
 
   if [ "$VERIFY_ONLY" -eq 0 ]; then

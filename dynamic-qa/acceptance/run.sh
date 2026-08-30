@@ -122,8 +122,15 @@ run_one_case() {
   report_case_begin
 
   # Run the case in a subshell so its env exports (HOME, XDG_*, PATH,
-  # FIXTURE_*) never leak into the next case or into run.sh itself.
-  (
+  # FIXTURE_*) never leak into the next case or into run.sh itself. The
+  # subshell is the condition of an `if`, not a bare statement — under
+  # run.sh's own `set -e`, a bare failing statement would abort the whole
+  # harness on the first failing Tier 2 case, so later cases would never run
+  # and the aggregate summary would never print. Testing a command's exit
+  # status in an `if` condition suspends `set -e` for that command, so the
+  # loop over cases keeps going regardless of any single case's outcome.
+  local status
+  if (
     set -euo pipefail
     fixture_create
     trap fixture_teardown EXIT
@@ -142,8 +149,11 @@ run_one_case() {
       exit 1
     fi
     echo "ok: $name"
-  )
-  local status=$?
+  ); then
+    status=0
+  else
+    status=$?
+  fi
   report_case_end
 
   if [ "$status" -ne 0 ]; then

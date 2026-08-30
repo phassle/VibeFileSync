@@ -20,7 +20,6 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/dynamic-qa-smoke.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
 
 fail() {
   echo "smoke.sh: FAIL: $*" >&2
@@ -34,13 +33,14 @@ pass() {
 # real_home_skills_snapshot — a stable, sorted listing of relative paths plus
 # a content hash per file, across the real skill install roots this process
 # could plausibly touch by accident (~/.agents/skills, ~/.codex/skills,
-# ~/.claude/skills) — the same directories install.sh writes into when no
-# --target is given. A missing directory contributes nothing (not an error),
-# so a developer machine that has never installed a given harness's skills
-# still gets a meaningful, comparable snapshot.
+# ~/.claude/skills, ~/.config/opencode/commands) — the same directories
+# install.sh writes into when no --target is given. A missing directory
+# contributes nothing (not an error), so a developer machine that has never
+# installed a given harness's skills still gets a meaningful, comparable
+# snapshot.
 real_home_skills_snapshot() {
   local root
-  for root in "$HOME/.agents/skills" "$HOME/.codex/skills" "$HOME/.claude/skills"; do
+  for root in "$HOME/.agents/skills" "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.config/opencode/commands"; do
     [ -d "$root" ] || continue
     ( cd "$root" && find . \( -type f -o -type l \) | sort | while IFS= read -r f; do
         if [ -L "$f" ]; then
@@ -54,7 +54,36 @@ real_home_skills_snapshot() {
   done
 }
 
+# on_exit — the real-$HOME-unchanged comparison, run unconditionally as an
+# EXIT trap rather than as one more check in the linear body below. fail()
+# exits immediately on the FIRST failing check, so if it lived inline after
+# every other check (as it used to), a run where installation touched a real
+# home directory AND some earlier assertion failed first would exit on that
+# earlier failure and never even reach the comparison — the real-home
+# regression would go unreported. Running it in the trap means it always
+# runs, on every exit path, and its own preserves the *original* failure's
+# exit status when it finds no difference, while still failing the run (and
+# saying so) if it finds one, even on top of an already-failing run.
+on_exit() {
+  local original_status=$?
+  local status="$original_status"
+
+  local real_home_after
+  real_home_after="$(real_home_skills_snapshot)"
+  if [ "$REAL_HOME_BEFORE" != "$real_home_after" ]; then
+    echo "smoke.sh: FAIL: build.sh/install.sh wrote to the real \$HOME's skill directories (~/.agents/skills, ~/.codex/skills, ~/.claude/skills, ~/.config/opencode/commands), which this run must never touch — before/after snapshots differ" >&2
+    status=1
+  elif [ "$original_status" -eq 0 ]; then
+    pass "real \$HOME's skill directories are unchanged by this run"
+    echo "smoke.sh: all checks passed"
+  fi
+
+  rm -rf "$TMP"
+  exit "$status"
+}
+
 REAL_HOME_BEFORE="$(real_home_skills_snapshot)"
+trap on_exit EXIT
 
 echo "smoke.sh: building and verifying packaging"
 "$HERE/build.sh"
@@ -105,13 +134,6 @@ grep -q '"version"' "$manifest" || fail "$manifest missing version"
 grep -q '"contentDigest": "sha256:' "$manifest" || fail "$manifest missing a sha256 contentDigest"
 pass "bundle release is versioned and content-addressed via BUNDLE_MANIFEST.json"
 
-# A build must not have touched the real install roots this process actually
-# owns outside $TMP — verify install.sh honoured --target and wrote nothing
-# to the real $HOME's skill directories during this run.
-REAL_HOME_AFTER="$(real_home_skills_snapshot)"
-if [ "$REAL_HOME_BEFORE" != "$REAL_HOME_AFTER" ]; then
-  fail "build.sh/install.sh wrote to the real \$HOME's skill directories (~/.agents/skills, ~/.codex/skills, ~/.claude/skills), which this run must never touch — before/after snapshots differ"
-fi
-pass "real \$HOME's skill directories are unchanged by this run"
-
-echo "smoke.sh: all checks passed"
+# The real-$HOME-unchanged comparison (and the final "all checks passed"
+# line) runs unconditionally in the on_exit EXIT trap above, not here — see
+# its comment for why.
