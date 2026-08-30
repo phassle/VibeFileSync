@@ -2283,6 +2283,57 @@ so every metric is expected to be measured or honestly `unknown`.
 stored value that disagrees with its own evidence, exactly like #167's
 `validateBaselinePlan`.
 
+## 35. Process-name sampling is not an execution audit (CodeRabbit re-review, PR #177)
+
+**Finding.** `acceptance/lib/env_absence.sh`'s
+`assert_no_forbidden_descendant_processes` (as it was named) sampled a
+launched command's process tree with polling `ps` calls. A forbidden
+process that starts and exits entirely between two samples — or before the
+very first sample runs — never has its `comm` written to
+`$DYNAMIC_QA_PROC_FILE`, so the assertion could pass having never observed
+a prohibited model or browser-agent process that genuinely ran during the
+command. The name promised something the mechanism could not deliver: "no
+forbidden process" reads as a completeness guarantee, not a sampling
+disclaimer.
+
+**Decision.** Do not fabricate completeness a polling mechanism cannot
+provide, and do not silently ship the overclaim either. Two changes:
+
+1. **Rename the claim to match the mechanism.** The assertion is now
+   `assert_no_forbidden_process_name_observed`. Its own doc comment, its
+   failure message ("forbidden-looking model/browser-agent process name
+   sampled among descendants: ..."), and every call-site comment
+   (`subprocess-env-scrub.case.sh`,
+   `repo-injection-leaves-tree-unchanged.case.sh`,
+   `subprocess-env-scrub-catches-grandchild.case.sh`,
+   `shared/references/hostile-fixtures.md`, `acceptance/README.md`) say
+   "observed"/"sampled," never "no forbidden process ran." The gap is
+   spelled out in `env_absence.sh`'s file-level comment: a genuinely
+   portable, unprivileged, cross-platform exec-event tracer (dtrace,
+   eBPF/execsnoop, or an OS-level sandbox policy recording every
+   descendant `exec`) is not available to this harness, so this file does
+   not pretend to be a complete audit. The sampling loop already samples
+   as fast as is reasonable (a do-while shape, sampling immediately and
+   then on a 20ms interval, so it catches everything slow enough for
+   polling to observe) — that tightening is real and worth keeping, but it
+   narrows the gap, it does not close it.
+
+2. **Name the load-bearing guarantee explicitly.** `assert_no_credential_leak`
+   is checked against a complete, deterministic `env` dump of the scrubbed
+   child — not a sample — so it is a real, complete proof: ordinary CI has
+   no model or browser-agent credentials in its environment at all. That is
+   the property this harness can actually stand behind. Process-name
+   sampling is supplementary defense-in-depth, not the primary guarantee:
+   even a forbidden process that started unobserved would find no
+   credential to call out with.
+
+**Rejected.** Building or vendoring a real exec-event tracer for this
+ticket — out of scope for an acceptance-harness fixture, platform-specific,
+and would need privileges this harness cannot assume it has. Silently
+tightening the poll interval and leaving the old name in place — an honest,
+narrower assertion is worth more than a confidently-named one that can pass
+while a forbidden process ran unseen.
+
 **Seeded Binding Defect Cases (#174, `seeded-defects.mjs`).** A seeded
 defect's `injectedChange.kind` is **always** `"binding"` — the constructor
 has no parameter path to a `"product"` kind at all, and

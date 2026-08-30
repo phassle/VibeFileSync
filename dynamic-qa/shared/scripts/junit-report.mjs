@@ -24,38 +24,53 @@ function stripCData(text) {
   return text.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
 }
 
-// Replaces every CDATA section's INNER content with same-length placeholder
-// characters (never "<", ">", or '"' — a plain letter is neutral to every
-// regex below), leaving the "<![CDATA[" / "]]>" delimiters and everything
-// else untouched. The replacement is always the same length as what it
-// replaces, so an offset measured in the masked text is always the same
-// offset in the real, original text.
+// Replaces the INNER content of every non-content region — a CDATA section,
+// an XML comment, a processing instruction, or a DOCTYPE declaration's body
+// — with same-length placeholder characters (never "<", ">", or '"' — a
+// plain letter is neutral to every regex below), leaving each region's own
+// delimiters and everything else untouched. Every replacement is exactly as
+// long as what it replaces, so an offset measured in the masked text is
+// always the same offset in the real, original text.
 //
-// Why this exists (CodeRabbit re-review finding on PR #177,
-// junit-report.mjs:78): a JUnit reporter routinely echoes captured test
-// stdout/stderr into <system-out>/<system-err> CDATA blocks, and that
-// captured output is not trusted content — it can contain literal text a
-// test printed, including text that happens to read like
-// "</testcase>", "<failure ...>", or "<skipped/>". Before this fix, every
-// tag-boundary regex (caseRe, failureMatch, errorMatch, skippedMatch) ran
-// directly against the raw XML text, so a real failing test whose captured
-// output happened to contain the literal string "</testcase>" BEFORE its
-// real <failure> element got its body truncated at that fake boundary —
-// the real <failure> element then fell outside the (wrongly shortened)
-// body, and the test was silently recorded as "passed". That is a false
-// negative in exactly the report a promotion/CI gate relies on to know
-// whether the run actually passed — the most dangerous direction for this
-// module to be wrong in.
+// Why this exists (CodeRabbit re-review findings on PR #177,
+// junit-report.mjs:78 and :121 — the same bug class, found twice): a JUnit
+// reporter routinely echoes captured test stdout/stderr into
+// <system-out>/<system-err> CDATA blocks, and a hand-authored or
+// reporter-emitted report can carry XML comments too. Neither is trusted,
+// structural content — a test can print (or a comment can contain) literal
+// text that happens to read like "</testcase>", "<failure ...>", or
+// "<skipped/>". Before the first fix, every tag-boundary regex (caseRe,
+// failureMatch, errorMatch, skippedMatch) ran directly against the raw XML
+// text, so a fake boundary living inside CDATA truncated a real testcase's
+// body before its real <failure> — recording an actually-failing test as
+// "passed". The first fix masked only CDATA. The second re-review finding
+// showed the identical bug still open for `<!-- </testcase> --> `-shaped
+// XML comments: caseRe stopped at the comment text just the same way it
+// once stopped at CDATA text, with the same false-negative consequence —
+// the most dangerous direction for this module to be wrong in, since
+// emitReporting can then publish a passing result for a failed run.
 //
-// Masking CDATA content before boundary-matching closes this: the fake
-// "</testcase>" text living inside a CDATA section is masked out (replaced
-// with neutral placeholder characters) before any boundary regex ever sees
-// it, so it can never be mistaken for a real closing tag. Actual message
-// content extraction (extractAttr, stripCData) always reads from the
-// ORIGINAL, unmasked text via the offsets the masked-text match reported,
-// so genuine CDATA content in a failure/error message is preserved exactly.
-function maskCDataForBoundaryMatching(text) {
-  return text.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (whole, inner) => `<![CDATA[${"x".repeat(inner.length)}]]>`);
+// Rather than patch a third variant later, this masks every non-content
+// region up front — CDATA, comments, processing instructions, and DOCTYPE —
+// before ANY boundary regex runs. Actual message content extraction
+// (extractAttr, stripCData) always reads from the ORIGINAL, unmasked text
+// via the offsets the masked-text match reported, so genuine CDATA content
+// in a failure/error message is preserved exactly; only comment/PI/DOCTYPE
+// bodies are ever masked, and nothing in those regions is ever surfaced as
+// message content in the first place.
+function maskNonContentRegions(text) {
+  return text
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (whole, inner) => `<![CDATA[${"x".repeat(inner.length)}]]>`)
+    .replace(/<!--([\s\S]*?)-->/g, (whole, inner) => `<!--${"x".repeat(inner.length)}-->`)
+    .replace(/<\?([\s\S]*?)\?>/g, (whole, inner) => `<?${"x".repeat(inner.length)}?>`)
+    // A DOCTYPE with an internal subset (`<!DOCTYPE x [ ... ]>`) can itself
+    // contain a raw '>' (e.g. inside an <!ENTITY ...> declaration) before
+    // its own closing '>' — but any <!ENTITY declaration anywhere in the
+    // document already makes parseJUnitXML throw before this function ever
+    // runs (see the ENTITY check below), so a non-greedy match up to the
+    // first '>' is always correct for every DOCTYPE this function actually
+    // has to mask.
+    .replace(/<!DOCTYPE([\s\S]*?)>/gi, (whole, inner) => `<!DOCTYPE${"x".repeat(inner.length)}>`);
 }
 
 function decodeEntities(text) {
@@ -89,7 +104,14 @@ export function parseJUnitXML(xmlText) {
     throw new Error("parseJUnitXML: refuses XML containing a processing instruction other than the XML declaration");
   }
 
-  const suiteMatch = /<testsuite\b(?:[^">]|"[^"]*")*?name="([^"]*)"/i.exec(xmlText);
+  // Masked once up front and reused everywhere below: a CDATA block, XML
+  // comment, processing instruction, or DOCTYPE body containing text shaped
+  // like a real tag (e.g. a stray `<testsuite name="...">` inside a
+  // comment) must never be mistaken for the real one, for the suite-name
+  // lookup any more than for testcase boundaries.
+  const maskedXmlText = maskNonContentRegions(xmlText);
+
+  const suiteMatch = /<testsuite\b(?:[^">]|"[^"]*")*?name="([^"]*)"/i.exec(maskedXmlText);
   const testsuiteName = suiteMatch ? decodeEntities(suiteMatch[1]) : "";
 
   const tests = [];
@@ -110,22 +132,22 @@ export function parseJUnitXML(xmlText) {
   // tag whose body runs on to absorb the next real testcase's closing tag
   // — silently dropping a whole test result rather than erroring.
   const ATTRS = `(?:[^">]|"[^"]*")*?`;
-  // "d" (hasIndices): boundary-matching runs against the CDATA-masked text
-  // (see maskCDataForBoundaryMatching above) so a "</testcase>"-shaped
-  // literal inside captured test output can never be mistaken for a real
-  // closing tag, but every substring actually used below is sliced from the
-  // real, unmasked xmlText using the match's own group indices — masking
-  // never changes a match's length or position, only whether the engine can
-  // be fooled by CDATA-embedded text into stopping early.
+  // "d" (hasIndices): boundary-matching runs against the masked text (see
+  // maskNonContentRegions above) so a "</testcase>"-shaped literal inside
+  // captured test output, an XML comment, a processing instruction, or a
+  // DOCTYPE body can never be mistaken for a real closing tag, but every
+  // substring actually used below is sliced from the real, unmasked
+  // xmlText using the match's own group indices — masking never changes a
+  // match's length or position, only whether the engine can be fooled by
+  // embedded text into stopping early.
   const caseRe = new RegExp(`<testcase\\b(${ATTRS})(\\/>|>([\\s\\S]*?)<\\/testcase>)`, "gid");
-  const maskedXmlText = maskCDataForBoundaryMatching(xmlText);
   let m;
   while ((m = caseRe.exec(maskedXmlText)) !== null) {
     const attrsRange = m.indices[1];
     const bodyRange = m.indices[3];
     const attrs = attrsRange ? xmlText.slice(attrsRange[0], attrsRange[1]) : "";
     const body = bodyRange ? xmlText.slice(bodyRange[0], bodyRange[1]) : "";
-    const maskedBody = maskCDataForBoundaryMatching(body);
+    const maskedBody = maskNonContentRegions(body);
     const name = extractAttr(attrs, "name") ?? "";
     const classname = extractAttr(attrs, "classname") ?? "";
     const time = extractAttr(attrs, "time");

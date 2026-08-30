@@ -2,14 +2,44 @@
 # dynamic-qa/acceptance/lib/env_absence.sh
 #
 # Verifies that ordinary CI runs happen with all model and browser-agent
-# processes and credentials absent (a non-negotiable invariant: ordinary PR
-# and nightly regression runs call no LLM and no browser agent). This does
-# NOT scan the ambient machine — a developer's own shell may legitimately
-# have Claude Code credentials exported for unrelated work, and a
-# machine-wide `ps` scan would make this flaky on exactly the box a later
-# implementer develops on. Instead it proves the harness's OWN mechanism: any
-# child process it spawns is launched through an explicitly scrubbed
-# environment, and that scrubbing is checked directly rather than assumed.
+# CREDENTIALS absent, and SAMPLES the launched command's process tree for
+# any forbidden-looking process observed while it ran (a non-negotiable
+# invariant: ordinary PR and nightly regression runs call no LLM and no
+# browser agent). This does NOT scan the ambient machine — a developer's
+# own shell may legitimately have Claude Code credentials exported for
+# unrelated work, and a machine-wide `ps` scan would make this flaky on
+# exactly the box a later implementer develops on. Instead it proves the
+# harness's OWN mechanism: any child process it spawns is launched through
+# an explicitly scrubbed environment, and that scrubbing is checked
+# directly rather than assumed.
+#
+# Two guarantees of very different strength live in this file (CodeRabbit
+# re-review finding on PR #177, env_absence.sh:104 — see DECISIONS.md §35
+# for the full writeup):
+#
+#   - Credential absence (assert_no_credential_leak) is checked against a
+#     complete, deterministic `env` dump of the scrubbed child — every
+#     variable the child process actually had is in that dump, so this
+#     assertion is a real, complete proof, not a sample. This is the
+#     load-bearing guarantee: ordinary CI has no model credentials in its
+#     environment at all, so even a forbidden process that DID start would
+#     have nothing to call out with.
+#
+#   - Process-name sampling (assert_no_forbidden_process_name_observed,
+#     renamed from assert_no_forbidden_descendant_processes) is NECESSARILY
+#     a best-effort, sampled OBSERVATION, not a complete execution audit. A
+#     forbidden process that starts and exits between two `ps` samples (or
+#     before the very first one) never has its `comm` written to
+#     $DYNAMIC_QA_PROC_FILE, and this check then passes having never seen
+#     it. A complete audit would require an exec-event tracer (dtrace,
+#     eBPF/execsnoop, or an OS-level sandbox policy recording every
+#     descendant `exec`) — none of those is portable or available
+#     unprivileged across the platforms this harness runs on, so this file
+#     does not pretend to provide one. The polling loop is tightened to
+#     sample as fast as is reasonable (see the do-while shape and the 0.02s
+#     interval below) purely as a diagnostic aid — catching more of what
+#     happens to be slow enough to observe — never as a claim of
+#     completeness.
 
 set -euo pipefail
 
@@ -137,19 +167,28 @@ assert_no_credential_leak() {
   done
 }
 
-# assert_no_forbidden_descendant_processes <log-file>
+# assert_no_forbidden_process_name_observed <log-file>
+#
+# NOT a complete execution audit — see the file-level comment above and
+# DECISIONS.md §35. This asserts only that repeated `ps` SAMPLING of the
+# command's process tree never CAUGHT a forbidden-looking process name
+# while it ran. A forbidden process that starts and exits between two
+# samples (or before the first one) leaves no trace here and this
+# assertion passes regardless — that gap is real and is not closed by
+# tightening the sample interval, only narrowed. Name it what it proves:
+# "observed" and "sampling", never "no forbidden process ran".
 #
 # Checked only against "<log-file>.procs" — real process `comm` names, one
 # per line, never the env dump or the command's own stdout — so a tmp/HOME
 # path that happens to contain a harness name never counts as that harness
 # actually running.
-assert_no_forbidden_descendant_processes() {
+assert_no_forbidden_process_name_observed() {
   local log_file="$1" pattern
   local proc_file="${log_file}.procs"
-  [ -f "$proc_file" ] || { case_fail "no process list found at $proc_file"; return; }
+  [ -f "$proc_file" ] || { case_fail "no process sample list found at $proc_file"; return; }
   for pattern in $DYNAMIC_QA_FORBIDDEN_PROCESS_PATTERNS; do
     if grep -qi "$pattern" "$proc_file" 2>/dev/null; then
-      case_fail "forbidden model/browser-agent process observed among descendants: $pattern"
+      case_fail "forbidden-looking model/browser-agent process name sampled among descendants: $pattern"
     fi
   done
 }

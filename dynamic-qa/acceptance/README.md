@@ -161,7 +161,7 @@ subshell:
 | `transcript_play <file>`, `transcript_log_path` | the replay adapter (`lib/transcript.sh`) |
 | `harness_real_invoke <harness> <skill> <args>`, `harness_real_available` | the opt-in real adapter (`lib/harness_real.sh`) |
 | `approval_grant`/`approval_withhold`/`approval_decision`/`approval_both_satisfied` | scripted QA/Technical Owner approvals (`lib/approvals.sh`) |
-| `env_absence_run_scrubbed`, `assert_no_credential_leak`, `assert_no_forbidden_descendant_processes` | CI-clean verification (`lib/env_absence.sh`) |
+| `env_absence_run_scrubbed`, `assert_no_credential_leak` (complete), `assert_no_forbidden_process_name_observed` (best-effort sample, not a complete audit — see `lib/env_absence.sh`) | CI-clean verification (`lib/env_absence.sh`) |
 | `assert_*` (see `lib/assertions.sh`) | the full assertion vocabulary; `case_fail <message>` underlies all of them |
 
 See `cases/transcript/example-stop-state.case.sh` for the smallest complete

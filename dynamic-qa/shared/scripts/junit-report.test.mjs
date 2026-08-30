@@ -161,6 +161,55 @@ test("a literal '</testcase>'-shaped string inside a <system-out> CDATA block ne
   assert.equal(parsed.tests[1].status, "passed");
 });
 
+test("a literal '</testcase>'-shaped string inside an XML COMMENT never truncates the real body — the real <failure> after it is still observed", () => {
+  // CodeRabbit re-review finding on PR #177 (junit-report.mjs:121) — the
+  // same bug class as the CDATA finding above, found a second time: a
+  // hand-authored or reporter-emitted report can carry an XML comment
+  // shaped like `<!-- </testcase> -->` before a real <failure>. Before this
+  // fix, caseRe's boundary regex stopped at that comment text exactly the
+  // way it once stopped at CDATA text, silently recording an actually-
+  // failing test as "passed".
+  const xml =
+    `<testsuite name="s">` +
+    `<testcase classname="c" name="a" time="0.1">` +
+    `<!-- </testcase> -->` +
+    `<failure message="the real failure"/>` +
+    `</testcase>` +
+    `<testcase classname="c" name="b" time="0.1"/>` +
+    `</testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 2, "the comment-embedded fake closing tag must not swallow the second testcase either");
+  assert.equal(parsed.tests[0].name, "a");
+  assert.equal(parsed.tests[0].status, "failed", "a fake '</testcase>' inside an XML comment must never hide the real <failure> that follows it");
+  assert.equal(parsed.tests[0].message, "the real failure");
+  assert.equal(parsed.tests[1].name, "b");
+  assert.equal(parsed.tests[1].status, "passed");
+});
+
+test("a tag-shaped string inside the leading <?xml ...?> declaration does not defeat the first testsuite/testcase boundary match", () => {
+  // Processing instructions other than the XML declaration are rejected
+  // outright (see the fail-closed tests below), so the only PI region this
+  // parser ever has to mask is the XML declaration itself. A value inside
+  // it that happens to read like a tag boundary must still be neutralized.
+  const xml =
+    `<?xml version="1.0" comment="</testsuite>"?>` +
+    `<testsuite name="s"><testcase classname="c" name="only" time="0.1"/></testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.testsuiteName, "s");
+  assert.equal(parsed.tests.length, 1);
+  assert.equal(parsed.tests[0].name, "only");
+});
+
+test("a tag-shaped string inside a DOCTYPE declaration (no internal subset, so no ENTITY) does not defeat boundary matching", () => {
+  const xml =
+    `<!DOCTYPE testsuite "-//dynamic-qa//DTD testsuite </testcase> fake//EN">` +
+    `<testsuite name="s"><testcase classname="c" name="only" time="0.1"/></testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.testsuiteName, "s");
+  assert.equal(parsed.tests.length, 1);
+  assert.equal(parsed.tests[0].name, "only");
+});
+
 test("a literal '</failure>'-shaped string inside a <failure> element's own CDATA message is preserved as content, not treated as the closing tag", () => {
   // Same class of hazard, one level down: the failure MESSAGE itself
   // (arbitrary test output) can contain text shaped like the failure

@@ -29,8 +29,18 @@
 case_describe="env_absence_run_scrubbed's descendant sampling reaches a grandchild process started by an intermediate shell, not just direct children"
 
 case_setup() {
+  # inner.sh is deliberately `#!/usr/bin/env bash`, not `#!/bin/sh`: `exec -a`
+  # (rename argv[0] without replacing the process) is a bash/ksh extension,
+  # not a POSIX `exec` option. On many Linux systems `/bin/sh` is dash, whose
+  # `exec` has no `-a` at all ("exec: -a: not found" — verified locally),
+  # which would make this whole fixture error out before ever producing a
+  # "chromium"-named process, silently defeating the case it exists to
+  # prove. Requiring bash here keeps the fixture correct on every platform
+  # this harness actually runs on (this repo's own CI is macos-14, whose
+  # /bin/sh already happens to be bash, but a contributor's local box is not
+  # guaranteed to be).
   cat > "$FIXTURE_ROOT/inner.sh" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env bash
 # Renames this process's comm to a forbidden-pattern name via `exec -a`,
 # without spawning anything further. Its parent is middle.sh, never the
 # command the harness directly launched.
@@ -54,7 +64,7 @@ case_run() {
 }
 
 case_assert() {
-  # Positive assertion, deliberately not assert_no_forbidden_descendant_processes:
+  # Positive assertion, deliberately not assert_no_forbidden_process_name_observed:
   # the whole point of this fixture is that a forbidden-looking process IS
   # present, two generations down. Proving the harness observed it is what
   # demonstrates the recursive walk works; a case that instead asserted

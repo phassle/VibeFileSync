@@ -43,7 +43,9 @@ succeeded or a defence was weaker than claimed.
 already proves the exact property SPEC-135 names: "the harness verifies
 that ordinary CI runs with all model and browser-agent processes and
 credentials absent," via `env_absence_run_scrubbed` / `assert_no_credential_leak`
-/ `assert_no_forbidden_descendant_processes`. This ticket's
+(a complete, deterministic proof) / `assert_no_forbidden_process_name_observed`
+(a best-effort sampled observation, not a complete execution audit — see
+`acceptance/lib/env_absence.sh` and DECISIONS.md §35). This ticket's
 `acceptance/cases/hostile/repo-injection-leaves-tree-unchanged.case.sh`
 builds on that exact mechanism against a fixture repository loaded with
 hostile content, so the property is proven under adversarial content too,

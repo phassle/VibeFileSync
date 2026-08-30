@@ -21,10 +21,13 @@
 #   2. The subprocess that reads this hostile content still runs with every
 #      model/browser-agent credential and process absent
 #      (env_absence_run_scrubbed / assert_no_credential_leak /
-#      assert_no_forbidden_descendant_processes) — i.e. the env-absence
+#      assert_no_forbidden_process_name_observed) — i.e. the env-absence
 #      property `ci-clean` proves in the clean case still holds when the
 #      content being processed is actively adversarial, not merely when
-#      nothing interesting is present to react to.
+#      nothing interesting is present to react to. Credential absence here
+#      is a complete, deterministic proof; process-name sampling is a
+#      best-effort observation, not a complete audit — see
+#      lib/env_absence.sh's file-level comment and DECISIONS.md §35.
 #   3. The hostile Flow Definition is REJECTED by the real validator with
 #      the exact named error (not merely "something failed") — the
 #      forbidden-template-marker rejection from flow-definition.mjs.
@@ -108,7 +111,7 @@ case_run() {
 
 case_assert() {
   assert_no_credential_leak "$FIXTURE_LOG/hostile-read.log"
-  assert_no_forbidden_descendant_processes "$FIXTURE_LOG/hostile-read.log"
+  assert_no_forbidden_process_name_observed "$FIXTURE_LOG/hostile-read.log"
   assert_contains "$FIXTURE_LOG/hostile-read.log" '"valid":false' \
     "the hostile Flow Definition must be refused, never silently accepted"
   assert_contains "$FIXTURE_LOG/hostile-read.log" 'no expression language or executable content' \

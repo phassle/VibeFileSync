@@ -27,7 +27,7 @@ case_run() {
 
 case_assert() {
   assert_no_credential_leak "$FIXTURE_LOG/scrub.log"
-  assert_no_forbidden_descendant_processes "$FIXTURE_LOG/scrub.log"
+  assert_no_forbidden_process_name_observed "$FIXTURE_LOG/scrub.log"
   assert_contains "$FIXTURE_LOG/scrub.log" "scrubbed child ran" \
     "the scrubbed child never actually ran its command"
 }
