@@ -1,0 +1,54 @@
+# Fixture for #146's generation gate: an approved (state: active), policy-
+# compliant Flow Definition — exactly one boundary declares role: owned and
+# stays real, the other is honourably forbidden. Used by preflight.test.mjs,
+# provenance.test.mjs, and binding-verification.test.mjs as the "everything
+# is fine" baseline; the invalid/* siblings vary exactly one precondition
+# each.
+schema: dynamic-qa-flow-v1
+id: generation-happy-path
+revision: 1
+title: "Generation happy path: an approved flow with two Then outcomes"
+intent: "Prove the deterministic core's generation gate accepts a fully approved, policy-compliant flow."
+criticality: high
+state: active
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/146"
+test_level:
+  selection: inferred
+data_sets:
+  - generation-basic-case
+boundaries:
+  - id: vibesync-cli
+    system: "vibesync CLI"
+    treatment: real
+    role: owned
+    behavior: "Invoke the CLI's Update mode against a temporary folder pair."
+    side_effects: "Writes only inside the disposable temporary directories created for this run."
+    isolation:
+      namespace: "per-run temp directory"
+      cleanup: "temp directory removed after each case"
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or home-directory path is read or written."
+    side_effects: "none"
+steps:
+  - id: given-changed-destination
+    kind: given
+    intent: "A folder pair uses Update mode, and the destination has different content than the source."
+  - id: when-review-and-run
+    kind: when
+    intent: "The QA Owner reviews the Compare output and approves Run."
+  - id: then-destination-matches-source
+    kind: then
+    intent: "The destination content matches the source after Run completes."
+    outcomes:
+      - id: destination-matches-source
+        expect: "The destination report file reads '${case.newContent}'."
+  - id: then-safetynet-preserves-prior
+    kind: then
+    intent: "The prior destination content is preserved in SafetyNet."
+    outcomes:
+      - id: safetynet-has-prior-content
+        expect: "Exactly one SafetyNet Run folder contains a report file that reads '${case.oldContent}'."

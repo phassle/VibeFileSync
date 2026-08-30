@@ -1,0 +1,40 @@
+# Inherited rule (restricted-YAML): aliases are rejected outright, even in
+# an otherwise policy-compliant boundaries document.
+schema: dynamic-qa-flow-v1
+id: boundary-alias-flow
+revision: 1
+title: "Inherited rule: YAML alias is rejected"
+intent: "Prove a YAML alias inside boundaries still fails closed via #145's fixtures."
+criticality: high
+state: draft
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/18"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: &anchor "vibesync CLI"
+    treatment: real
+    behavior: "Invoke the CLI's Update mode against a temporary folder pair."
+    side_effects: "none"
+    role: owned
+  - id: vibesync-cli-alias
+    system: *anchor
+    treatment: forbidden
+    behavior: "No other use of this system."
+    side_effects: "none"
+steps:
+  - id: given-a
+    kind: given
+    intent: "i"
+  - id: when-b
+    kind: when
+    intent: "i"
+  - id: then-c
+    kind: then
+    intent: "i"
+    outcomes:
+      - id: outcome-a
+        expect: "exact one."

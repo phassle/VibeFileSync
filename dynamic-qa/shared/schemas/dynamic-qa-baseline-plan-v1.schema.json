@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-baseline-plan-v1.schema.json",
+  "title": "dynamic-qa Baseline Plan v1",
+  "description": "Strict, versioned contract for the customer file qa/baseline-plan.yaml (DESIGN-dynamic-qa-spec.md §5.4, SPEC-135.md user stories 42-44 and 103). Produced by qa-setup stage 8 ('Establish measurement readiness') whenever required baseline evidence is missing: setup pauses with readiness 'measurement-required' rather than inventing success evidence, and a later explicit invocation resumes purely from this file. Unknown, zero, and not-applicable are three distinct, mutually exclusive states for every numerator and denominator (never collapsed into one another), so a missing denominator can never masquerade as a good result. This document is the human-readable contract; dynamic-qa/shared/scripts/baseline-plan.mjs is the hand-written fail-closed validator, constructor, renderer, and resume reader that enforces it (no JSON Schema validator dependency is added — see dynamic-qa/DECISIONS.md and the run brief's deterministic-core decision).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "revision", "owners", "repository", "window", "metrics", "readiness", "generatedAt"],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-baseline-plan-v1",
+      "description": "Immutable. Any other value, including a plausible future version string, is an unsupported-schema-version error, not a silent upgrade attempt."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+      "description": "Immutable, semantic, kebab-case Baseline Plan ID."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing integer, starting at 1, incremented each time the plan is resumed and re-evaluated."
+    },
+    "owners": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qaOwner", "technicalOwner"],
+      "properties": {
+        "qaOwner": { "type": "string", "minLength": 1 },
+        "technicalOwner": { "type": "string", "minLength": 1 }
+      }
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The repository identity this plan measures (e.g. 'org/repo')."
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startedAt"],
+      "properties": {
+        "startedAt": { "type": "string", "format": "date-time", "description": "When baseline collection began. The burn-in gate (14 calendar days minimum) is measured from here." },
+        "note": { "type": "string" }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "description": "Exactly the six required baselines (flow-coverage, escaped-regressions, pr-check-latency-p95, flake-rate, maintenance-time, repair-decisions), one each, no more, no fewer. A baseline that does not yet apply is still present, carrying a not-applicable Quantity with a reason, never simply absent.",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "label", "query", "interval", "source", "numerator", "denominator", "provenance", "collectedAt"],
+        "properties": {
+          "id": {
+            "enum": ["flow-coverage", "escaped-regressions", "pr-check-latency-p95", "flake-rate", "maintenance-time", "repair-decisions"]
+          },
+          "label": { "type": "string", "minLength": 1 },
+          "query": { "type": "string", "minLength": 1, "description": "The exact query or collection method. Required even before any evidence exists — this is the explicit collection method the ticket requires for every baseline." },
+          "interval": { "type": "string", "minLength": 1, "description": "The collection interval, e.g. 'trailing-30-days'." },
+          "source": { "type": "string", "minLength": 1, "description": "The system queried for this metric." },
+          "numerator": { "$ref": "#/$defs/quantity" },
+          "denominator": { "$ref": "#/$defs/quantity" },
+          "provenance": { "enum": ["observed", "reported", "unknown"] },
+          "collectedAt": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "Required non-null ISO 8601 timestamp when numerator or denominator carries a known value; required null otherwise — a timestamp here with no known value would misleadingly claim a real collection happened."
+          },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "readiness": {
+      "enum": ["measurement-required", "ready"],
+      "description": "Always recomputed from the metrics/window actually present; never hand-set. 'ready' requires every metric to be either fully measured or legitimately not-applicable, AND the burn-in gate (>=14 calendar days since window.startedAt, >=20 relevant completed PR runs) to have cleared."
+    },
+    "generatedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "quantity": {
+      "description": "The three-state value type every numerator and denominator must be. 'unknown' means evidence not yet collected. 'not-applicable' means this metric does not apply here, with a mandatory reason. 'known' carries an actual measured number, where 0 is an entirely ordinary value distinguished from 'unknown' by tag, never by value. There is no fourth, implicit 'missing' state: a field is always one of these three.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "unknown" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reason"],
+          "properties": {
+            "kind": { "const": "not-applicable" },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "known" },
+            "value": { "type": "number", "minimum": 0 }
+          }
+        }
+      ]
+    }
+  }
+}

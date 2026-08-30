@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-execution-profile-v1.schema.json",
+  "title": "dynamic-qa Execution Profile v1",
+  "description": "Strict, versioned contract for one Execution Profile file (qa/execution-profiles/<profile-id>.yaml), referenced by id from a Provenance Manifest binding record's executionProfile.id (dynamic-qa-provenance-v1.schema.json, #146). Generated before activation so a Flow's paths, commands, environments, network, identities, effects, resources, and evidence are enforceable rather than assumed (DESIGN-dynamic-qa-spec.md §5.3, SPEC-135.md user stories 40-41). A profile declares handles and policy, never secret values. Provider adapters may strengthen a profile, never omit or weaken it. This document is the human-readable contract; dynamic-qa/shared/scripts/execution-profile.mjs is the hand-written fail-closed validator that enforces it, and dynamic-qa/shared/scripts/capability-gate.mjs is the Capability Gate that checks a validated profile against actual environment evidence before activation (no JSON Schema validator dependency is added — see dynamic-qa/DECISIONS.md and the run brief's deterministic-core decision).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "revision",
+    "owners",
+    "allowedPhases",
+    "allowedTestLevels",
+    "environments",
+    "paths",
+    "commands",
+    "resources",
+    "identities",
+    "network",
+    "effects",
+    "credentials",
+    "diagnostics",
+    "evidence"
+  ],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-execution-profile-v1",
+      "description": "Immutable. Any other value, including a plausible future version string, is an unsupported-schema-version error, not a silent upgrade attempt."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+      "description": "Immutable, semantic, kebab-case Execution Profile ID. Must equal the file's basename without extension. Never derived from an issue number; never reused; never renamed."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing per profile id."
+    },
+    "owners": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qaOwner", "technicalOwner"],
+      "properties": {
+        "qaOwner": { "type": "string", "minLength": 1 },
+        "technicalOwner": { "type": "string", "minLength": 1 }
+      },
+      "description": "Who approved this profile. Distinct roles per the run brief's separate-approvals invariant."
+    },
+    "allowedPhases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "enum": ["candidate-verification", "pr", "nightly", "manual"] },
+      "description": "Which safe-execution Trust Zone phases this profile may be used in (spec §11's four Trust Zones)."
+    },
+    "allowedTestLevels": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "enum": ["api", "cli", "browser"] }
+    },
+    "environments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runnerClass", "disposable", "disposabilityEvidence", "sandbox"],
+      "properties": {
+        "runnerClass": { "type": "string", "minLength": 1, "description": "e.g. \"github-hosted-macos\", \"self-hosted-linux-container\"." },
+        "disposable": { "type": "boolean", "description": "Must be true: the run must execute on disposable, unprivileged compute (SPEC-135 story 86)." },
+        "disposabilityEvidence": { "type": "string", "minLength": 1, "description": "How disposability is evidenced, e.g. \"fresh VM per job, destroyed after\"." },
+        "sandbox": { "type": "string", "minLength": 1, "description": "Sandbox mechanism, e.g. \"os-level container\", \"vm\", \"none\" (a literal \"none\" is a valid value; the Capability Gate, not this schema, decides if that is acceptable for a given phase)." },
+        "osLimits": { "type": "string" },
+        "containerLimits": { "type": "string" }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowedRead", "allowedWrite"],
+      "properties": {
+        "allowedRead": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "allowedWrite": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "description": "Both may be empty arrays (no read/write access granted), but the keys themselves are required — undeclared filesystem reach is forbidden by default, so every profile must say so explicitly."
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed"],
+      "properties": {
+        "allowed": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxProcesses", "maxCpuSeconds", "maxMemoryMb", "maxFileSizeMb", "maxWallTimeSeconds"],
+      "properties": {
+        "maxProcesses": { "type": "integer", "minimum": 1 },
+        "maxCpuSeconds": { "type": "number", "exclusiveMinimum": 0 },
+        "maxMemoryMb": { "type": "number", "exclusiveMinimum": 0 },
+        "maxFileSizeMb": { "type": "number", "exclusiveMinimum": 0 },
+        "maxWallTimeSeconds": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approvedNonProduction", "denyProduction", "denyMetadata"],
+      "properties": {
+        "approvedNonProduction": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "denyProduction": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "Positive-deny production identifiers. Non-empty: a profile must name at least one production identifier it explicitly denies." },
+        "denyMetadata": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "Positive-deny cloud/instance-metadata identifiers, e.g. \"169.254.169.254\"." }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["none", "exact-allowlist"], "description": "Defaults to none. exact-allowlist requires every other field below." },
+        "allowlist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["origin", "service"],
+            "properties": {
+              "origin": { "type": "string", "minLength": 1, "description": "An exact origin, e.g. \"https://api.example-staging.test\". Wildcards (\"*\"), bare TLDs, or CIDR ranges broader than a single host are rejected by execution-profile.mjs as not exact." },
+              "service": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "dnsRecheck": { "type": "boolean" },
+        "redirectRecheck": { "type": "boolean" },
+        "denyMetadataRange": { "type": "boolean" },
+        "denyInternalRange": { "type": "boolean" },
+        "denyPublicRange": { "type": "boolean" },
+        "externallyEnforced": { "type": "boolean", "description": "True only when egress is enforced by a mechanism outside the test process itself (a network policy, egress proxy, or firewall) — never by the test code's own good behaviour. A permissive hosted runner with no such mechanism does not satisfy exact egress (SPEC-135 story 88)." },
+        "enforcementMechanism": { "type": "string", "minLength": 1 }
+      },
+      "description": "network.mode=\"exact-allowlist\" requires allowlist (non-empty), dnsRecheck, redirectRecheck, denyMetadataRange, denyInternalRange, denyPublicRange, externallyEnforced (all true), and a non-empty enforcementMechanism. execution-profile.mjs enforces this combination; this schema only shapes the fields."
+    },
+    "effects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowedBoundaryIds", "reversibleSideEffects"],
+      "properties": {
+        "allowedBoundaryIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "reversibleSideEffects": { "type": "boolean" },
+        "namespace": { "type": "string", "minLength": 1, "description": "Required when reversibleSideEffects is true." },
+        "cleanup": { "type": "string", "minLength": 1, "description": "Required when reversibleSideEffects is true." },
+        "rate": { "type": "string", "minLength": 1 },
+        "concurrency": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "credentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "handle": { "type": "string", "minLength": 1, "description": "A named handle, never a secret value." },
+        "audience": { "type": "string", "minLength": 1 },
+        "scopes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "lifetimeSeconds": { "type": "number", "exclusiveMinimum": 0 },
+        "injectionPhase": { "enum": ["candidate-verification", "pr", "nightly", "manual"] },
+        "revocation": { "type": "string", "minLength": 1 }
+      },
+      "description": "May be an empty object when no credential is required by this profile."
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classes", "captureConditions", "scrubber", "maxSizeMb", "audience", "retentionDays"],
+      "properties": {
+        "classes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "captureConditions": { "type": "array", "items": { "enum": ["failure-only", "always", "never"] } },
+        "scrubber": { "type": "string", "minLength": 1, "description": "Named scrubber applied before upload. Required even when classes is empty, so \"no diagnostics captured\" is an explicit statement." },
+        "maxSizeMb": { "type": "number", "minimum": 0 },
+        "audience": { "type": "string", "minLength": 1 },
+        "retentionDays": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "capabilities"],
+      "properties": {
+        "adapter": { "type": "string", "minLength": 1, "description": "Provider adapter identity, e.g. \"github-actions\"." },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "description": "One entry per capability this profile requires the environment to prove before activation. Every category above (paths, commands, environments, network, identities, effects, resources) that this profile declares non-trivial policy for should have a matching capability entry here for the Capability Gate to check.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["capability", "category"],
+            "properties": {
+              "capability": { "type": "string", "minLength": 1, "description": "A stable, exact, human-readable capability name, e.g. \"network.exact-allowlist-externally-enforced\". Named exactly so a missing capability produces a named Safety Blocker, never a generic failure." },
+              "category": { "enum": ["paths", "commands", "environments", "network", "identities", "effects", "resources", "evidence"] },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,23 @@
+schema: dynamic-qa-flow-v1
+id: boundary-invalid-treatment-flow
+revision: 1
+title: "Boundary declares a treatment outside real | simulated | forbidden"
+intent: "Boundary treatment must be exactly one of the three allowed values."
+criticality: low
+state: draft
+origin:
+  tickets:
+    - "https://example.com/1"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: b
+    system: s
+    treatment: mocked
+    behavior: b
+    side_effects: none
+steps:
+  - id: given-a
+    kind: given
+    intent: "irrelevant"

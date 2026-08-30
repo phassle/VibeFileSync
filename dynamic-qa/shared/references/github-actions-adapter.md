@@ -1,0 +1,106 @@
+# GitHub Actions adapter (#153)
+
+GitHub Actions is dynamic-qa's first named provider adapter
+(DESIGN-dynamic-qa-spec.md §9). It renders a fast, advisory pull-request lane
+for the customer's relevant deterministic Bindings — brownfield Bindings
+enter CI advisory during burn-in (spec §8) so a new suite can never
+destabilise an existing merge gate.
+
+## Modules
+
+- `shared/scripts/github-actions-workflow.mjs` — pure renderers
+  (`renderAdvisoryPullRequestLane`, and #154's `renderNightlyFullSuiteLane`,
+  `renderManualTriggerLane`, `renderMergeGroupLane`) plus a reusable
+  hardening detector (`checkWorkflowHardening(yaml, { lane, trigger })`)
+  that names, individually, any missing/violated hardening property in
+  arbitrary rendered/mutated workflow YAML text, lane- and trigger-aware.
+- `shared/scripts/github-actions-adapter.mjs` — the seven-point
+  provider-adapter contract: detection (`detectProviderConfiguration`),
+  capability evidence shaping (`deriveCapabilityEvidence`), planning
+  (`planAdvisoryPullRequestLane` plus #154's `planNightlyFullSuiteLane`,
+  `planManualTriggerLane`, `planMergeGroupLane`, all of which compose the
+  Capability Gate with their renderer and never render while a blocker is
+  open), the supported trigger list (`SUPPORTED_TRIGGERS`, now all four),
+  run-reference resolution (`resolveRunReference`), post-render profile
+  enforcement (`checkGeneratedConfigEnforcesProfile`), and #154's trust
+  classification (`classifyLaneContentSource`, `checkLaneTrustInvariant`).
+- `shared/scripts/junit-report.mjs` — a restricted-subset JUnit XML reader
+  (no third-party dependency), used by:
+  - `shared/scripts/github-actions-annotations-cli.mjs` — native GitHub
+    Actions annotations (`::error::` workflow commands), no action needed.
+  - `shared/scripts/github-actions-summary-cli.mjs` — a concise job summary
+    written to `$GITHUB_STEP_SUMMARY`, no action needed.
+- `shared/scripts/result-envelope.mjs` — the Result Envelope v1 contract
+  (`shared/schemas/dynamic-qa-result-envelope-v1.schema.json`) that a
+  privileged-publication lane may consume, gated by trust-zones.mjs's
+  `checkPrivilegedLaneArtifact` (reused, not duplicated).
+
+## Hardening (a security requirement, this is not a style preference)
+
+Every rendered workflow: a safe `pull_request` trigger only (never
+`pull_request_target`); minimal `permissions: contents: read`;
+`persist-credentials: false` on checkout; full-commit-SHA-pinned actions
+(never a floating tag); a job-level `continue-on-error: true` so an
+advisory failure can never fail the workflow run or gate a merge; no
+secret, OIDC (`id-token: write`), protected environment, write permission
+scope, privileged cache action, or self-hosted runner. `checkWorkflowHardening`
+detects each property's violation individually and by name — it is the same
+function used both to prove the renderer's own output is hardened and to
+implement contract point 7 (validate that generated configuration enforces
+the Execution Profile) against arbitrary text.
+
+## The Node-runtime caveat
+
+Node is guaranteed on a developer machine and a GitHub-hosted runner, but
+NOT automatically on a minimal self-hosted runner. The renderer always
+emits an explicit `actions/setup-node` step (never assumes an ambient
+`node`), and the adapter additionally REQUIRES the Execution Profile to
+declare a `runtime.node-available` capability
+(`checkNodeRuntimeCapabilityDeclared`) and the environment to report it
+`met` — a missing or unmet Node runtime is always a named Safety Blocker and
+a deferred flow (`planAdvisoryPullRequestLane` returns
+`{ rendered: false, state: "deferred", blockers }`), never a silent skip.
+
+## Sharding
+
+Not introduced. DESIGN-dynamic-qa-spec.md §8 is explicit: "sharding only
+after measured need." The renderer's `testCommand` is a single, precomputed
+command string — the seam for a later ticket to shard is there (a caller
+could pass a matrix of `testCommand`s once real runtime data justifies it),
+but nothing in this ticket adds a matrix strategy, and none should be added
+without measured runtime evidence.
+
+## Seams for later tickets
+
+- **Nightly full suite, manual/provider-API trigger, merge-group trigger**
+  (DESIGN-dynamic-qa-spec.md §8's other three Provider-native CI exposures)
+  are now built (#154) — `SUPPORTED_TRIGGERS` names all four; `DEFERRED_TRIGGERS`
+  is empty. See `shared/references/ci-lanes.md` for the per-lane prose (gating
+  semantics, the trust-asymmetry classification, and the manual trigger's
+  no-inputs guarantee).
+- **Impact-path-based Binding selection** ("a pull request runs only the
+  Bindings relevant to the change") is NOT implemented here — this
+  renderer's `testCommand` is a precomputed, already-scoped command string a
+  caller supplies. Selecting *which* Bindings are relevant from impact paths
+  is a separate concern for whichever ticket owns impact-path evaluation.
+- **Full semantic inventory of an existing arbitrary workflow's content**
+  (contract point 1) is out of scope: `detectProviderConfiguration` is
+  read-only and filename-level only. dynamic-qa's restricted-YAML parser is
+  deliberately scoped to dynamic-qa's own schemas, not arbitrary
+  third-party GitHub Actions YAML.
+- **Required-lane and quarantine-lane rendering** (adapter contract point 3
+  names all three: advisory, required, quarantine). #154 added one REQUIRED
+  renderer (`renderMergeGroupLane`, since a merge-group trigger's entire
+  purpose is to gate the queue) reusing the same hardening detector via a
+  new `lane: "required"` option; a PR lane graduating from advisory to
+  required after burn-in, and quarantine-lane rendering, remain open for a
+  later ticket.
+- **Action-pin freshness**: `CHECKOUT_ACTION_SHA` / `SETUP_NODE_ACTION_SHA`
+  in `github-actions-workflow.mjs` are placeholders shaped as real 40-hex
+  commit SHAs (the deterministic core has zero network access and cannot
+  resolve them itself) — re-verify each against the intended upstream
+  release before this generated workflow is ever enabled for a real
+  repository. The pilot (#171-175) is deliberately not being run yet.
+- **Wiring this adapter's invocation into `qa-generate/SKILL.md`'s own step
+  sequence** is left to a coordinated follow-up — see that file's step 5
+  note.

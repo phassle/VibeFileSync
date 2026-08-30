@@ -1,0 +1,51 @@
+# Identical to valid.yaml except one semantic value changed (the final
+# outcome's expect text). Used to prove the digest DOES change when meaning
+# changes, in contrast with valid-reformatted.yaml.
+schema: dynamic-qa-flow-v1
+id: update-preserves-safetynet
+revision: 1
+title: "Update preserves the prior destination version in SafetyNet before Publish"
+intent: "Prevent silent loss of the previous destination content when Update replaces it."
+criticality: high
+state: draft
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/18"
+test_level:
+  selection: inferred
+data_sets:
+  - changed-destination-basic
+boundaries:
+  - id: vibesync-cli
+    system: "vibesync CLI"
+    treatment: real
+    behavior: "Invoke the CLI's Update mode against a temporary folder pair."
+    side_effects: "Writes only inside the disposable temporary directories created for this run."
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or home-directory path is read or written."
+    side_effects: "none"
+steps:
+  - id: given-changed-destination
+    kind: given
+    intent: "A folder pair named 'documents' uses Update mode, and the destination has different content than the source."
+  - id: when-review-and-run
+    kind: when
+    intent: "The QA Owner reviews the Compare output and approves Run."
+  - id: then-destination-matches-source
+    kind: then
+    intent: "The destination content matches the source after Run completes."
+    outcomes:
+      - id: destination-matches-source
+        expect: "The destination report file reads '${case.newContent}'."
+  - id: then-safetynet-preserves-prior
+    kind: then
+    intent: "The prior destination content is preserved in SafetyNet."
+    outcomes:
+      - id: safetynet-has-prior-content
+        expect: "Exactly one SafetyNet Run folder contains a report file that reads '${case.oldContent}'."
+      - id: no-sibling-temp-remains
+        expect: "No sibling temporary file, folder, or lockfile remains beside the destination."
+        tolerance:
+          kind: exact

@@ -1,0 +1,74 @@
+# Pilot Flow Definition (dynamic-qa-flow-v1) — VibeFileSync brownfield
+# pilot, flow 5 of 5 (ticket #172, SPEC-135.md §13 "Interrupted Publish
+# converges on rerun").
+#
+# state: deferred — see dynamic-qa/pilot/vibefilesync/README.md.
+#
+# Grounds this Flow in CONTEXT.md's "Convergence" entry and
+# docs/adr/0009-acceptance-test-harness.md's invariants I1-I4: the next run
+# after any interruption reaches the correct destination state through its
+# own fresh scan, with the old destination version never lost (I1), no
+# unverified file ever published (I2), one rerun converging (I3), and the
+# Journal honestly reporting the interruption (I4). The Binding reuses the
+# real-binary acceptance harness's replacement variant at the
+# `publish_complete` crash transition —
+# `tests/acceptance/main.rs::exercise_replacement_cell` — which kills the
+# real `vibesync` process via `VIBESYNC_TEST_CRASH_AT=publish_complete` on a
+# real hdiutil-mounted APFS or exFAT volume, then asserts convergence after
+# an ordinary rerun.
+schema: dynamic-qa-flow-v1
+id: interrupted-publish-convergence
+revision: 1
+title: "A process killed exactly after Publish completes still converges cleanly on the next ordinary run"
+intent: "Prove that killing the real vibesync process immediately after Publish finishes never loses the old version, never leaves a partial file live, and that one ordinary rerun reaches the correct destination state through its own fresh scan, with the crashed run's Journal honestly reporting the interruption."
+criticality: critical
+state: deferred
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/13"
+    - "https://github.com/phassle/VibeFileSync/issues/172"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "the vibesync CLI binary, built with the fault-injection cargo feature"
+    treatment: real
+    behavior: "Run a replacement in Update or Mirror mode against a real mounted volume; the process is killed via VIBESYNC_TEST_CRASH_AT=publish_complete exactly after Publish completes, then Run is invoked again as an ordinary rerun."
+    side_effects: "Writes, replaces, and archives files on the suite's own disposable mounted image."
+    role: owned
+    isolation:
+      namespace: "the same suite-scoped hdiutil sparse image and per-case destination directory as the real-mounted-volume boundary below"
+      cleanup: "the test harness detaches and removes the sparse image on teardown"
+  - id: real-mounted-volume
+    system: "a real hdiutil-attached APFS or exFAT sparse image, suite-scoped"
+    treatment: real
+    behavior: "The source and destination live on a real mounted volume so rename, kernel AppleDouble fallback, and timestamp-granularity semantics are exercised, not mocked (ADR-0009 explicitly rejects in-process filesystem mocks for this harness)."
+    side_effects: "Creates and removes files on a disposable, suite-scoped sparse image attached and detached by the test harness itself."
+    isolation:
+      namespace: "one hdiutil sparse image attached per suite run, a fresh destination directory per test case (tests/acceptance/main.rs::MountedImage)"
+      cleanup: "the test harness detaches and removes the sparse image on teardown"
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or developer HOME path is read or written; only the suite's own disposable mounted image is touched."
+    side_effects: "none"
+steps:
+  - id: given-replacement-about-to-publish
+    kind: given
+    intent: "A replacement is in flight on a real mounted volume: the new version has passed Verification and is about to be published in place of the old destination file."
+  - id: when-process-is-killed-at-publish-complete-and-rerun-happens
+    kind: when
+    intent: "The real process is killed exactly after the publish_complete transition, then Run is invoked again as an ordinary rerun."
+  - id: then-rerun-converges-honestly
+    kind: then
+    intent: "The rerun's own fresh scan reaches the correct destination state without manual repair or replay, the old version was never lost, no partial file was ever live, and the crashed run's Journal honestly reports the interruption."
+    outcomes:
+      - id: old-version-never-lost
+        expect: "The old destination content exists either at its live path or in a SafetyNet Run folder, never in neither place, at every point checked (invariant I1)."
+      - id: no-unverified-publish
+        expect: "The final destination path always holds either the complete old version or the complete gate-passed new version, never a partial write (invariant I2)."
+      - id: rerun-converges-cleanly
+        expect: "The rerun exits cleanly, its own fresh scan reaches the destination state Convergence requires, and no manual repair or replay step is needed (invariant I3)."
+      - id: crashed-run-journal-is-honest
+        expect: "The crashed run's Journal is summary-less and the rerun's Journal records its own cleanup; no crashed run's Journal ever claims success (invariant I4)."

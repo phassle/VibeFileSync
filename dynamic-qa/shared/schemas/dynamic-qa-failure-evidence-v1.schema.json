@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-failure-evidence-v1.schema.json",
+  "title": "dynamic-qa Failure Evidence Bundle v1",
+  "description": "The Failure Evidence Bundle DESIGN-dynamic-qa-spec.md §5.6 describes: 'immutable run/source/environment identities, original failed conclusion, Flow/step/outcome/Binding/provenance/profile mappings, normalized JUnit facts, safe expected-versus-observed facts, attempts, fixture and boundary enforcement, environment health, and digest-addressed approved diagnostics. It excludes secrets, production data, unrestricted bodies, whole workspaces, and unscrubbed evidence.' This is the ONLY artifact that may authorize `qa-generate repair --evidence <bundle>` (spec §7's Repair workflow step 1). This document is the human-readable contract only — no JSON Schema validator dependency is added, matching every other schema in this bundle. The actual hand-written, fail-closed validation — including the bundle-wide invariants this format alone cannot express, such as 'every free-text field is bounded and scrubbed', 'diagnosisRecord identity must agree with the bundle's own identity', and 'bundleDigest must match a recomputation or the bundle has been mutated' — lives in shared/scripts/failure-evidence.mjs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "bundleId",
+    "repository",
+    "sourceCommit",
+    "generatedAt",
+    "workflow",
+    "flowId",
+    "profileId",
+    "provenanceDigest",
+    "originalConclusion",
+    "diagnosisRecord",
+    "junitFacts",
+    "expectedVsObserved",
+    "fixtureBoundaryEnforcement",
+    "environmentHealth",
+    "approvedDiagnostics",
+    "bundleDigest"
+  ],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-failure-evidence-v1",
+      "description": "Immutable. Any other value is an unsupported-schema-version error, never a silent upgrade."
+    },
+    "bundleId": { "type": "string", "minLength": 1, "description": "Stable identifier for this bundle, distinct from any Diagnosis Record it carries." },
+    "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$", "description": "Exact 'owner/name' string." },
+    "sourceCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full commit SHA of the run this evidence came from — never a branch name or short SHA. The bundle names a specific run tied to a source commit; this and workflow together are that identity."
+    },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "workflowFile", "runId", "runAttempt"],
+      "properties": {
+        "provider": { "const": "github-actions" },
+        "workflowFile": { "type": "string", "minLength": 1 },
+        "runId": { "type": "string", "minLength": 1 },
+        "runAttempt": { "type": "string", "minLength": 1 },
+        "url": { "type": "string" }
+      },
+      "description": "Same identity shape as result-envelope.mjs's workflow field, produced by github-actions-adapter.mjs's resolveRunReference from a real run — never a free-text description of where the failure came from."
+    },
+    "flowId": { "type": "string", "minLength": 1 },
+    "bindingId": { "type": "string", "minLength": 1, "description": "Present when the failure is Binding-owned; required to agree with diagnosisRecord.bindingId when both are present." },
+    "profileId": { "type": "string", "minLength": 1, "description": "The Execution Profile ID the run used." },
+    "provenanceDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Ties the bundle to a specific qa/provenance.json Binding entry." },
+    "originalConclusion": { "const": "failed", "description": "A Failure Evidence Bundle only ever documents a failed run. The historical failure remains failed regardless of any later repair (spec §7 step 7)." },
+    "diagnosisRecord": {
+      "description": "Exactly one embedded Diagnosis Record (dynamic-qa-diagnosis-v1, #158) — never a list, never omitted. Its own causalChain is a single string, so a bundle structurally cannot carry more than one causal hypothesis. See shared/schemas/dynamic-qa-diagnosis-v1.schema.json for its full shape; validated here by diagnosis.mjs's own validateDiagnosisRecord, composed rather than re-implemented.",
+      "type": "object"
+    },
+    "junitFacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "description": "Normalized JUnit facts from the actual failing run — structured fields only, never a raw log excerpt.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["suite", "name", "verdict"],
+        "properties": {
+          "suite": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "verdict": { "type": "string", "enum": ["failed", "error", "skipped"] },
+          "message": { "type": "string", "maxLength": 500, "description": "Bounded and scrubbed (secret-detection.mjs) — never an unbounded log dump." },
+          "durationMs": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "expectedVsObserved": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "description": "The safe expected-versus-observed facts the design requires — bounded, scrubbed, tied to a stable Expected Outcome ID, never free prose.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["expectedOutcomeId", "expected", "observed"],
+        "properties": {
+          "expectedOutcomeId": { "type": "string", "minLength": 1 },
+          "expected": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "observed": { "type": "string", "minLength": 1, "maxLength": 500 }
+        }
+      }
+    },
+    "fixtureBoundaryEnforcement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["boundariesEnforced", "fixtureIsolation"],
+      "properties": {
+        "boundariesEnforced": { "type": "array", "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "fixtureIsolation": { "type": "string", "minLength": 1, "maxLength": 500 }
+      }
+    },
+    "environmentHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkedAt", "capabilities"],
+      "properties": {
+        "checkedAt": { "type": "string", "format": "date-time" },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "status"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "status": { "type": "string", "enum": ["met", "unmet", "unknown"] }
+            }
+          }
+        }
+      }
+    },
+    "approvedDiagnostics": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "Digest-addressed pointers to approved diagnostic artifacts — never inline raw content. Excludes secrets, production data, unrestricted bodies, and whole workspaces by construction: only a label and a sha256 digest are representable here.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "digest"],
+        "properties": {
+          "label": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "bundleDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Canonical content digest (canonical-digest.mjs's contentDigest) over every OTHER field in this bundle. The immutability mechanism: any edit to the bundle after this digest was computed — including an edit meant to 'improve' evidence to justify a conclusion the original run never supported — is detected by recomputing and comparing. Evidence cannot be edited to justify a conclusion."
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# Worked example transcript for cases/transcript/example-stop-state.case.sh.
+#
+# Format: one step per line, see dynamic-qa/acceptance/lib/transcript.sh for
+# the full grammar. This transcript plays out a capability-gate style stop:
+# a question is asked, a scripted owner answers it, and the run stops
+# without writing anything to the fixture repository.
+ask|capability-gate|Is a verified dynamic-skills-setup capability profile present for this harness?
+answer|capability-gate|absent
+stop|missing-capability-profile

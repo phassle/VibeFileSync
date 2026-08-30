@@ -1,0 +1,40 @@
+# Violates rule: exactly one boundary may declare role: owned. Here two do.
+schema: dynamic-qa-flow-v1
+id: multiple-owned-boundaries-flow
+revision: 1
+title: "Boundary policy violation: two owned boundaries"
+intent: "Prove a flow with more than one role: owned boundary is rejected."
+criticality: high
+state: draft
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/18"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "vibesync CLI"
+    treatment: real
+    behavior: "Invoke the CLI's Update mode against a temporary folder pair."
+    side_effects: "none"
+    role: owned
+  - id: vibesync-report
+    system: "the generated report file"
+    treatment: real
+    behavior: "Read the report file the CLI writes."
+    side_effects: "none"
+    role: owned
+steps:
+  - id: given-a
+    kind: given
+    intent: "i"
+  - id: when-b
+    kind: when
+    intent: "i"
+  - id: then-c
+    kind: then
+    intent: "i"
+    outcomes:
+      - id: outcome-a
+        expect: "exact one."

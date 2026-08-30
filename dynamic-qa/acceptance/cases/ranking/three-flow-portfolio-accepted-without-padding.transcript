@@ -1,0 +1,11 @@
+# Models stage 4's ranking presentation and the QA Owner's explicit approval
+# of a below-guidance portfolio. No write step appears anywhere — stage 4,
+# like stages 1-3, only ever asks and reports; nothing is emitted until the
+# Setup Review Packet (stage 10).
+ask|candidate-list|Here is the broad Candidate Flow list, ranked by impact, frequency, change exposure, escape history, and whether cheaper coverage already exists. Does this ranking match your understanding of risk?
+answer|candidate-list|yes
+ask|portfolio-selection|Which ranked candidates should this portfolio protect?
+answer|portfolio-selection|all three
+ask|portfolio-size-check|That is fewer than the usual 5-10 guidance range. Is three flows sufficient coverage for this repository right now, or should discovery look for more evidence first?
+answer|portfolio-size-check|three is sufficient — nothing else rises to this level of risk
+stop|candidate-portfolio-approved

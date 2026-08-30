@@ -1,0 +1,7 @@
+schema: dynamic-qa-data-v1
+id: forbidden-url-value-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      homepage: "https://example.com/dashboard"

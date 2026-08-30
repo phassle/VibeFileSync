@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-data-v1.schema.json",
+  "title": "dynamic-qa Named Data Set v1",
+  "description": "Strict, versioned contract for one Named Data Set file (qa/data/<data-set-id>.yaml). The filename equals the immutable, semantic data-set ID. A Named Data Set is separated from Flow intent so cases stay reusable across flows and environments (DESIGN-dynamic-qa-spec.md §5.2, SPEC-135.md user stories 25-26). Values are non-secret and environment-neutral: secret values, selectors, URLs, commands, and adapter configuration are forbidden. A field may name an approved secret handle by ID, never carry its value. This document is the human-readable contract; dynamic-qa/shared/scripts/named-data-set.mjs is the hand-written fail-closed validator that enforces it (no JSON Schema validator dependency is added — see dynamic-qa/DECISIONS.md and the run brief's deterministic-core decision). Secret-value detection there is a mix of exact structural rules and necessarily heuristic pattern matching; see that module's header comment for exactly which is which.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "revision", "cases"],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-data-v1",
+      "description": "Immutable. Any other value, including a plausible future version string, is an unsupported-schema-version error, not a silent upgrade attempt."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+      "description": "Immutable, semantic, kebab-case Named Data Set ID. Must equal the file's basename without extension. Never derived from an issue number; never reused; never renamed."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing per data-set ID. A single file's validator can only check that this is a positive integer; monotonic non-decrease across revisions is a cross-file provenance/drift-gate concern, not this schema's (mirrors the Flow Definition schema's revision note)."
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Named cases. Order is not meaningful (cases are addressed by id, not position), but is preserved rather than reordered.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "fields"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+            "description": "Stable semantic case id, unique within this data set."
+          },
+          "fields": {
+            "type": "object",
+            "minProperties": 1,
+            "propertyNames": {
+              "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
+              "description": "Must be usable as the <field> in a Flow's scalar '${case.<field>}' substitution."
+            },
+            "additionalProperties": {
+              "description": "Either a non-secret scalar value, or an approved-secret-handle reference. Never a URL, selector, command, or adapter-configuration value, and never a secret value.",
+              "oneOf": [
+                { "type": ["string", "number", "boolean", "null"] },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["secret_handle"],
+                  "properties": {
+                    "secret_handle": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Names an approved secret handle owned by the Execution Profile. The value itself never appears here."
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

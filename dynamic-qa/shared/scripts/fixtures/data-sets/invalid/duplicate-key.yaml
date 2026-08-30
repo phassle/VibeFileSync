@@ -1,0 +1,8 @@
+schema: dynamic-qa-data-v1
+id: duplicate-key-data-set
+revision: 1
+cases:
+  - id: a
+    fields:
+      note: "first"
+      note: "second — should never be reached"

@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-provenance-v1.schema.json",
+  "title": "dynamic-qa Provenance Manifest v1",
+  "description": "Strict, versioned contract for the customer file <repository>/qa/provenance.json (DESIGN-dynamic-qa-spec.md §5.5, SPEC-135.md user story 54). Records, for every current or adopted Binding, exactly what generation used to produce it and what it produced. Runtime test results never enter this file. Deterministically ordered: bindings are sorted by flowId, and every order-insignificant collection inside a record is sorted, so re-running generation against identical inputs produces byte-identical output. This document is the human-readable contract; dynamic-qa/shared/scripts/provenance.mjs is the hand-written fail-closed validator, builder, and canonical-ordering module that enforces and produces it (no JSON Schema validator dependency is added — see dynamic-qa/DECISIONS.md and the run brief's deterministic-core decision).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generatedAt", "bindings"],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-provenance-v1",
+      "description": "Immutable. Any other value, including a plausible future version string, is an unsupported-schema-version error, not a silent upgrade attempt."
+    },
+    "generatedAt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Caller-supplied timestamp (an injected clock, per the bundle's determinism rule — never computed internally by the writer, so identical inputs always produce identical bytes)."
+    },
+    "bindings": {
+      "type": "array",
+      "description": "One record per current or adopted Binding, sorted by flowId. A flowId may appear at most once: regenerating a flow replaces its record rather than appending a duplicate.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "flowId",
+          "flowRevision",
+          "flowDigest",
+          "originTickets",
+          "dataSets",
+          "schemas",
+          "testLevel",
+          "sourceCommit",
+          "generator",
+          "framework",
+          "harnessInputs",
+          "outputs",
+          "impactPaths",
+          "enforcementLane",
+          "executionProfile"
+        ],
+        "properties": {
+          "flowId": { "type": "string", "minLength": 1, "description": "The Flow Definition's immutable, semantic id." },
+          "flowRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The Flow Definition's revision at generation time. Must never regress against a revision already recorded for the same flowId (see provenance.mjs checkRevisionMonotonic)."
+          },
+          "flowDigest": { "type": "string", "minLength": 1, "description": "canonical-digest.mjs contentDigest over the validated Flow Definition data model." },
+          "originTickets": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "format": "uri" },
+            "description": "Copied from the Flow Definition's origin.tickets, sorted."
+          },
+          "dataSets": {
+            "type": "array",
+            "description": "One entry per referenced Named Data Set, sorted by id.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "digest"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "digest": { "type": "string", "minLength": 1, "description": "contentDigest over the validated Named Data Set data model." }
+              }
+            }
+          },
+          "schemas": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["flow", "data"],
+            "properties": {
+              "flow": { "type": "string", "minLength": 1, "description": "Digest of the pinned dynamic-qa-flow-v1 schema text in use at generation time." },
+              "data": { "type": "string", "minLength": 1, "description": "Digest of the pinned dynamic-qa-data-v1 schema text in use at generation time." }
+            }
+          },
+          "testLevel": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["selection"],
+            "properties": {
+              "selection": { "type": "string", "enum": ["inferred", "override"] },
+              "value": { "type": "string", "minLength": 1 },
+              "reason": { "type": "string", "minLength": 1 }
+            },
+            "description": "The selected test level and whether it was inferred or an approved override, mirroring the Flow Definition's own test_level shape."
+          },
+          "sourceCommit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "description": "The exact source commit the candidate Binding was verified against."
+          },
+          "generator": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["identity", "bundleVersion", "contentDigest"],
+            "properties": {
+              "identity": { "enum": ["generated", "adopted"] },
+              "bundleVersion": { "type": "string", "minLength": 1, "description": "dynamic-qa BUNDLE_VERSION at generation time." },
+              "contentDigest": { "type": "string", "minLength": 1, "description": "Content digest identifying the exact generator/bundle code used." },
+              "harness": { "type": "string", "minLength": 1, "description": "Coding harness/model used for authoring. Required when identity is \"generated\"." },
+              "adoptedFrom": { "type": "string", "minLength": 1, "description": "Path to the pre-existing test this Binding was adopted from. Required when identity is \"adopted\"." }
+            }
+          },
+          "framework": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["name", "version"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "version": { "type": "string", "minLength": 1 },
+              "adapter": { "type": "string", "minLength": 1 }
+            }
+          },
+          "harnessInputs": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["configPaths", "lockfilePaths"],
+            "properties": {
+              "configPaths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path", "digest"],
+                  "properties": { "path": { "type": "string", "minLength": 1 }, "digest": { "type": "string", "minLength": 1 } }
+                }
+              },
+              "lockfilePaths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path", "digest"],
+                  "properties": { "path": { "type": "string", "minLength": 1 }, "digest": { "type": "string", "minLength": 1 } }
+                }
+              }
+            }
+          },
+          "outputs": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Every Binding output file path this Binding wrote, sorted by path.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "digest"],
+              "properties": { "path": { "type": "string", "minLength": 1 }, "digest": { "type": "string", "minLength": 1 } }
+            }
+          },
+          "impactPaths": {
+            "type": "array",
+            "description": "Conservative product-impact path globs, sorted. A trigger hint, never proof.",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "enforcementLane": {
+            "enum": ["advisory", "required"],
+            "description": "Brownfield Bindings enter advisory during burn-in; a first active greenfield Binding defaults to required."
+          },
+          "executionProfile": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1, "description": "Reference by id only. The Execution Profile artifact itself is #150's, not this schema's." },
+              "digest": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

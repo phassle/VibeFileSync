@@ -1,0 +1,12 @@
+# Models stage 6's reconciliation path: the QA Owner is shown the exact
+# duplicate conflict named between two flows, an unrelated third flow's
+# exact YAML review, and the resulting per-flow and portfolio approval
+# state. No write step appears anywhere — stage 6, like every earlier
+# stage, only ever reconciles, reviews, and reports.
+ask|reconciliation-summary|Portfolio reconciliation found a duplicate: flows "update-preserves-safetynet" and "update-keeps-old-version" declare the same Given/When/Then steps and Expected Outcome wording. How would you like to resolve this?
+answer|reconciliation-summary|We need to think about which one to keep — leave both as-is for now, don't resolve today.
+ask|flow-review-compare-detects-conflicts|Here is the exact YAML for "compare-detects-conflicts" — do you approve this flow as the source-of-truth contract?
+answer|flow-review-compare-detects-conflicts|yes, approved
+ask|portfolio-summary|"compare-detects-conflicts" is approved. "update-preserves-safetynet" and "update-keeps-old-version" remain draft because their duplicate conflict is unresolved — the portfolio is not fully approved this session. Does that match your expectation?
+answer|portfolio-summary|yes
+stop|portfolio-not-fully-approved

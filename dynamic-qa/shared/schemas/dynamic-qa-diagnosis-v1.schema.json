@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-diagnosis-v1.schema.json",
+  "title": "dynamic-qa Diagnosis Record v1",
+  "description": "The Diagnosis Record DESIGN-dynamic-qa-spec.md §5.6 describes: 'a machine-readable causal decision with evidence, counter-evidence, owner, repeatability, status, and next action.' It is produced by qa-generate's repair mode, step 3 ('Diagnose on independent axes: Failure Owner and Repeatability... Emit a Diagnosis Record with evidence and counter-evidence.') This document is the human-readable contract only — no JSON Schema validator dependency is added, matching every other schema in this bundle. The actual hand-written, fail-closed validation (including business rules this format alone cannot express, such as 'an environment failure must name its exact capability' or 'a retry pass may never justify an intermittent repeatability call') lives in shared/scripts/diagnosis.mjs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "diagnosisId",
+    "flowId",
+    "sourceCommit",
+    "generatedAt",
+    "owner",
+    "repeatability",
+    "repeatabilityBasis",
+    "failureClass",
+    "status",
+    "causalChain",
+    "evidence",
+    "counterEvidence",
+    "affectedIds",
+    "attempts"
+  ],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-diagnosis-v1",
+      "description": "Immutable. Any other value is an unsupported-schema-version error, never a silent upgrade."
+    },
+    "diagnosisId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identifier for this Diagnosis Record, distinct from the Failure Evidence Bundle it was produced from."
+    },
+    "flowId": { "type": "string", "minLength": 1 },
+    "bindingId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required by the validator (not by this schema alone) when owner is 'binding' — a binding-owned diagnosis must name the exact Binding under suspicion."
+    },
+    "failedCapability": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required by the validator when owner is 'environment' — an Environment Failure routes to the exact failed capability, never a vague 'infra flaked'."
+    },
+    "productDefectRef": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional tracked-issue reference for a Product Regression ('create/link product defect'). This record never carries a Binding-edit field — a Product Regression structurally cannot hide behind a test change."
+    },
+    "sourceCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full commit SHA the diagnosed run verified — never a branch name or short SHA, matching provenance.mjs/result-envelope.mjs."
+    },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "owner": {
+      "type": "string",
+      "enum": ["product", "binding", "environment", "unresolved"],
+      "description": "Failure Owner — one of two independent axes. Never inferred from repeatability."
+    },
+    "repeatability": {
+      "type": "string",
+      "enum": ["deterministic", "intermittent", "unknown"],
+      "description": "Repeatability — the other independent axis. Never inferred from owner."
+    },
+    "repeatabilityBasis": {
+      "type": "string",
+      "enum": ["retry-pass", "reproduction", "hypothesis-probe", "historical-evidence", "external-report", "insufficient-evidence"],
+      "description": "What actually grounds the repeatability call. 'retry-pass' alone can never justify 'intermittent' (the validator enforces this) — a single passing retry is evidence of nothing but the retry itself."
+    },
+    "failureClass": {
+      "type": "string",
+      "enum": ["product-regression", "binding-defect", "environment-failure", "test-flake", "unclassified-failure"],
+      "description": "Derived, never assigned directly. The validator recomputes this from owner x repeatability and rejects any stored value that disagrees."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["confirmed", "provisional", "safety-blocked"],
+      "description": "Only 'confirmed' status, combined with owner 'binding' and failureClass 'binding-defect', is repair-eligible. Every other combination defaults ineligible."
+    },
+    "causalChain": { "type": "string", "minLength": 1 },
+    "evidence": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "counterEvidence": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "affectedIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "nextAction": { "type": "string", "minLength": 1 },
+    "attempts": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Append-only run history. Exactly one entry has kind 'original', and it must carry verdict 'failed' — a failed attempt stays failed after any subsequent retry, diagnosis, repair-verification, or quarantine action; nothing here ever rewrites a past attempt's own recorded verdict.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["attemptId", "kind", "verdict", "recordedAt"],
+        "properties": {
+          "attemptId": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "enum": ["original", "retry", "repair-verification", "quarantine-check"] },
+          "verdict": { "type": "string", "enum": ["failed", "passed"] },
+          "recordedAt": { "type": "string", "format": "date-time" },
+          "note": { "type": "string" }
+        }
+      }
+    }
+  }
+}

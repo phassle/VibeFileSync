@@ -1,0 +1,6 @@
+interface:
+  display_name: "QA Setup"
+  short_description: "Design the QA-owned critical-flow contract and CI proposal"
+  default_prompt: "Use $qa-setup to start or resume the critical-flow contract for this repository, or $qa-setup review <flow-id> to reopen one flow."
+policy:
+  allow_implicit_invocation: false

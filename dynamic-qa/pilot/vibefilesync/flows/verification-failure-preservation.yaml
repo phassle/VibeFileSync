@@ -1,0 +1,74 @@
+# Pilot Flow Definition (dynamic-qa-flow-v1) — VibeFileSync brownfield
+# pilot, flow 3 of 5 (ticket #172, SPEC-135.md §13 "Verification failure
+# preserves the old destination").
+#
+# state: deferred — see dynamic-qa/pilot/vibefilesync/README.md.
+#
+# Grounds this Flow in CONTEXT.md's "Verification" entry and
+# docs/adr/0008-post-copy-verification.md: a per-file gate a copy must pass
+# before any destination change is made. The Binding reuses the real-binary,
+# fault-injection-gated test
+# `tests/cli.rs::full_verification_rejects_corrupt_temp_without_publishing_and_continues`,
+# which uses the `fault-injection` cargo feature's `VIBESYNC_TEST_EXEC_AT`
+# hook (ADR-0009) to corrupt one file's temp mid-copy while a second,
+# unrelated file copies normally.
+schema: dynamic-qa-flow-v1
+id: verification-failure-preservation
+revision: 1
+title: "A file that fails Verification never publishes, and the old destination content is preserved"
+intent: "Prove that Verification is a real gate, not advisory: when a copied temp fails the selected verification tier, the old destination file is never replaced, the run reports the failure honestly, and unrelated files still complete."
+criticality: critical
+state: deferred
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/11"
+    - "https://github.com/phassle/VibeFileSync/issues/13"
+    - "https://github.com/phassle/VibeFileSync/issues/172"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "the vibesync CLI binary, run with --verify"
+    treatment: real
+    behavior: "Invoke Run with full Verification enabled against a Folder pair holding one file whose copy will be corrupted mid-transfer and a second, unrelated file."
+    side_effects: "none"
+    role: owned
+  - id: fault-injection-hook
+    system: "the fault-injection cargo feature's VIBESYNC_TEST_EXEC_AT hook"
+    treatment: simulated
+    behavior: "A test-only, debug-build-only hook (compiled out of release builds) truncates/corrupts one file's temp copy at the copy_complete transition, standing in for a real mid-copy corruption without depending on one actually occurring."
+    side_effects: "none"
+    volatile: true
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or developer HOME path is read or written; only disposable temporary trees are touched."
+    side_effects: "none"
+  - id: destination-tree
+    system: "the destination tempdir"
+    treatment: real
+    behavior: "The old destination file must remain exactly as it was for the file that fails Verification, while the unrelated file's new content is published normally."
+    side_effects: "The unrelated file's content changes on the destination tempdir; the failing file's content does not."
+    isolation:
+      namespace: "one tempfile::TempDir per test, created fresh by tests/cli.rs::Fixture::new"
+      cleanup: "the Rust test harness removes the tempdir on both success and failure"
+steps:
+  - id: given-pair-with-one-corruptible-and-one-clean-file
+    kind: given
+    intent: "A Folder pair has a file whose temp copy will be corrupted mid-transfer, and a second, unrelated file that copies normally."
+  - id: when-run-executes-with-verify
+    kind: when
+    intent: "Run executes with --verify; the fault-injection hook corrupts the first file's temp at copy_complete."
+  - id: then-corrupted-file-fails-verification-and-old-content-preserved
+    kind: then
+    intent: "The corrupted file's copy fails Verification, its old destination content is preserved, the run reports the failure honestly, and the unrelated file still completes."
+    outcomes:
+      - id: corrupted-file-reports-verify-mismatch
+        expect: "The run reports action_failed with reason 'verify_mismatch' for the corrupted file."
+      - id: old-destination-content-preserved-for-failed-file
+        expect: "The corrupted file's destination content still reads '${case.oldContent}', not the corrupted temp content."
+      - id: unrelated-file-still-completes
+        expect: "The unrelated file's destination content reads '${case.unrelatedNewContent}', verified at the 'full' tier."
+      - id: run-exits-partial
+        expect: "The run's exit status is the partial-success code, not a clean success."

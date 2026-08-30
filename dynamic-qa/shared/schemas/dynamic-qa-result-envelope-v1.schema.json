@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dynamic-qa.internal/schemas/dynamic-qa-result-envelope-v1.schema.json",
+  "title": "dynamic-qa Result Envelope v1",
+  "description": "The Result Envelope DESIGN-dynamic-qa-spec.md §5.6 left as a placeholder and #151 handed to #153 to define: 'small, non-executable, schema-validated, size-bounded, and tied to repository, source SHA, workflow/run, and artifact digest. A privileged lane may consume only this envelope or recompute the result.' It is a provider/run artifact, not routine Git history — never committed, never referenced by a Flow ID directly. It carries no field capable of holding executable content (no free-form script, command, path, or URL field is defined here at all — see dynamic-qa/shared/scripts/result-envelope.mjs, which is the hand-written fail-closed validator and the actual size-bound enforcement; this document is the human-readable contract only, no JSON Schema validator dependency is added, matching every other schema in this bundle). trust-zones.mjs's checkPrivilegedLaneArtifact (#151) stays the sole gate deciding whether the privileged-publication zone may accept an artifact of kind 'result-envelope' at all; this schema only constrains what such an artifact's envelope payload may contain once that gate has already accepted it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repository", "sourceCommit", "generatedAt", "workflow", "verdict", "bindings", "artifactDigest"],
+  "properties": {
+    "schema": {
+      "const": "dynamic-qa-result-envelope-v1",
+      "description": "Immutable. Any other value is an unsupported-schema-version error, never a silent upgrade."
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[^/\\s]+/[^/\\s]+$",
+      "description": "Exact 'owner/name' the run belongs to, so a privileged lane never trusts an envelope produced for a different repository."
+    },
+    "sourceCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "The full commit SHA the run verified — never a branch name or short SHA, mirroring provenance.mjs's and trust-zones.mjs's own sourceCommit format."
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp the envelope was produced."
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "workflowFile", "runId", "runAttempt"],
+      "properties": {
+        "provider": { "type": "string", "enum": ["github-actions"], "description": "Only a named, tested provider adapter identity — never generic." },
+        "workflowFile": { "type": "string", "description": "The exact workflow file path the run executed, e.g. '.github/workflows/dynamic-qa.yml'." },
+        "runId": { "type": "string", "minLength": 1 },
+        "runAttempt": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "description": "Optional provider run URL, for a human to open; never treated as evidence on its own." }
+      }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "fail"],
+      "description": "The overall run verdict. A privileged lane trusts this only after schema and size validation, and only for a validated 'result-envelope' artifact kind (trust-zones.mjs's checkPrivilegedLaneArtifact)."
+    },
+    "bindings": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["flowId", "flowRevision", "verdict", "junitDigest"],
+        "properties": {
+          "flowId": { "type": "string" },
+          "flowRevision": { "type": "integer", "minimum": 1 },
+          "verdict": { "type": "string", "enum": ["pass", "fail"] },
+          "junitDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Content digest of the Binding's own JUnit output, so a privileged lane (or a later recompute) can prove which exact JUnit bytes this verdict came from, without re-executing anything." }
+        }
+      },
+      "description": "Bounded to 50 entries — one small line per Binding, never the JUnit body itself. Enforces the small/size-bounded requirement structurally, not only via the byte-count check in result-envelope.mjs."
+    },
+    "artifactDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Content digest of the full run's combined JUnit/report artifact bytes. A privileged lane consumes only this digest (or independently recomputes it) — never the underlying artifact bytes as an executable input."
+    }
+  }
+}
