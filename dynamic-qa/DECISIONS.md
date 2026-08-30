@@ -2236,3 +2236,107 @@ edited — `github-actions-adapter.mjs`'s existing exports
 and attacked from the new test file. All prose lives in
 `shared/references/hostile-fixtures.md`, a new file, so neither in-flight
 ticket's `SKILL.md` was touched.
+
+## 34. Pilot machinery, unrun (#171-#175)
+
+Builds the machinery #171-#175 need. Does **not** run the pilot: no
+baseline, pilot result, seeded-defect outcome, or promotion approval in
+this ticket range is real. The tickets stay open; a human runs the actual
+pilot later.
+
+**Five pilot Flow Definitions (#172).** Real `dynamic-qa-flow-v1` YAML under
+`dynamic-qa/pilot/vibefilesync/flows/`, `state: deferred`. Each is grounded
+in an already-shipped VibeFileSync safety guarantee and names the exact
+existing Rust test its Binding is meant to adopt or extend:
+`update-replacement-retention` (`tests/cli.rs::update_mode_also_archives_a_replaced_destination`),
+`mirror-destination-only-retention`
+(`tests/cli.rs::mirror_deletion_archives_old_file_and_leaves_safetynet_untouched`),
+`verification-failure-preservation`
+(`tests/cli.rs::full_verification_rejects_corrupt_temp_without_publishing_and_continues`),
+`unmounted-source-abort`
+(`tests/cli.rs::missing_pinned_volume_aborts_plan_before_scanning`), and
+`interrupted-publish-convergence`
+(`tests/acceptance/main.rs::exercise_replacement_cell` at the
+`publish_complete` crash transition, ADR-0009's invariants I1-I4). All five
+validate against `flow-definition.mjs` and `boundary-policy.mjs` unchanged,
+and produce stable `canonical-digest.mjs` digests
+(`pilot-flows.test.mjs`). None is `active` — activation is #172's own,
+separately evidenced, human-in-the-loop step.
+
+**Pilot Report (#173, `pilot-report.mjs`).** Reuses #167's `Quantity`
+verbatim rather than inventing a second metric model. Five required
+metrics (`flow-coverage`, `escaped-regressions`, `pr-check-latency-p95`,
+`flake-false-positive-rate`, `maintenance-time`), each always carrying
+`query`/`interval`/`source`/`provenance`/`numerator`/`denominator`/
+`measuredAt` — missing any one field rejects the metric outright. Unlike
+#167's pre-activation Baseline Plan, a **report-time** metric may never be
+`not-applicable`: by the time a report exists all five Bindings are active,
+so every metric is expected to be measured or honestly `unknown`.
+`computeReportStatus` is the sole readiness derivation (never a caller-set
+`status`); `validatePilotReport` independently re-derives it and flags a
+stored value that disagrees with its own evidence, exactly like #167's
+`validateBaselinePlan`.
+
+**Seeded Binding Defect Cases (#174, `seeded-defects.mjs`).** A seeded
+defect's `injectedChange.kind` is **always** `"binding"` — the constructor
+has no parameter path to a `"product"` kind at all, and
+`productBehaviorChanged` is always `false` and frozen, never
+caller-settable. `attachDiagnosis` refuses any diagnosis whose `owner` is
+not `"binding"` (reuses #158's `validateDiagnosisRecord`/`isRepairEligible`
+unchanged) before repair review can ever be recorded — enforced
+structurally, since `recordRepairReview` refuses a case that is not already
+`"diagnosed"`. `stayedRedUntilRepairVerification` fails a case where
+anything other than a `repair-verification` attempt ever passes — the
+"defect quietly stopped reproducing on its own" failure mode. Repair review
+outcomes (`accepted-unchanged | accepted-with-modification | rejected`) all
+require `proposalOnly: true`; there is no path to record an
+auto-applied/auto-merged outcome. `summarizeSeededDefectResults` returns
+`unknown` Quantities until a caller explicitly asserts `measured: true` —
+no plausible-looking zero before a real seeded-defect pilot ever runs.
+
+**FLAGGED FOR REVIEW — #160 (Repair Review Packet) has not landed.** #174
+is blocked by #160 in the tracker, but #160 is not in this branch's landed
+set. `seeded-defects.mjs`'s `REPAIR_REVIEW_OUTCOMES`/`recordRepairReview`
+are a deliberately minimal, LOCAL stand-in for the one fact #174's
+acceptance criteria need (an outcome, a named reviewer, `proposalOnly`) —
+NOT a reimplementation of #160's full packet (evidence, mappings,
+protected-contract digests, diff, verification results, residual risk).
+Whoever builds #160 should reconcile this shape with the real Repair Review
+Packet rather than let two review-outcome models diverge; this module says
+so in its own header comment.
+
+**Promotion gate (#175, `pilot-promotion.mjs`).** Evaluates SPEC-135 §13's
+seven thresholds (coverage, escapes, PR p95, flake/false-positive rate,
+maintenance, seeded Binding defects, safety violations) purely against a
+Pilot Report / seeded-defect summary / safety-violation count — every
+evaluation names the exact `metricUsed`. A metric that is not fully
+`known` on both numerator and denominator (via #173's `checkMetricPasses`)
+yields `"pilot-incomplete"`, never a pass; `evaluatePromotionThresholds`
+never stops at the first failure. `bothApprovalsPresent` reuses
+`authority.mjs`'s two-gate shape verbatim (a collapsed `approved` field is
+refused) — `decidePilotPromotion` requires both gates, AND that an
+`approvals.decidedAt` (when given) is not earlier than the report's own
+latest `measuredAt`, so an approval cannot retroactively bless evidence
+measured after it was granted. `applyDocumentedRelaxations` is the ONLY
+way a failed/incomplete threshold's verdict can move, and only onto a new
+`"relaxed"` status (never silently onto `"met"`) carrying a mandatory
+`reason`/`approvedBy`/`recordedAt` — the real `measuredValue` is always
+preserved alongside it.
+
+**No measurement, baseline, seeded-defect outcome, or approval anywhere in
+this ticket range is real.** Every number in every test file is a labelled
+synthetic fixture. `dynamic-qa/pilot/vibefilesync/README.md` says this
+explicitly for a future reader landing in that directory.
+
+**What remains for the human (#171-#175), unchanged by this ticket:**
+collecting the real 14-day/20-PR-run Baseline Plan (#171, via #167's
+already-landed machinery); getting the five Bindings generated/adopted and
+QA+Technical approval for advisory activation (#172); running the real
+four-week/20-PR advisory window and populating a real Pilot Report (#173);
+actually seeding three-plus Binding defects against the real, active
+Bindings and having the QA Owner review the real repair proposals (#174,
+and building #160 for real, which this ticket did not do); and the QA
+Owner + Technical Owner's actual promotion decision against real evidence
+(#175). Nothing in `dynamic-qa/` writes to `qa/` in a real customer
+repository as a side effect of this ticket, and VibeFileSync is not
+enrolled in any CI lane by it.

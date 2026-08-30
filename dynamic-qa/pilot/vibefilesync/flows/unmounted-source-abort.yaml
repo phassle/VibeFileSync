@@ -1,0 +1,64 @@
+# Pilot Flow Definition (dynamic-qa-flow-v1) — VibeFileSync brownfield
+# pilot, flow 4 of 5 (ticket #172, SPEC-135.md §13 "An unmounted source
+# aborts before mutation").
+#
+# state: deferred — see dynamic-qa/pilot/vibefilesync/README.md.
+#
+# Grounds this Flow in CONTEXT.md's "Run preconditions" entry ("source
+# volume actually mounted (an unmounted source reads as an empty
+# directory)") and docs/adr/0002-run-preconditions.md. The Binding reuses
+# the real-binary test `tests/cli.rs::missing_pinned_volume_aborts_plan_before_scanning`,
+# which pins a Folder pair to a source volume UUID that is not mounted on
+# the test machine and asserts the command aborts before scanning or
+# mutating anything.
+schema: dynamic-qa-flow-v1
+id: unmounted-source-abort
+revision: 1
+title: "A source volume that is not mounted aborts the run before any scan or destination mutation"
+intent: "Prove that Run preconditions catch an unmounted source before it can be silently misread as an empty directory: the command aborts with a precondition error, and the destination is never touched."
+criticality: critical
+state: deferred
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/5"
+    - "https://github.com/phassle/VibeFileSync/issues/172"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "the vibesync CLI binary"
+    treatment: real
+    behavior: "Invoke plan/run for a Folder pair pinned to a source volume UUID that is not the actually mounted volume."
+    side_effects: "none"
+    role: owned
+  - id: config-file
+    system: "the vibesync config file under XDG_CONFIG_HOME"
+    treatment: real
+    behavior: "The config file's pinned source_volume_uuid is rewritten to a UUID that does not match any mounted volume, staying otherwise valid TOML."
+    side_effects: "Writes one config file under a disposable temporary XDG_CONFIG_HOME."
+    isolation:
+      namespace: "one tempfile::TempDir per test, created fresh by tests/cli.rs::Fixture::new, with XDG_CONFIG_HOME and HOME both pointed at it"
+      cleanup: "the Rust test harness removes the tempdir on both success and failure"
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or developer HOME path is read or written; only disposable temporary trees are touched."
+    side_effects: "none"
+steps:
+  - id: given-pair-pinned-to-an-unmounted-source-volume
+    kind: given
+    intent: "A Folder pair's source_volume_uuid is pinned to a UUID that does not match any currently mounted volume."
+  - id: when-plan-is-invoked
+    kind: when
+    intent: "The plan command is invoked for that Folder pair."
+  - id: then-command-aborts-before-mutation
+    kind: then
+    intent: "The command aborts with a precondition failure naming the volume as not mounted, before any scan or destination write happens."
+    outcomes:
+      - id: exits-with-precondition-status
+        expect: "The command's exit status is the precondition-failure code."
+      - id: stderr-names-volume-not-mounted
+        expect: "Stderr states that the pinned source volume is not mounted."
+      - id: destination-untouched
+        expect: "No file is created, modified, or removed under the destination tempdir."

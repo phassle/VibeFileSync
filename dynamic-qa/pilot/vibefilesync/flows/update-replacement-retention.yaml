@@ -1,0 +1,75 @@
+# Pilot Flow Definition (dynamic-qa-flow-v1) — VibeFileSync brownfield pilot,
+# flow 1 of 5 (ticket #172, SPEC-135.md §13 "Update preserves a replaced
+# destination version in SafetyNet before Publish").
+#
+# state: deferred — activation (advisory-first) requires QA and Technical
+# approval per ticket #172; this file is not active and enrolls in no CI
+# lane. See dynamic-qa/pilot/vibefilesync/README.md.
+#
+# Grounds this Flow in VibeFileSync's real, already-shipped safety guarantee
+# (CONTEXT.md's "Update" and "SafetyNet" entries; docs/adr/0001-safetynet-archive-by-rename.md):
+# in Update mode a source file that structurally replaces a destination file
+# is archived into `_SafetyNet/<run-id>/` before the replacement is
+# published, exactly as it is in Mirror. The first candidate Binding adopts
+# and extends the existing real-binary test
+# `tests/cli.rs::update_mode_also_archives_a_replaced_destination`
+# (DESIGN-dynamic-qa-spec.md §13), which spawns the real `vibesync` binary
+# via `tests/cli.rs::Fixture` against isolated temporary source/destination
+# trees.
+schema: dynamic-qa-flow-v1
+id: update-replacement-retention
+revision: 1
+title: "Update mode archives a replaced destination file into SafetyNet before Publish"
+intent: "Prove that Update mode's structural-replacement path never drops the previous destination version: the old content is durably retained in a SafetyNet Run folder before the new content is published."
+criticality: critical
+state: deferred
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/4"
+    - "https://github.com/phassle/VibeFileSync/issues/172"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "the vibesync CLI binary"
+    treatment: real
+    behavior: "Invoke Update mode's Run against a Folder pair whose destination file differs from the source."
+    side_effects: "none"
+    role: owned
+  - id: system-clock
+    system: "the system clock"
+    treatment: simulated
+    behavior: "The Run id is a UTC timestamp; the test does not depend on any particular wall-clock value."
+    side_effects: "none"
+    volatile: true
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or developer HOME path is read or written; only disposable temporary trees are touched."
+    side_effects: "none"
+  - id: safetynet-archive
+    system: "the local SafetyNet archive under the destination tempdir"
+    treatment: real
+    behavior: "The run creates one Run folder under _SafetyNet/ holding the replaced version, with relative paths preserved."
+    side_effects: "Creates one Run folder under a disposable temporary destination root."
+    isolation:
+      namespace: "one tempfile::TempDir per test, created fresh by tests/cli.rs::Fixture::new"
+      cleanup: "the Rust test harness removes the tempdir on both success and failure"
+steps:
+  - id: given-update-pair-with-differing-destination
+    kind: given
+    intent: "A Folder pair uses Update mode, and the destination holds a file whose content differs from the same-named source file."
+  - id: when-run-executes
+    kind: when
+    intent: "Run executes and completes for that Folder pair."
+  - id: then-destination-matches-source-and-old-version-archived
+    kind: then
+    intent: "The destination file now matches the source, and the previous destination content is retrievable from exactly one new SafetyNet Run folder."
+    outcomes:
+      - id: destination-content-matches-source
+        expect: "The destination file reads '${case.newContent}'."
+      - id: exactly-one-new-safetynet-run-folder
+        expect: "Exactly one new Run folder exists under _SafetyNet/."
+      - id: safetynet-run-folder-holds-old-content
+        expect: "The new Run folder's copy of the file reads '${case.oldContent}'."
