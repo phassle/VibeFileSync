@@ -102,6 +102,30 @@ for skill in qa-setup qa-generate; do
 done
 pass "both skills discoverable in shared, Codex, and OpenCode installs, each installed alone side by side"
 
+# Every skill-local path a SKILL.md names must exist inside that installed skill.
+#
+# Packaging already proves the shared copies are byte-identical, but that says
+# nothing about whether the paths the document tells an agent to load actually
+# resolve after installation. They did not: the SKILL.md bodies carried 37
+# references to build-source paths (dynamic-qa/shared/..., shared/...) that
+# exist only in this repository, so a standalone installed skill could not load
+# its own deterministic core -- the exact self-containment property this bundle
+# claims. Byte-identity is not path-resolution; check both.
+for skill in qa-setup qa-generate; do
+  root="$TMP/.agents/skills/$skill"
+  sm="$root/SKILL.md"
+  # Backtick-quoted references/..., scripts/... and assets/... paths.
+  refs=$(grep -oE '`(references|scripts|assets)/[A-Za-z0-9._/-]+`' "$sm" | tr -d '`' | sort -u)
+  for ref in $refs; do
+    [ -e "$root/$ref" ] || fail "$skill/SKILL.md names '$ref', which does not exist in the installed skill"
+  done
+  # No build-source path may survive into an installed skill.
+  if grep -qE '`(dynamic-qa/)?shared/(scripts|references|schemas)/' "$sm"; then
+    fail "$skill/SKILL.md still names a build-source path that does not exist after installation"
+  fi
+done
+pass "every skill-local path named in each installed SKILL.md resolves inside that skill"
+
 # Each skill directory must be installable with its sibling entirely absent.
 rm -rf "$TMP/.agents/skills/qa-generate"
 [ -d "$TMP/.agents/skills/qa-setup" ] || fail "qa-setup install got removed along with qa-generate"
