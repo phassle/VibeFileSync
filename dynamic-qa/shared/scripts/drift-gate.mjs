@@ -170,7 +170,18 @@ export function evaluateBindingDrift({
     }
   }
 
-  if (flowDigest !== undefined && record.flowDigest !== flowDigest) {
+  // flowDigest is mandatory for comparison (a valid Provenance Manifest
+  // record always carries a non-empty record.flowDigest — provenance.mjs's
+  // own schema validation enforces that before this function ever runs).
+  // An unrecomputable current digest (`undefined`, e.g. the Flow Definition
+  // could not be read or parsed) must never silently skip this check — it
+  // is itself a mismatch, not an excuse to compare nothing.
+  if (flowDigest === undefined) {
+    reasons.push({
+      code: "FLOW_DIGEST_MISMATCH",
+      message: `Flow Definition digest could not be recomputed for comparison — recorded ${record.flowDigest}, current unavailable; an unrecomputable digest is never treated as a match`,
+    });
+  } else if (record.flowDigest !== flowDigest) {
     reasons.push({
       code: "FLOW_DIGEST_MISMATCH",
       message: `Flow Definition changed since generation: recorded ${record.flowDigest}, current ${flowDigest}`,
@@ -192,16 +203,26 @@ export function evaluateBindingDrift({
     }
   }
 
-  if (schemaDigests.flow !== undefined && record.schemas?.flow !== schemaDigests.flow) {
+  // schemas.flow / schemas.data are likewise mandatory, non-empty fields on
+  // any valid record (provenance.mjs's schema validation). An unavailable
+  // current digest (schema file missing or unreadable) must fail closed,
+  // not skip the comparison the way `!== undefined` guards used to.
+  if (schemaDigests.flow === undefined || record.schemas?.flow !== schemaDigests.flow) {
     reasons.push({
       code: "SCHEMA_CONTRACT_CHANGED",
-      message: `Flow Definition schema contract changed: recorded ${record.schemas?.flow}, current ${schemaDigests.flow} — an unsupported or incompatible schema mandates regeneration`,
+      message:
+        schemaDigests.flow === undefined
+          ? `Flow Definition schema contract could not be recomputed for comparison — recorded ${record.schemas?.flow}, current unavailable`
+          : `Flow Definition schema contract changed: recorded ${record.schemas?.flow}, current ${schemaDigests.flow} — an unsupported or incompatible schema mandates regeneration`,
     });
   }
-  if (schemaDigests.data !== undefined && record.schemas?.data !== schemaDigests.data) {
+  if (schemaDigests.data === undefined || record.schemas?.data !== schemaDigests.data) {
     reasons.push({
       code: "SCHEMA_CONTRACT_CHANGED",
-      message: `Named Data Set schema contract changed: recorded ${record.schemas?.data}, current ${schemaDigests.data} — an unsupported or incompatible schema mandates regeneration`,
+      message:
+        schemaDigests.data === undefined
+          ? `Named Data Set schema contract could not be recomputed for comparison — recorded ${record.schemas?.data}, current unavailable`
+          : `Named Data Set schema contract changed: recorded ${record.schemas?.data}, current ${schemaDigests.data} — an unsupported or incompatible schema mandates regeneration`,
     });
   }
 
@@ -224,11 +245,24 @@ export function evaluateBindingDrift({
     }
   }
 
-  if (executionProfileDigest !== undefined && record.executionProfile?.digest !== undefined) {
-    if (record.executionProfile.digest !== executionProfileDigest) {
+  // Unlike flowDigest/schemas above, record.executionProfile.digest is not
+  // itself required by provenance.mjs's schema (only .id is) — an older or
+  // pre-#150 record may never have recorded one, and that genuinely has
+  // nothing to compare against yet, so it is skipped rather than flagged
+  // (this ticket does not require the Execution Profile artifact to exist
+  // to run). But once a digest HAS been recorded, it is mandatory from
+  // then on: a current digest that fails to recompute (`undefined`, e.g.
+  // the profile file went missing or became unparseable) must never be
+  // treated as "nothing to check" — that is exactly how this gate could be
+  // fed `undefined` and silently pass.
+  if (record.executionProfile?.digest !== undefined) {
+    if (executionProfileDigest === undefined || record.executionProfile.digest !== executionProfileDigest) {
       reasons.push({
         code: "EXECUTION_PROFILE_CHANGED",
-        message: `Execution Profile ${JSON.stringify(record.executionProfile.id)} changed since generation`,
+        message:
+          executionProfileDigest === undefined
+            ? `Execution Profile ${JSON.stringify(record.executionProfile.id)} could not be recomputed for comparison — recorded digest ${record.executionProfile.digest}, current unavailable`
+            : `Execution Profile ${JSON.stringify(record.executionProfile.id)} changed since generation`,
       });
     }
   }

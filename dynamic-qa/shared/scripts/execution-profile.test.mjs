@@ -242,6 +242,49 @@ test("classifyOriginRisk / isExactOrigin classify each case correctly", () => {
   assert.equal(isExactOrigin("https://*.example.test"), false);
 });
 
+test("classifyOriginRisk normalizes before classifying — closes the network-deny bypass", () => {
+  // Embedded userinfo must not smuggle a private host past the regex: the
+  // raw host capture used to swallow "evil.test@10.0.0.5" as one opaque
+  // string, which matched none of the deny checks and fell through to
+  // "exact". A well-formed origin never carries userinfo, so this is
+  // rejected outright rather than silently stripped and reclassified.
+  assert.equal(classifyOriginRisk("https://evil.test@10.0.0.5"), "malformed");
+  assert.notEqual(classifyOriginRisk("https://evil.test@10.0.0.5"), "exact");
+
+  // A trailing FQDN root dot used to dodge both the METADATA_HOSTS set
+  // membership check and the ".internal" suffix check.
+  assert.equal(classifyOriginRisk("https://metadata.google.internal."), "metadata");
+  assert.equal(classifyOriginRisk("https://foo.internal."), "internal");
+
+  // Mixed-case host must still match the (lowercase) deny lists.
+  assert.equal(classifyOriginRisk("https://METADATA.GOOGLE.INTERNAL"), "metadata");
+
+  // IPv6 loopback and the AWS IMDSv2 IPv6 metadata address, bracketed and
+  // with an explicit port.
+  assert.equal(classifyOriginRisk("https://[::1]"), "internal");
+  assert.equal(classifyOriginRisk("https://[::1]:8443"), "internal");
+  assert.equal(classifyOriginRisk("https://[fd00:ec2::254]"), "metadata");
+
+  // Port variant of a plain private IPv4 host.
+  assert.equal(classifyOriginRisk("https://10.0.0.5:8443"), "internal");
+
+  // A path, query, or fragment suffix is not a clean single origin —
+  // reject rather than guess at the intended host.
+  assert.equal(classifyOriginRisk("https://example.test/foo"), "malformed");
+  assert.equal(classifyOriginRisk("https://example.test?x=1"), "malformed");
+  assert.equal(classifyOriginRisk("https://example.test#frag"), "malformed");
+
+  // A malformed origin must never default to "exact".
+  for (const bad of [
+    "https://evil.test@10.0.0.5",
+    "https://example.test/foo",
+    "ftp://example.test",
+    "https://",
+  ]) {
+    assert.notEqual(classifyOriginRisk(bad), "exact", `${bad} must not classify as exact`);
+  }
+});
+
 // --- effects -------------------------------------------------------------
 
 test("reversibleSideEffects true requires namespace and cleanup", () => {

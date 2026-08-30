@@ -206,7 +206,17 @@ export function runGenerationPreflight({
       },
     ]);
   }
-  const executionProfile = parseRestrictedYAML(readFileSync(profilePath, "utf8"), { filename: executionProfileId });
+  let executionProfile;
+  try {
+    executionProfile = parseRestrictedYAML(readFileSync(profilePath, "utf8"), { filename: executionProfileId });
+  } catch (err) {
+    return fail("invalid-execution-profile", [
+      {
+        path: ["executionProfileId"],
+        message: `Execution Profile ${JSON.stringify(executionProfileId)} could not be parsed: ${err.message}`,
+      },
+    ]);
+  }
   const profileValidation = validateExecutionProfile(executionProfile, { expectedId: executionProfileId });
   if (!profileValidation.valid) {
     return fail("invalid-execution-profile", profileValidation.errors);

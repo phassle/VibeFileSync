@@ -151,6 +151,35 @@ function isPrivateOrInternalHost(host) {
 }
 
 /**
+ * Normalizes an allowlist origin's host for classification. Strips
+ * userinfo, lowercases, strips IPv6 brackets, strips a single trailing
+ * root dot. Returns `null` (never a guessed host) whenever the origin
+ * does not parse as a clean, single https origin with no path/query/
+ * fragment and no embedded userinfo — fail closed rather than fall
+ * through to a permissive classification.
+ */
+function normalizeOriginHost(origin) {
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:") return null;
+  // Embedded credentials (`https://user:pass@host`) are not part of a
+  // well-formed origin and are a classic host-confusion bypass vector —
+  // reject rather than silently discard the userinfo and continue.
+  if (url.username !== "" || url.password !== "") return null;
+  if (url.pathname !== "" && url.pathname !== "/") return null;
+  if (url.search !== "" || url.hash !== "") return null;
+  let host = url.hostname.toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1); // IPv6 literal
+  if (host.endsWith(".") && host !== ".") host = host.slice(0, -1); // trailing FQDN root dot
+  if (host === "") return null;
+  return host;
+}
+
+/**
  * Classifies one allowlist origin string. Returns one of:
  *   "exact"      — a single exact https host, no wildcard, not metadata/
  *                  internal/private/public-catch-all.
@@ -165,11 +194,9 @@ function isPrivateOrInternalHost(host) {
 export function classifyOriginRisk(origin) {
   if (typeof origin !== "string" || origin.trim() === "") return "malformed";
   if (origin.includes("*")) return "wildcard";
-  if (origin.includes("/") && !/^https:\/\/[^/]+$/i.test(origin)) return "wildcard"; // CIDR-style or path suffix
-  const match = /^https:\/\/([^/:]+)(?::\d+)?$/i.exec(origin);
-  if (!match) return "malformed";
-  const host = match[1].toLowerCase();
-  if (host === "" || host === "0.0.0.0") return "wildcard";
+  const host = normalizeOriginHost(origin);
+  if (host === null) return "malformed";
+  if (host === "0.0.0.0") return "wildcard";
   if (METADATA_HOSTS.has(host)) return "metadata";
   if (/^169\.254\.169\.254$/.test(host)) return "metadata";
   if (isPrivateOrInternalHost(host)) return "internal";

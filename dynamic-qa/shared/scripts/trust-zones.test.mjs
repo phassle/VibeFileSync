@@ -163,6 +163,40 @@ test("checkHardSecurityInvariant: an exact, externally enforced allowlist classi
   assert.deepEqual(result, { valid: true, errors: [] });
 });
 
+test("checkHardSecurityInvariant: an allowlist origin bypass shape (userinfo host confusion) is not classified restricted", () => {
+  // Same bypass as execution-profile.mjs's classifyOriginRisk test: without
+  // origin normalization, "https://evil.test@10.0.0.5" reads as an opaque
+  // exact host and this network reach would wrongly classify "restricted",
+  // clearing the untrusted-content-with-unrestricted-network check.
+  const result = checkHardSecurityInvariant({
+    contentSource: "repository",
+    credentials: { scopes: ["read-only"] },
+    paths: { allowedRead: ["qa/"], allowedWrite: [] },
+    network: {
+      mode: "exact-allowlist",
+      allowlist: [{ origin: "https://evil.test@10.0.0.5", service: "x" }],
+      externallyEnforced: true,
+    },
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.error === "trust-invariant.untrusted-content-with-unrestricted-network"));
+});
+
+test("checkHardSecurityInvariant: a trailing-dot metadata host allowlist bypass shape is not classified restricted", () => {
+  const result = checkHardSecurityInvariant({
+    contentSource: "repository",
+    credentials: { scopes: ["read-only"] },
+    paths: { allowedRead: ["qa/"], allowedWrite: [] },
+    network: {
+      mode: "exact-allowlist",
+      allowlist: [{ origin: "https://metadata.google.internal.", service: "x" }],
+      externallyEnforced: true,
+    },
+  });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((e) => e.error === "trust-invariant.untrusted-content-with-unrestricted-network"));
+});
+
 test("UNTRUSTED_CONTENT_SOURCES names every source SPEC-135 User Story 84 lists", () => {
   assert.deepEqual(
     [...UNTRUSTED_CONTENT_SOURCES].sort(),

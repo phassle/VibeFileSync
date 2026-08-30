@@ -55,11 +55,28 @@ export function parseJUnitXML(xmlText) {
     throw new Error("parseJUnitXML: refuses XML containing a processing instruction other than the XML declaration");
   }
 
-  const suiteMatch = /<testsuite\b[^>]*name="([^"]*)"/i.exec(xmlText);
+  const suiteMatch = /<testsuite\b(?:[^">]|"[^"]*")*?name="([^"]*)"/i.exec(xmlText);
   const testsuiteName = suiteMatch ? decodeEntities(suiteMatch[1]) : "";
 
   const tests = [];
-  const caseRe = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/gi;
+  // Attribute lists are matched with a quote-aware pattern rather than
+  // plain `[^>]*` — a well-formed attribute value MAY legally contain a
+  // raw, unescaped `>` (XML only mandates escaping `<`, `&`, and the
+  // enclosing quote character within an attribute value; `>` is optional
+  // convention, not a requirement). `[^>]*` truncates at that `>` and the
+  // whole testcase silently vanishes from the parse instead of erroring or
+  // parsing correctly. `(?:[^">]|"[^"]*")*` instead treats a `"..."` run
+  // atomically, so a `>` inside quotes never ends the attribute list.
+  // Non-greedy: the shortest attribute-list match that still lets the
+  // required "/>" or ">...</tag>" closer match immediately after it is the
+  // correct one. A greedy version would happily let its unquoted-char
+  // branch swallow the self-close tag's own "/" (which is not `"` or `>`,
+  // so the character class alone can't exclude it), miss the "/>" closer
+  // entirely, and misparse a self-closed <testcase .../> as an *opening*
+  // tag whose body runs on to absorb the next real testcase's closing tag
+  // — silently dropping a whole test result rather than erroring.
+  const ATTRS = `(?:[^">]|"[^"]*")*?`;
+  const caseRe = new RegExp(`<testcase\\b(${ATTRS})(\\/>|>([\\s\\S]*?)<\\/testcase>)`, "gi");
   let m;
   while ((m = caseRe.exec(xmlText)) !== null) {
     const attrs = m[1];
@@ -70,8 +87,8 @@ export function parseJUnitXML(xmlText) {
 
     let status = "passed";
     let message;
-    const failureMatch = /<failure\b([^>]*)(?:\/>|>([\s\S]*?)<\/failure>)/i.exec(body);
-    const errorMatch = /<error\b([^>]*)(?:\/>|>([\s\S]*?)<\/error>)/i.exec(body);
+    const failureMatch = new RegExp(`<failure\\b(${ATTRS})(?:\\/>|>([\\s\\S]*?)<\\/failure>)`, "i").exec(body);
+    const errorMatch = new RegExp(`<error\\b(${ATTRS})(?:\\/>|>([\\s\\S]*?)<\\/error>)`, "i").exec(body);
     const skippedMatch = /<skipped\b/i.test(body);
 
     if (failureMatch) {

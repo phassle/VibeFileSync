@@ -49,6 +49,71 @@ test("summarizeJUnit produces exact counts and a fail verdict when any failure/e
   assert.deepEqual(summary, { total: 4, passed: 1, failed: 1, errors: 1, skipped: 1, verdict: "fail" });
 });
 
+// --- escaping: <, >, &, and quotes must round-trip in both attributes and
+// text, and must never cause a testcase to be silently dropped from the
+// parse (the finding: an unescaped `>` in an attribute value broke the
+// tag-boundary regex and made the whole next testcase vanish). ------------
+
+test("a testcase name containing an escaped '<' decodes correctly and does not truncate parsing", () => {
+  const xml = `<testsuite name="s"><testcase classname="c" name="a &lt; b" time="0.1"/></testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 1);
+  assert.equal(parsed.tests[0].name, "a < b");
+});
+
+test("a testcase name containing an escaped '&' decodes correctly", () => {
+  const xml = `<testsuite name="s"><testcase classname="c" name="a &amp; b" time="0.1"/></testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 1);
+  assert.equal(parsed.tests[0].name, "a & b");
+});
+
+test("a testcase name containing escaped quote entities decodes correctly", () => {
+  const xml = `<testsuite name="s"><testcase classname="c" name="say &quot;hi&quot; and &apos;bye&apos;" time="0.1"/></testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 1);
+  assert.equal(parsed.tests[0].name, `say "hi" and 'bye'`);
+});
+
+test("a raw, unescaped '>' inside an attribute value must not drop a subsequent testcase from the parse", () => {
+  // XML only requires escaping '<', '&', and the enclosing quote character
+  // within an attribute value — a literal '>' is legal there. The
+  // tag-boundary regexes must be quote-aware so this never causes the
+  // following self-closed <testcase/> to be swallowed into the current
+  // one's body and lost.
+  const xml =
+    `<testsuite name="s">` +
+    `<testcase classname="c" name="a > b" time="0.1"/>` +
+    `<testcase classname="c" name="second case" time="0.2"/>` +
+    `</testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 2);
+  assert.equal(parsed.tests[0].name, "a > b");
+  assert.equal(parsed.tests[1].name, "second case");
+});
+
+test("a raw '>' inside a failure/error message attribute does not drop the enclosing testcase", () => {
+  const xml =
+    `<testsuite name="s">` +
+    `<testcase classname="c" name="first" time="0.1">` +
+    `<failure message="expected a > b"><![CDATA[trace]]></failure>` +
+    `</testcase>` +
+    `<testcase classname="c" name="second" time="0.2"/>` +
+    `</testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 2);
+  assert.equal(parsed.tests[0].status, "failed");
+  assert.equal(parsed.tests[0].message, "expected a > b");
+  assert.equal(parsed.tests[1].name, "second");
+});
+
+test("a raw '>' inside the <testsuite> name attribute's preceding attributes does not defeat the name lookup", () => {
+  const xml = `<testsuite tests="a > b" name="dynamic-qa"><testcase classname="c" name="only" time="0.1"/></testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.testsuiteName, "dynamic-qa");
+  assert.equal(parsed.tests.length, 1);
+});
+
 test("summarizeJUnit reports pass only when there is at least one test and no failure/error", () => {
   const allPass = `<testsuite name="s"><testcase classname="c" name="a" time="0.1"/><testcase classname="c" name="b" time="0.1"/></testsuite>`;
   assert.equal(summarizeJUnit(parseJUnitXML(allPass)).verdict, "pass");

@@ -399,6 +399,103 @@ export function checkMetricPasses(metric) {
 }
 
 // ---------------------------------------------------------------------------
+// Rendering — restricted-YAML subset only (mirrors baseline-plan.mjs's own
+// renderBaselinePlanYAML / flow-yaml.mjs's approach exactly, for the same
+// reason: PILOT_REPORT_REPO_PATH names a `.yaml` file, parsed back by
+// parsePilotReportDocument/resumePilotReport with parseRestrictedYAML — a
+// parser that does not accept JSON's `{`/`[` flow syntax at all. Writing
+// `JSON.stringify(report)` to that path would save a document its own
+// resume path can never read back (verified: it throws on the very first
+// line). Not a general-purpose YAML writer — round-tripping through
+// parseRestrictedYAML + validatePilotReport is guaranteed to succeed and to
+// reproduce an identical document.
+// ---------------------------------------------------------------------------
+
+function renderQuotedString(value) {
+  const escaped = value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t")
+    .replace(/\r/g, "\\r");
+  return `"${escaped}"`;
+}
+
+function renderScalar(value) {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string") return renderQuotedString(value);
+  throw new Error(`pilot-report: cannot render a scalar of type ${typeof value}`);
+}
+
+function pad(n) {
+  return " ".repeat(n);
+}
+
+function renderQuantity(q, indent) {
+  const lines = [`${pad(indent)}kind: ${renderScalar(q.kind)}`];
+  if (q.kind === "not-applicable") lines.push(`${pad(indent)}reason: ${renderScalar(q.reason)}`);
+  if (q.kind === "known") lines.push(`${pad(indent)}value: ${renderScalar(q.value)}`);
+  return lines;
+}
+
+function renderMetric(m, indent) {
+  const lines = [];
+  lines.push(`${pad(indent)}- id: ${renderScalar(m.id)}`);
+  lines.push(`${pad(indent + 2)}label: ${renderScalar(m.label)}`);
+  lines.push(`${pad(indent + 2)}query: ${renderScalar(m.query)}`);
+  lines.push(`${pad(indent + 2)}interval: ${renderScalar(m.interval)}`);
+  lines.push(`${pad(indent + 2)}source: ${renderScalar(m.source)}`);
+  lines.push(`${pad(indent + 2)}numerator:`);
+  lines.push(...renderQuantity(m.numerator, indent + 4));
+  lines.push(`${pad(indent + 2)}denominator:`);
+  lines.push(...renderQuantity(m.denominator, indent + 4));
+  lines.push(`${pad(indent + 2)}provenance: ${renderScalar(m.provenance)}`);
+  lines.push(`${pad(indent + 2)}measuredAt: ${renderScalar(m.measuredAt)}`);
+  if (m.extra !== undefined) {
+    const extraKeys = Object.keys(m.extra);
+    if (extraKeys.length === 0) {
+      lines.push(`${pad(indent + 2)}extra: {}`);
+    } else {
+      lines.push(`${pad(indent + 2)}extra:`);
+      for (const key of extraKeys) {
+        lines.push(`${pad(indent + 4)}${key}:`);
+        lines.push(...renderQuantity(m.extra[key], indent + 6));
+      }
+    }
+  }
+  if (m.notes !== undefined) lines.push(`${pad(indent + 2)}notes: ${renderScalar(m.notes)}`);
+  return lines;
+}
+
+/**
+ * Renders a Pilot Report JS value into the restricted YAML subset
+ * restricted-yaml.mjs accepts. See the section header above for why this
+ * exists at all: PILOT_REPORT_REPO_PATH is a `.yaml` file read back with
+ * parseRestrictedYAML, never with JSON.parse.
+ */
+export function renderPilotReportYAML(report) {
+  const lines = [];
+  lines.push(`schema: ${renderScalar(report.schema)}`);
+  lines.push(`id: ${renderScalar(report.id)}`);
+  lines.push(`revision: ${renderScalar(report.revision)}`);
+  lines.push(`repository: ${renderScalar(report.repository)}`);
+  lines.push(`window:`);
+  lines.push(`  allBindingsActiveAt: ${renderScalar(report.window.allBindingsActiveAt)}`);
+  if (report.window.note !== undefined) lines.push(`  note: ${renderScalar(report.window.note)}`);
+  if (report.metrics.length === 0) {
+    lines.push(`metrics: []`);
+  } else {
+    lines.push(`metrics:`);
+    for (const m of report.metrics) lines.push(...renderMetric(m, 2));
+  }
+  lines.push(`status: ${renderScalar(report.status)}`);
+  lines.push(`generatedAt: ${renderScalar(report.generatedAt)}`);
+  return `${lines.join("\n")}\n`;
+}
+
+// ---------------------------------------------------------------------------
 // Resume / persistence (mirrors baseline-plan.mjs's resume discipline)
 // ---------------------------------------------------------------------------
 
@@ -431,6 +528,6 @@ export function savePilotReportToRepo(repoRoot, report) {
   }
   const filePath = path.join(repoRoot, PILOT_REPORT_REPO_PATH);
   mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(report, null, 2), "utf8");
+  writeFileSync(filePath, renderPilotReportYAML(report), "utf8");
   return filePath;
 }

@@ -148,9 +148,12 @@ test("fail-closed: safety — no executionProfilesDir at all is refused with inv
   assert.equal(result.reason, "invalid-execution-profile");
 });
 
-test("fail-closed: safety — a malformed Execution Profile document is refused with invalid-execution-profile", () => {
-  const badProfilesDir = path.join(FIXTURES, "does-not-exist-profiles-dir");
-  const result = runGenerationPreflight(goodInput({ executionProfilesDir: badProfilesDir }));
+test("fail-closed: safety — a malformed Execution Profile document (parse failure) is refused with invalid-execution-profile", () => {
+  // Distinct from the missing-file/missing-directory cases above: this
+  // profile id resolves to a real file under a real directory, but the
+  // file's content is not valid restricted-subset YAML (a duplicate key),
+  // so the throw happens inside parseRestrictedYAML itself, not before it.
+  const result = runGenerationPreflight(goodInput({ executionProfileId: "pilot-profile-malformed" }));
   assert.equal(result.ready, false);
   assert.equal(result.reason, "invalid-execution-profile");
 });

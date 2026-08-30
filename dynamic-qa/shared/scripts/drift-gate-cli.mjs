@@ -39,25 +39,40 @@ import { validateProvenanceManifest } from "./provenance.mjs";
 import { contentDigest } from "./canonical-digest.mjs";
 import { evaluateBindingDrift, evaluatePortfolioDrift } from "./drift-gate.mjs";
 
-function readJSON(filePath) {
+// Raw JSON read — throws on missing file or malformed JSON. Callers below
+// always wrap this (or replicate its try/catch) so a corrupt file becomes
+// an explicit `undefined` digest for drift-gate.mjs to fail closed on,
+// never an uncaught crash that skips the check entirely.
+export function readJSON(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
 
-function schemaDigestOf(schemasDir, filename) {
+export function schemaDigestOf(schemasDir, filename) {
   const p = path.join(schemasDir, filename);
   if (!existsSync(p)) return undefined;
-  return contentDigest(readJSON(p));
+  try {
+    return contentDigest(readJSON(p));
+  } catch {
+    return undefined;
+  }
 }
 
-function digestPathList(list, repoRoot) {
+export function digestPathList(list, repoRoot) {
   return (list ?? []).map(({ path: relPath }) => {
     const abs = path.join(repoRoot, relPath);
     if (!existsSync(abs)) return { path: relPath, digest: undefined };
-    return { path: relPath, digest: contentDigest(readFileSync(abs, "utf8")) };
+    try {
+      return { path: relPath, digest: contentDigest(readFileSync(abs, "utf8")) };
+    } catch {
+      // Unreadable (e.g. a permissions error, or a directory at that path)
+      // is reported the same way as missing: an explicit undefined digest,
+      // never an uncaught crash.
+      return { path: relPath, digest: undefined };
+    }
   });
 }
 
-function resolveDataSetDigest(id, dataSetsDir) {
+export function resolveDataSetDigest(id, dataSetsDir) {
   const filePath = path.join(dataSetsDir, `${id}.yaml`);
   if (!existsSync(filePath)) return { id, digest: undefined };
   try {
@@ -68,7 +83,7 @@ function resolveDataSetDigest(id, dataSetsDir) {
   }
 }
 
-function executionProfileDigest(profileId, profilesDir) {
+export function executionProfileDigest(profileId, profilesDir) {
   if (!profileId) return undefined;
   const filePath = path.join(profilesDir, `${profileId}.yaml`);
   if (!existsSync(filePath)) return undefined;
@@ -108,7 +123,11 @@ export function runDriftGate(repoRoot) {
 
   let manifest = null;
   if (existsSync(provenancePath)) {
-    manifest = readJSON(provenancePath);
+    try {
+      manifest = readJSON(provenancePath);
+    } catch (err) {
+      return { ok: false, messages: [`qa/provenance.json could not be parsed as JSON: ${err.message}`] };
+    }
     const manifestValidation = validateProvenanceManifest(manifest);
     if (!manifestValidation.valid) {
       return {

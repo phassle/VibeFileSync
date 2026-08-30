@@ -7,11 +7,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   REQUIRED_METRIC_IDS,
   RUN_COUNT_METRIC_ID,
   MIN_ADVISORY_WEEKS,
   MIN_RELEVANT_PR_RUNS,
+  PILOT_REPORT_REPO_PATH,
   unknownQuantity,
   notApplicableQuantity,
   knownQuantity,
@@ -20,6 +24,10 @@ import {
   validatePilotReport,
   computeReportStatus,
   checkMetricPasses,
+  savePilotReportToRepo,
+  resumePilotReport,
+  renderPilotReportYAML,
+  parsePilotReportDocument,
 } from "./pilot-report.mjs";
 
 const ACTIVE_SINCE = "2026-01-01T00:00:00Z";
@@ -212,4 +220,107 @@ test("a hand-set status that disagrees with the report's own evidence is rejecte
 test("MIN_ADVISORY_WEEKS and MIN_RELEVANT_PR_RUNS are the exact spec-given constants", () => {
   assert.equal(MIN_ADVISORY_WEEKS, 4);
   assert.equal(MIN_RELEVANT_PR_RUNS, 20);
+});
+
+// --- save/resume round trip: PILOT_REPORT_REPO_PATH is a .yaml file, read
+// back with the restricted-YAML parser, never with JSON.parse. A previous
+// version of savePilotReportToRepo wrote JSON.stringify(report) to that
+// path — a document its own resume path could never read back. -----------
+
+function sortKeysDeep(value) {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((k) => [k, sortKeysDeep(value[k])]));
+  }
+  return value;
+}
+
+function tempRepoRoot() {
+  return mkdtempSync(path.join(tmpdir(), "pilot-report-test-"));
+}
+
+test("savePilotReportToRepo writes a document resumePilotReport can read straight back, complete with extra metrics and notes", () => {
+  const repoRoot = tempRepoRoot();
+  try {
+    const metrics = fullyKnownMetrics().map((m) =>
+      m.id === "maintenance-time" ? { ...m, notes: "hand-reviewed" } : m,
+    );
+    const report = buildPilotReport(
+      {
+        id: "vibefilesync-pilot",
+        revision: 1,
+        repository: "phassle/VibeFileSync",
+        window: { allBindingsActiveAt: ACTIVE_SINCE, note: "kickoff" },
+        metrics,
+        generatedAt: WELL_PAST_WINDOW,
+      },
+      { now: WELL_PAST_WINDOW },
+    );
+
+    const filePath = savePilotReportToRepo(repoRoot, report);
+    assert.equal(filePath, path.join(repoRoot, PILOT_REPORT_REPO_PATH));
+
+    // The file on disk must actually be restricted-YAML, not JSON — a raw
+    // JSON document starts with "{" as its first non-whitespace character,
+    // which parseRestrictedYAML rejects outright (it is not "key: value").
+    const onDisk = readFileSync(filePath, "utf8").trim();
+    assert.ok(onDisk.startsWith("schema:"), `expected a YAML document, got: ${onDisk.slice(0, 40)}`);
+
+    const resumed = resumePilotReport(repoRoot, { now: WELL_PAST_WINDOW });
+    assert.equal(resumed.exists, true);
+    assert.equal(resumed.valid, true, JSON.stringify(resumed.errors));
+    assert.equal(resumed.status, "complete");
+    assert.deepEqual(sortKeysDeep(resumed.report), sortKeysDeep(report));
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("renderPilotReportYAML's empty-metrics-list flow literal round-trips through parseRestrictedYAML", () => {
+  // savePilotReportToRepo always refuses an incomplete metrics list (a
+  // valid report always carries all five), but the renderer's "metrics: []"
+  // flow-literal branch is still real, reachable code — exercise it
+  // directly against the same parser resumePilotReport uses, rather than
+  // routing around it via the schema-validity gate.
+  const draft = {
+    schema: "dynamic-qa-pilot-report-v1",
+    id: "vibefilesync-pilot",
+    revision: 1,
+    repository: "phassle/VibeFileSync",
+    window: { allBindingsActiveAt: ACTIVE_SINCE },
+    metrics: [],
+    status: "pilot-incomplete",
+    generatedAt: ACTIVE_SINCE,
+  };
+  const yaml = renderPilotReportYAML(draft);
+  assert.match(yaml, /^metrics: \[\]$/m);
+  const parsed = parsePilotReportDocument(yaml);
+  assert.deepEqual(parsed.metrics, []);
+});
+
+test("savePilotReportToRepo round-trips string values needing escaping (quotes, backslash, newline)", () => {
+  const repoRoot = tempRepoRoot();
+  try {
+    const metrics = fullyKnownMetrics().map((m) =>
+      m.id === "flow-coverage" ? { ...m, notes: `a "quoted" note with a\\backslash and a\nline break` } : m,
+    );
+    const report = buildPilotReport(
+      {
+        id: "vibefilesync-pilot",
+        revision: 1,
+        repository: "phassle/VibeFileSync",
+        window: { allBindingsActiveAt: ACTIVE_SINCE },
+        metrics,
+        generatedAt: WELL_PAST_WINDOW,
+      },
+      { now: WELL_PAST_WINDOW },
+    );
+    savePilotReportToRepo(repoRoot, report);
+    const resumed = resumePilotReport(repoRoot, { now: WELL_PAST_WINDOW });
+    assert.equal(resumed.valid, true, JSON.stringify(resumed.errors));
+    const flowCoverage = resumed.report.metrics.find((m) => m.id === "flow-coverage");
+    assert.equal(flowCoverage.notes, `a "quoted" note with a\\backslash and a\nline break`);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
 });

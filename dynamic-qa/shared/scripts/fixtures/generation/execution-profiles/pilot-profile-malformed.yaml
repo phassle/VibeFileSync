@@ -1,0 +1,12 @@
+# Fixture for preflight.test.mjs: a document that is present and resolves to
+# a real file, but is not valid restricted-subset YAML at all — a duplicate
+# key, which parseRestrictedYAML rejects by throwing YamlSyntaxError. This
+# exercises the parse-failure path distinctly from the missing-file/
+# missing-directory paths, which never reach the parser.
+schema: dynamic-qa-execution-profile-v1
+id: pilot-profile-malformed
+revision: 1
+revision: 2
+owners:
+  qaOwner: Per
+  technicalOwner: Alex

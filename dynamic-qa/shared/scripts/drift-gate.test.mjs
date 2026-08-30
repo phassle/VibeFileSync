@@ -187,6 +187,65 @@ test("evaluatePortfolioDrift flags a retired flow that still carries a provenanc
   assert.equal(result.retiredCleanup[0].code, "RETIRED_FLOW_PROVENANCE");
 });
 
+// --- an undefined current digest must never compare equal or silently
+// pass — the gate must fail closed with a named reason (finding: digest
+// helpers feeding `undefined` into evaluateBindingDrift must not slip
+// through as "nothing to check"). ---------------------------------------
+
+test("an unrecomputable current flowDigest (undefined) fails closed, never treated as a match", () => {
+  const record = baseRecord();
+  const inputs = currentInputsFor(record);
+  inputs.flowDigest = undefined;
+  const result = evaluateBindingDrift(inputs);
+  assert.equal(result.freshness, "stale");
+  assert.ok(result.reasons.some((r) => r.code === "FLOW_DIGEST_MISMATCH"));
+});
+
+test("an unrecomputable current schemaDigests.flow (undefined) fails closed", () => {
+  const record = baseRecord();
+  const inputs = currentInputsFor(record);
+  inputs.schemaDigests = { flow: undefined, data: record.schemas.data };
+  const result = evaluateBindingDrift(inputs);
+  assert.equal(result.freshness, "stale");
+  assert.ok(result.reasons.some((r) => r.code === "SCHEMA_CONTRACT_CHANGED"));
+});
+
+test("an unrecomputable current schemaDigests.data (undefined) fails closed", () => {
+  const record = baseRecord();
+  const inputs = currentInputsFor(record);
+  inputs.schemaDigests = { flow: record.schemas.flow, data: undefined };
+  const result = evaluateBindingDrift(inputs);
+  assert.equal(result.freshness, "stale");
+  assert.ok(result.reasons.some((r) => r.code === "SCHEMA_CONTRACT_CHANGED"));
+});
+
+test("omitting schemaDigests entirely fails closed rather than defaulting to current", () => {
+  const record = baseRecord();
+  const inputs = currentInputsFor(record);
+  delete inputs.schemaDigests;
+  const result = evaluateBindingDrift(inputs);
+  assert.equal(result.freshness, "stale");
+  assert.ok(result.reasons.some((r) => r.code === "SCHEMA_CONTRACT_CHANGED"));
+});
+
+test("an unrecomputable current executionProfileDigest fails closed once a digest has been recorded", () => {
+  const record = baseRecord();
+  const inputs = currentInputsFor(record);
+  inputs.executionProfileDigest = undefined;
+  const result = evaluateBindingDrift(inputs);
+  assert.equal(result.freshness, "stale");
+  assert.ok(result.reasons.some((r) => r.code === "EXECUTION_PROFILE_CHANGED"));
+});
+
+test("a record that never recorded an executionProfile digest is not flagged when current is undefined (nothing to compare yet)", () => {
+  const record = baseRecord({ executionProfile: { id: "default-profile" } });
+  const inputs = currentInputsFor(record);
+  inputs.executionProfileDigest = undefined;
+  const result = evaluateBindingDrift(inputs);
+  assert.equal(result.freshness, "current");
+  assert.deepEqual(result.reasons, []);
+});
+
 test("evaluatePortfolioDrift is ok when every active Binding is current and nothing retired remains", () => {
   const record = baseRecord();
   const manifest = baseManifest(record);
