@@ -291,5 +291,3 @@ This skill reads only files under its own installed directory
 (`SKILL.md`, `references/`, `assets/`, `scripts/`) plus the
 `dynamic-skills-setup` capability profile named above. It never reads from a
 sibling `qa-setup` installation, and is installable on its own.
-
-<!-- reach-through test: ../qa-setup -->
