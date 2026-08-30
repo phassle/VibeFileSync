@@ -31,3 +31,31 @@ test("contentDigest is a prefixed sha256 hex string", () => {
   const d = contentDigest({ a: 1 });
   assert.match(d, /^sha256:[0-9a-f]{64}$/);
 });
+
+test("a literal own '__proto__' key digests as ordinary data, without polluting the prototype", () => {
+  // JSON.parse (unlike a `{ "__proto__": ... }` literal) creates a real own
+  // enumerable data property named "__proto__", the same shape untrusted
+  // Named Data Set field names could take.
+  const hostile = JSON.parse('{"__proto__": {"polluted": true}, "a": 1}');
+  assert.equal(Object.prototype.hasOwnProperty.call(hostile, "__proto__"), true);
+
+  const canonical = canonicalize(hostile);
+
+  // Global Object.prototype must be untouched.
+  assert.equal(({}).polluted, undefined);
+  assert.equal(Object.prototype.polluted, undefined);
+
+  // "__proto__" must survive as an ordinary own data key, not be consumed
+  // as a prototype reassignment.
+  assert.equal(Object.getPrototypeOf(canonical), Object.prototype);
+  assert.equal(Object.prototype.hasOwnProperty.call(canonical, "__proto__"), true);
+  assert.deepEqual(Object.keys(canonical).sort(), ["__proto__", "a"]);
+  const protoDescriptor = Object.getOwnPropertyDescriptor(canonical, "__proto__");
+  assert.equal(protoDescriptor.value.polluted, true);
+});
+
+test("contentDigest distinguishes an object with a literal '__proto__' key from one without it", () => {
+  const withProtoKey = JSON.parse('{"__proto__": {"polluted": true}, "a": 1}');
+  const without = { a: 1 };
+  assert.notEqual(contentDigest(withProtoKey), contentDigest(without));
+});

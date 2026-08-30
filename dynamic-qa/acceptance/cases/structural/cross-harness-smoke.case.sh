@@ -66,7 +66,7 @@ case_assert() {
   rm -rf "$FIXTURE_HOME/.agents/skills/qa-generate"
   assert_file_exists "$FIXTURE_HOME/.agents/skills/qa-setup/SKILL.md" \
     "qa-setup became unusable after qa-generate's install was removed"
-  if grep -RIl -e '\.\./qa-generate' "$FIXTURE_HOME/.agents/skills/qa-setup" >/dev/null 2>&1; then
+  if grep -rIl -e '\.\./qa-generate' "$FIXTURE_HOME/.agents/skills/qa-setup" >/dev/null 2>&1; then
     case_fail "qa-setup still references a path into the now-absent qa-generate install"
   fi
 

@@ -139,3 +139,20 @@ test("error messages name the offending line", () => {
     assert.equal(err.line, 2);
   }
 });
+
+test("a mapping key literally named '__proto__' parses as ordinary data, without polluting the prototype", () => {
+  const value = parseRestrictedYAML(`
+__proto__:
+  polluted: true
+a: 1
+`);
+  assert.equal(Object.getPrototypeOf(value), Object.prototype);
+  assert.equal(Object.prototype.hasOwnProperty.call(value, "__proto__"), true);
+  assert.deepEqual(Object.keys(value).sort(), ["__proto__", "a"]);
+  const protoDescriptor = Object.getOwnPropertyDescriptor(value, "__proto__");
+  assert.equal(protoDescriptor.value.polluted, true);
+
+  // Global Object.prototype must be untouched.
+  assert.equal(({}).polluted, undefined);
+  assert.equal(Object.prototype.polluted, undefined);
+});

@@ -32,9 +32,25 @@ export function canonicalize(value) {
   }
   if (value !== null && typeof value === "object") {
     const sortedKeys = Object.keys(value).sort();
+    // Named Data Set field names are attacker-influenceable. Building `out`
+    // via `out[key] = ...` on a plain object would, for an own key literally
+    // named "__proto__", invoke the inherited Object.prototype accessor on
+    // assignment — silently repointing `out`'s own prototype instead of
+    // storing the key as data (prototype pollution) — and that key would
+    // then vanish from Object.keys(out) and so from the digest: two
+    // documents differing only in a malicious "__proto__" key would digest
+    // identically. Object.defineProperty always defines an own data
+    // property directly ([[DefineOwnProperty]]), never invoking an
+    // inherited setter, so every key — "__proto__" included — round-trips
+    // as ordinary data.
     const out = {};
     for (const key of sortedKeys) {
-      out[key] = canonicalize(value[key]);
+      Object.defineProperty(out, key, {
+        value: canonicalize(value[key]),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
     return out;
   }

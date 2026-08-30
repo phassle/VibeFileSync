@@ -22,6 +22,23 @@
 import { readFileSync, existsSync } from "node:fs";
 import { parseJUnitXML } from "./junit-report.mjs";
 
+// GitHub's workflow-command escaping rules (both the message body and each
+// property value): "%" MUST be escaped first, before anything else — any
+// later-inserted "%XX" escape sequence (from escaping "\n" to "%0A", say)
+// would itself get mangled into "%250A" if "%" were escaped afterward.
+// https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#about-workflow-commands
+export function escapeData(value) {
+  return String(value).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+}
+
+// Property values (e.g. `title=`, `file=`) additionally escape "," and ":",
+// which the property-list syntax itself uses as separators — otherwise a
+// comma or colon inside a JUnit test name breaks the property list, or lets
+// a crafted test name inject an extra property.
+export function escapeProperty(value) {
+  return escapeData(value).replace(/,/g, "%2C").replace(/:/g, "%3A");
+}
+
 function main() {
   const junitPath = process.argv[2];
   if (!junitPath) {
@@ -37,8 +54,8 @@ function main() {
   for (const t of parsed.tests) {
     if (t.status === "failed" || t.status === "error") {
       const title = `${t.classname ? `${t.classname} > ` : ""}${t.name}`;
-      const message = (t.message ?? "failed").replace(/\n/g, "%0A").replace(/%/g, "%25").replace(/\r/g, "%0D");
-      console.log(`::error file=${junitPath},title=${title}::${message}`);
+      const message = escapeData(t.message ?? "failed");
+      console.log(`::error file=${escapeProperty(junitPath)},title=${escapeProperty(title)}::${message}`);
     }
   }
 }

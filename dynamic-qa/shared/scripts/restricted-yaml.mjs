@@ -44,6 +44,14 @@ export class YamlSyntaxError extends Error {
   }
 }
 
+// Defines `key` on `obj` (which must be a null-prototype object) as an
+// ordinary own enumerable data property, regardless of the key's name.
+// Paired with `Object.create(null)` targets so a parsed key literally named
+// "__proto__" is never mistaken for a prototype reassignment.
+function defineDataProperty(obj, key, value) {
+  Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
 export function formatPath(path) {
   if (!path || path.length === 0) return "$";
   let out = "$";
@@ -373,6 +381,19 @@ function parseSequence(lines, startIdx, indent, path) {
 }
 
 function parseMapping(lines, startIdx, indent, path) {
+  // `key` below comes straight from the YAML text (parseKeyScalar), which is
+  // attacker-influenceable (this parser reads Flow Definitions, Named Data
+  // Sets, and other customer-owned-but-untrusted documents). Assigning a
+  // literal key named "__proto__" onto a normal object via `obj[key] = ...`
+  // would invoke the inherited Object.prototype accessor and repoint obj's
+  // own prototype instead of storing the key as data (prototype pollution),
+  // and the key would then silently vanish from Object.keys(obj) — defeating
+  // this parser's own fail-closed "unknown key" and duplicate-key checks
+  // upstream. `defineDataProperty` below uses Object.defineProperty, which
+  // always defines an own data property directly and never invokes an
+  // inherited setter, so every key — "__proto__" included — round-trips as
+  // ordinary data. (Kept as a plain `{}` rather than a null-prototype
+  // object so parsed values keep the shape existing consumers expect.)
   const obj = {};
   const seenKeys = new Set();
   let idx = startIdx;
@@ -396,12 +417,12 @@ function parseMapping(lines, startIdx, indent, path) {
     if (kv.rest.trim() === "") {
       idx++;
       const nested = parseBlock(lines, idx, indent + 2, valuePath);
-      obj[key] = nested.value;
+      defineDataProperty(obj, key, nested.value);
       idx = nested.next;
       continue;
     }
 
-    obj[key] = parseScalar(kv.rest, line.lineNo, valuePath);
+    defineDataProperty(obj, key, parseScalar(kv.rest, line.lineNo, valuePath));
     idx++;
   }
   return { value: obj, next: idx };

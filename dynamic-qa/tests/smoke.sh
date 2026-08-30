@@ -31,6 +31,31 @@ pass() {
   echo "smoke.sh: ok: $*"
 }
 
+# real_home_skills_snapshot — a stable, sorted listing of relative paths plus
+# a content hash per file, across the real skill install roots this process
+# could plausibly touch by accident (~/.agents/skills, ~/.codex/skills,
+# ~/.claude/skills) — the same directories install.sh writes into when no
+# --target is given. A missing directory contributes nothing (not an error),
+# so a developer machine that has never installed a given harness's skills
+# still gets a meaningful, comparable snapshot.
+real_home_skills_snapshot() {
+  local root
+  for root in "$HOME/.agents/skills" "$HOME/.codex/skills" "$HOME/.claude/skills"; do
+    [ -d "$root" ] || continue
+    ( cd "$root" && find . \( -type f -o -type l \) | sort | while IFS= read -r f; do
+        if [ -L "$f" ]; then
+          printf '%s symlink -> %s\n' "$root/$f" "$(readlink "$f")"
+        elif command -v shasum >/dev/null 2>&1; then
+          printf '%s %s\n' "$root/$f" "$(shasum -a 256 "$f" | awk '{print $1}')"
+        else
+          printf '%s %s\n' "$root/$f" "$(sha256sum "$f" | awk '{print $1}')"
+        fi
+      done )
+  done
+}
+
+REAL_HOME_BEFORE="$(real_home_skills_snapshot)"
+
 echo "smoke.sh: building and verifying packaging"
 "$HERE/build.sh"
 pass "build.sh completed with all packaging checks passing"
@@ -52,7 +77,7 @@ pass "both skills discoverable in shared, Codex, and OpenCode installs, each ins
 rm -rf "$TMP/.agents/skills/qa-generate"
 [ -d "$TMP/.agents/skills/qa-setup" ] || fail "qa-setup install got removed along with qa-generate"
 [ -f "$TMP/.agents/skills/qa-setup/SKILL.md" ] || fail "qa-setup unusable after qa-generate removed"
-if grep -RIl -e '\.\./qa-generate' "$TMP/.agents/skills/qa-setup" >/dev/null 2>&1; then
+if grep -rIl -e '\.\./qa-generate' "$TMP/.agents/skills/qa-setup" >/dev/null 2>&1; then
   fail "qa-setup still references a path into the now-absent qa-generate"
 fi
 pass "qa-setup remains installable and self-contained with qa-generate absent"
@@ -81,6 +106,12 @@ grep -q '"contentDigest": "sha256:' "$manifest" || fail "$manifest missing a sha
 pass "bundle release is versioned and content-addressed via BUNDLE_MANIFEST.json"
 
 # A build must not have touched the real install roots this process actually
-# owns outside $TMP — sanity check that install.sh honoured --target and
-# wrote nothing to $HOME during this run beyond what already existed.
+# owns outside $TMP — verify install.sh honoured --target and wrote nothing
+# to the real $HOME's skill directories during this run.
+REAL_HOME_AFTER="$(real_home_skills_snapshot)"
+if [ "$REAL_HOME_BEFORE" != "$REAL_HOME_AFTER" ]; then
+  fail "build.sh/install.sh wrote to the real \$HOME's skill directories (~/.agents/skills, ~/.codex/skills, ~/.claude/skills), which this run must never touch — before/after snapshots differ"
+fi
+pass "real \$HOME's skill directories are unchanged by this run"
+
 echo "smoke.sh: all checks passed"
