@@ -212,6 +212,22 @@ test("validateFact rejects a confirmed brownfield-observation fact missing confi
   assert.ok(errors.some((e) => e.includes("confirmedByRole")));
 });
 
+// --- proves makeFact and validateFact share one rule set (code-review fix) -
+
+test("a new invariant added to the shared rule set (fact.id must not have leading/trailing whitespace) is enforced by both makeFact and validateFact", () => {
+  assert.throws(
+    () => makeFact({ id: " x", category: "test-framework", provenance: "observed" }),
+    /leading or trailing whitespace/
+  );
+  assert.throws(
+    () => makeFact({ id: "x ", category: "test-framework", provenance: "observed" }),
+    /leading or trailing whitespace/
+  );
+  const { ok, errors } = validateFact({ id: " x", category: "test-framework", provenance: "observed" });
+  assert.equal(ok, false);
+  assert.ok(errors.some((e) => e.includes("leading or trailing whitespace")));
+});
+
 test("validateInventory accepts a greenfield-source fact with unknown provenance and no evidence", () => {
   const inventory = {
     generatedAt: "2026-08-29T00:00:00Z",

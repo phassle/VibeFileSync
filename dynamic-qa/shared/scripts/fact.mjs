@@ -103,8 +103,12 @@ export function isKnownCategory(category) {
   return CATEGORIES.includes(category);
 }
 
-// makeFact — construct one immutable fact. Throws (fails closed) rather than
-// returning a partially-valid object, on:
+// The invariants below are the single source of truth for what a Fact may
+// legally look like. `collectFactRuleViolations` runs every rule against a
+// fact-shaped object and returns every violation, in a fixed order, without
+// throwing — `makeFact` and `validateFact` are two thin entry points over
+// this one rule set, differing only in what they do with the result
+// (respectively: throw on the first violation, or report all of them):
 //   - an unknown category
 //   - a provenance outside PROVENANCE
 //   - a "secret-name" category fact carrying `value` or `secretValue`
@@ -118,88 +122,15 @@ export function isKnownCategory(category) {
 //     (only "qa-owner"/"technical-owner" may confirm intent), or whose
 //     intentStatus is "confirmed-intended"/"confirmed-not-intended" without
 //     a confirming identity
-export function makeFact(input = {}) {
-  const { id, category, description, provenance, evidence, value, secretName, intentStatus, confirmedBy, confirmedByRole } =
-    input;
-  if (typeof id !== "string" || id.length === 0) {
-    throw new Error("fact.id must be a non-empty string");
-  }
-  if (!isKnownCategory(category)) {
-    throw new Error(`fact.category is not a known Setup Inventory category: ${String(category)}`);
-  }
-  if (!isValidProvenance(provenance)) {
-    throw new Error(`fact.provenance must be observed, reported, or unknown, got: ${String(provenance)}`);
-  }
-  if (Object.prototype.hasOwnProperty.call(input, "secretValue")) {
-    throw new Error("fact must never carry a secretValue field — secrets are inspected by name only");
-  }
-  if (category === "secret-name" && value !== undefined) {
-    throw new Error("a secret-name fact may record a secret's name only, never its value");
-  }
-
-  const carriesIntentFields =
-    intentStatus !== undefined || confirmedBy !== undefined || confirmedByRole !== undefined;
-  if (category !== "brownfield-observation" && carriesIntentFields) {
-    throw new Error(
-      "only a brownfield-observation fact may carry intentStatus/confirmedBy/confirmedByRole"
-    );
-  }
-
-  const fact = { id, category, provenance };
-  if (description !== undefined) fact.description = description;
-  if (evidence !== undefined) fact.evidence = evidence;
-  if (category === "secret-name") {
-    if (typeof secretName !== "string" || secretName.length === 0) {
-      throw new Error("a secret-name fact requires a non-empty secretName");
-    }
-    fact.secretName = secretName;
-  } else if (category === "brownfield-observation") {
-    const resolvedStatus = intentStatus === undefined ? "unconfirmed" : intentStatus;
-    if (!isValidIntentStatus(resolvedStatus)) {
-      throw new Error(
-        `brownfield-observation fact.intentStatus must be one of ${INTENT_STATUSES.join(", ")}, got: ${String(resolvedStatus)}`
-      );
-    }
-    const hasConfirmedBy = confirmedBy !== undefined;
-    const hasConfirmedByRole = confirmedByRole !== undefined;
-    if (resolvedStatus === "unconfirmed") {
-      if (hasConfirmedBy || hasConfirmedByRole) {
-        throw new Error(
-          "an unconfirmed brownfield-observation fact must not already carry confirmedBy/confirmedByRole — that would let an observation arrive pre-confirmed without ever going through confirmIntent"
-        );
-      }
-    } else {
-      if (typeof confirmedBy !== "string" || confirmedBy.length === 0) {
-        throw new Error(
-          `a ${resolvedStatus} brownfield-observation fact requires a non-empty confirmedBy identity`
-        );
-      }
-      if (!CONFIRMING_ROLES.includes(confirmedByRole)) {
-        throw new Error(
-          `confirmedByRole must be one of ${CONFIRMING_ROLES.join(", ")}, got: ${String(confirmedByRole)} — a Domain Expert may clarify but never confirms intent`
-        );
-      }
-      fact.confirmedBy = confirmedBy;
-      fact.confirmedByRole = confirmedByRole;
-    }
-    fact.intentStatus = resolvedStatus;
-    if (value !== undefined) fact.value = value;
-  } else if (value !== undefined) {
-    fact.value = value;
-  }
-  return Object.freeze(fact);
-}
-
-// validateFact — non-throwing check for a fact object that arrived from
-// somewhere other than makeFact (e.g. parsed from a persisted artifact).
-// Returns { ok, errors }. Never mutates its input.
-export function validateFact(fact) {
+// Adding a new invariant means adding one rule here — never editing
+// makeFact/validateFact separately, which is exactly the duplication this
+// shared rule set replaces.
+function collectFactRuleViolations(fact) {
   const errors = [];
-  if (fact === null || typeof fact !== "object" || Array.isArray(fact)) {
-    return { ok: false, errors: ["fact must be an object"] };
-  }
   if (typeof fact.id !== "string" || fact.id.length === 0) {
     errors.push("fact.id must be a non-empty string");
+  } else if (fact.id !== fact.id.trim()) {
+    errors.push("fact.id must not have leading or trailing whitespace");
   }
   if (!isKnownCategory(fact.category)) {
     errors.push(`fact.category is not a known Setup Inventory category: ${String(fact.category)}`);
@@ -250,6 +181,66 @@ export function validateFact(fact) {
     }
   }
 
+  return errors;
+}
+
+// Assembles the exact fact-shaped candidate `collectFactRuleViolations`
+// should judge, from makeFact's raw constructor input. This is the one place
+// that applies makeFact's convenience default (an unspecified
+// brownfield-observation intentStatus resolves to "unconfirmed" rather than
+// being rejected as missing) — a persisted fact validated via validateFact
+// gets no such default, on purpose: silently defaulting a value read back
+// from a stored artifact would mask a real gap. Every field is copied onto
+// the candidate exactly when the caller supplied it (never defaulted
+// otherwise), including fields that are invalid for the fact's category,
+// specifically so collectFactRuleViolations can see and reject them exactly
+// as it would for a hand-built fact carrying the same mistake.
+function buildFactCandidate(input) {
+  const { id, category, description, provenance, evidence, value, secretName, intentStatus, confirmedBy, confirmedByRole } =
+    input;
+  const candidate = { id, category, provenance };
+  if (description !== undefined) candidate.description = description;
+  if (evidence !== undefined) candidate.evidence = evidence;
+  if (Object.prototype.hasOwnProperty.call(input, "secretValue")) {
+    candidate.secretValue = input.secretValue;
+  }
+
+  const resolvedIntentStatus =
+    category === "brownfield-observation" && intentStatus === undefined ? "unconfirmed" : intentStatus;
+  if (resolvedIntentStatus !== undefined) candidate.intentStatus = resolvedIntentStatus;
+  if (confirmedBy !== undefined) candidate.confirmedBy = confirmedBy;
+  if (confirmedByRole !== undefined) candidate.confirmedByRole = confirmedByRole;
+
+  if (category === "secret-name") {
+    candidate.secretName = secretName;
+  }
+  if (value !== undefined) candidate.value = value;
+
+  return candidate;
+}
+
+// makeFact — construct one immutable fact. Throws (fails closed) with the
+// first rule violation `collectFactRuleViolations` finds, rather than
+// returning a partially-valid object. See that function's own comment for
+// the full invariant list.
+export function makeFact(input = {}) {
+  const candidate = buildFactCandidate(input);
+  const errors = collectFactRuleViolations(candidate);
+  if (errors.length > 0) {
+    throw new Error(errors[0]);
+  }
+  return Object.freeze(candidate);
+}
+
+// validateFact — non-throwing check for a fact object that arrived from
+// somewhere other than makeFact (e.g. parsed from a persisted artifact).
+// Returns { ok, errors }, collecting every violation from the same rule set
+// makeFact uses. Never mutates its input.
+export function validateFact(fact) {
+  if (fact === null || typeof fact !== "object" || Array.isArray(fact)) {
+    return { ok: false, errors: ["fact must be an object"] };
+  }
+  const errors = collectFactRuleViolations(fact);
   return { ok: errors.length === 0, errors };
 }
 

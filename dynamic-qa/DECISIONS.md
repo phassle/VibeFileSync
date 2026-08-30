@@ -1,9 +1,15 @@
 # dynamic-qa build decisions
 
-This file is the decision record for `dynamic-qa`'s own packaging and distribution
-choices. `dynamic-qa` is a separate bounded context from VibeFileSync: this file,
-not a VibeFileSync ADR under `docs/adr/`, is where those decisions live, and its
-vocabulary must never enter VibeFileSync's `CONTEXT.md`.
+This file is the decision record for `dynamic-qa`'s own design and build
+decisions in general — not only packaging and distribution. `dynamic-qa` is a
+separate bounded context from VibeFileSync: this file, not a VibeFileSync ADR
+under `docs/adr/`, is where those decisions live, and its vocabulary must
+never enter VibeFileSync's `CONTEXT.md`.
+
+Sections are numbered as stable IDs cross-referenced from reference docs and
+commit messages (e.g. "DECISIONS §15"); numbers are never reused or
+renumbered, only appended. §3 and §5 were never allocated, an artifact of
+concurrent authoring during the run — do not look for them.
 
 ## 1. Build source location: top-level `dynamic-qa/` in this repository
 
@@ -546,76 +552,6 @@ formed input. Anyone wiring these modules into the real generation flow
 (the run coordinator's central `qa-generate/SKILL.md` edit, or a later
 ticket) still has to write that discovery/derivation logic; it is out of
 this ticket's scope because it is genuinely interpretive, not computable.
-## 16. Negative controls (#152)
-
-**Decision.** A new module, `shared/scripts/negative-controls.mjs`, is the
-whole of the negative-control gate: "prove that each assertion still fails
-for the violation it is supposed to catch" (tickets/152.md) is split into a
-pure derivation half and a pure judgment half, with the actual
-harness-specific execution left as a documented seam — see the module's own
-footer comment and `shared/references/negative-controls.md`.
-
-**Derivation reuses the Flow contract, never invents a violation.**
-`deriveDeclaredViolation` reads only what #143/#145 already validate: the
-outcome's own `tolerance.kind` (spec 5.1's seven v1 kinds) and, when
-declared, the flow's `role: "owned"` boundary (#145's vocabulary — the
-boundary the outcome is actually proving something about). Each tolerance
-kind gets its own tech-neutral violation statement: `numeric`/`temporal`
-name the exact epsilon window the observed value must move outside of;
-`presentation` requires breaking a non-ignorable aspect (content, values,
-behavior, accessibility, counts), never an ignored one (layout, style,
-position); `unordered-set` requires an actual membership change, not
-reordering; `custom` has no deterministic notion of what invalidates an
-approved comparison, so it surfaces the approver's own `reason`/
-`approved_by` rather than inventing one, and is still marked as requiring a
-control (`requiresManualStatement: true`), never exempted.
-`buildNegativeControlPlan` walks every outcome via
-`expected-outcome-coverage.mjs`'s own `collectExpectedOutcomeIds` — a third
-declaration-order walk was never written.
-
-**Judgment is fail-closed on the reported execution mode, not just the
-result.** `judgeNegativeControl` accepts a `NegativeControlReport` only when
-`mode` is the exact literal `"executed"` — no allowance for "probably ran"
-exists, so a report claiming `"simulated"`, `"skipped"`, `"assumed"`, or
-simply omitting `mode` is rejected as `not-executed` by the same code path,
-regardless of what `appliedViolation` claims. Among genuinely executed
-reports: `"assertion-passed"` is rejected as `assertion-did-not-fail` (the
-always-true-assertion case the ticket exists to catch), and `"crash"`/
-`"timeout"` are rejected as `unrelated-failure` — the acceptance criterion
-"the control exercises the declared violation, not an unrelated failure
-such as a crash or timeout" is a distinct rejection reason from "did not
-fail", not folded into it, so a review packet can tell the two apart.
-
-**Coverage is per Expected Outcome, matching #146's own proof model.**
-`checkNegativeControlCoverage` requires one accepted control per
-`{stepId, outcomeId}` an assertion mapping references — multiple assertions
-proving the same outcome share that outcome's one control, exactly as
-`expected-outcome-coverage.mjs` treats coverage as per-outcome, not
-per-assertion. A missing report is a distinct, named error from a rejected
-one, and a later weaker report (e.g. a `"simulated"` report following a
-genuine `"executed"` rejection) never silently overwrites an already-good
-verdict for the same key, nor can a later report resurrect a key whose only
-verdict is a rejection.
-
-**Not built here, and not #152's to build:** actually executing an
-assertion against a mutated fixture in a real harness (API/CLI/browser);
-wiring this module into `qa-generate/SKILL.md` step 6 (prose integration is
-handed back centrally per the run brief's coordination rule — see
-`shared/references/negative-controls.md` for the exact replacement text and
-placeholder); neighbor-flow verification and the drift gate itself, both
-still #148's territory per #146's own seam note.
-
-**Seam left for #160 (guarded repair).** Repair's own verify step
-(DESIGN-dynamic-qa-spec.md §7 repair-workflow step 6: "verify the exact
-failure, a deterministic negative control, neighboring tests, protected-
-contract digests") should call `buildNegativeControlPlan` and
-`judgeNegativeControl`/`checkNegativeControlCoverage` directly — the same
-Expected Outcome/tolerance/boundary contract is read-only during repair, so
-the same derivation applies unchanged. Nothing repair-specific (e.g.
-guarding against the repair candidate widening a tolerance to make its own
-control pass more easily) is built here; #160 owns making sure a repair
-candidate cannot satisfy this gate by changing the contract instead of the
-code.
 ## 14. Deterministic drift gate (#148)
 
 **"Unrelated product changes are not drift" is structural, not a filter.**
@@ -821,6 +757,76 @@ the central editor to replace:
   disk should add a thin restricted-YAML parse/render pair the same way
   `flow-definition.mjs` and `flow-yaml.mjs` do for Flow Definitions, rather
   than growing that concern inside `execution-profile.mjs` itself.
+## 16. Negative controls (#152)
+
+**Decision.** A new module, `shared/scripts/negative-controls.mjs`, is the
+whole of the negative-control gate: "prove that each assertion still fails
+for the violation it is supposed to catch" (tickets/152.md) is split into a
+pure derivation half and a pure judgment half, with the actual
+harness-specific execution left as a documented seam — see the module's own
+footer comment and `shared/references/negative-controls.md`.
+
+**Derivation reuses the Flow contract, never invents a violation.**
+`deriveDeclaredViolation` reads only what #143/#145 already validate: the
+outcome's own `tolerance.kind` (spec 5.1's seven v1 kinds) and, when
+declared, the flow's `role: "owned"` boundary (#145's vocabulary — the
+boundary the outcome is actually proving something about). Each tolerance
+kind gets its own tech-neutral violation statement: `numeric`/`temporal`
+name the exact epsilon window the observed value must move outside of;
+`presentation` requires breaking a non-ignorable aspect (content, values,
+behavior, accessibility, counts), never an ignored one (layout, style,
+position); `unordered-set` requires an actual membership change, not
+reordering; `custom` has no deterministic notion of what invalidates an
+approved comparison, so it surfaces the approver's own `reason`/
+`approved_by` rather than inventing one, and is still marked as requiring a
+control (`requiresManualStatement: true`), never exempted.
+`buildNegativeControlPlan` walks every outcome via
+`expected-outcome-coverage.mjs`'s own `collectExpectedOutcomeIds` — a third
+declaration-order walk was never written.
+
+**Judgment is fail-closed on the reported execution mode, not just the
+result.** `judgeNegativeControl` accepts a `NegativeControlReport` only when
+`mode` is the exact literal `"executed"` — no allowance for "probably ran"
+exists, so a report claiming `"simulated"`, `"skipped"`, `"assumed"`, or
+simply omitting `mode` is rejected as `not-executed` by the same code path,
+regardless of what `appliedViolation` claims. Among genuinely executed
+reports: `"assertion-passed"` is rejected as `assertion-did-not-fail` (the
+always-true-assertion case the ticket exists to catch), and `"crash"`/
+`"timeout"` are rejected as `unrelated-failure` — the acceptance criterion
+"the control exercises the declared violation, not an unrelated failure
+such as a crash or timeout" is a distinct rejection reason from "did not
+fail", not folded into it, so a review packet can tell the two apart.
+
+**Coverage is per Expected Outcome, matching #146's own proof model.**
+`checkNegativeControlCoverage` requires one accepted control per
+`{stepId, outcomeId}` an assertion mapping references — multiple assertions
+proving the same outcome share that outcome's one control, exactly as
+`expected-outcome-coverage.mjs` treats coverage as per-outcome, not
+per-assertion. A missing report is a distinct, named error from a rejected
+one, and a later weaker report (e.g. a `"simulated"` report following a
+genuine `"executed"` rejection) never silently overwrites an already-good
+verdict for the same key, nor can a later report resurrect a key whose only
+verdict is a rejection.
+
+**Not built here, and not #152's to build:** actually executing an
+assertion against a mutated fixture in a real harness (API/CLI/browser);
+wiring this module into `qa-generate/SKILL.md` step 6 (prose integration is
+handed back centrally per the run brief's coordination rule — see
+`shared/references/negative-controls.md` for the exact replacement text and
+placeholder); neighbor-flow verification and the drift gate itself, both
+still #148's territory per #146's own seam note.
+
+**Seam left for #160 (guarded repair).** Repair's own verify step
+(DESIGN-dynamic-qa-spec.md §7 repair-workflow step 6: "verify the exact
+failure, a deterministic negative control, neighboring tests, protected-
+contract digests") should call `buildNegativeControlPlan` and
+`judgeNegativeControl`/`checkNegativeControlCoverage` directly — the same
+Expected Outcome/tolerance/boundary contract is read-only during repair, so
+the same derivation applies unchanged. Nothing repair-specific (e.g.
+guarding against the repair candidate widening a tolerance to make its own
+control pass more easily) is built here; #160 owns making sure a repair
+candidate cannot satisfy this gate by changing the contract instead of the
+code.
 ## 17. Portfolio reconciliation (#165)
 
 **A new module, `portfolio-reconciliation.mjs`, is the whole-of-portfolio
@@ -1088,6 +1094,127 @@ DESIGN-dynamic-qa-spec.md §11 zone 4 names — gets the general
   coordinator — see the exact replacement text and placeholder reported
   separately.
 
+## 20. GitHub Actions adapter and the advisory PR lane (#153)
+
+**GitHub Actions is the first named provider adapter**
+(DESIGN-dynamic-qa-spec.md §9). Two new modules split the concern the same
+way #150 split Execution Profile shape from Capability Gate enforcement:
+`shared/scripts/github-actions-workflow.mjs` is the pure renderer plus a
+reusable hardening detector; `shared/scripts/github-actions-adapter.mjs` is
+the seven-point provider-adapter contract (detect, prove capability
+evidence, render without deciding policy, name supported triggers, publish
+JUnit/annotations/summary, resolve a run reference, validate that generated
+configuration enforces the profile). Only the advisory pull-request lane is
+built. Required and quarantine lane rendering (contract point 3 names all
+three) are an explicit seam for a later ticket, reusing the same hardening
+detector rather than duplicating it.
+
+**The hardening detector is the acceptance mechanism, not just the
+renderer's own self-check.** `checkWorkflowHardening(yamlText)` scans
+arbitrary rendered/mutated workflow YAML text (a targeted line-scanner, not
+a general YAML parser — no dependency added) and names, individually, any
+of: missing/non-minimal `permissions`, a checkout step missing
+`persist-credentials: false`, a tag-pinned (not full-40-hex-SHA-pinned)
+action, the unsafe `pull_request_target` trigger, a job missing
+`continue-on-error: true` (which is how the advisory lane is structurally
+prevented from ever failing the merge gate — GitHub Actions' own documented
+job-level mechanism, not a policy convention this bundle merely asks for), a
+referenced secret, a requested OIDC `id-token: write` permission, a
+declared protected environment, a granted write permission scope, a
+privileged cache action, or a self-hosted runner label. Every one of these
+has its own Tier 1 test that mutates one property at a time and asserts the
+exact named code — proving each is *individually* detected, never bundled
+into one generic "unsafe" flag.
+
+**No third-party action beyond `actions/checkout` and `actions/setup-node`,
+both full-commit-SHA pinned.** Native GitHub Actions annotations and the job
+summary are produced by this bundle's own zero-dependency scripts
+(`github-actions-annotations-cli.mjs`, `github-actions-summary-cli.mjs`)
+reading a restricted-subset JUnit XML parser (`junit-report.mjs`, refuses an
+`<!ENTITY` declaration and any processing instruction beyond the XML
+declaration) rather than adding and pinning a third-party JUnit-reporter
+action — one fewer supply-chain dependency to pin, verify, and keep current.
+**Action-pin freshness is an explicit, named assumption, not a silent
+claim**: the deterministic core has zero network access and cannot itself
+resolve "the current commit behind tag vX" — the two SHAs shipped are
+placeholders shaped as real pins, flagged in the module header for
+re-verification before the generated workflow is ever enabled for a real
+repository (the pilot, #171-175, is deliberately not being run yet).
+
+**The Node-runtime caveat is a Safety Blocker, never a silent skip.** Node
+is guaranteed on a developer machine and a GitHub-hosted runner, but not
+automatically on a minimal self-hosted runner. The renderer always emits an
+explicit `actions/setup-node` step (never assumes an ambient `node`); the
+adapter additionally requires the Execution Profile to declare a
+`runtime.node-available` capability at all
+(`checkNodeRuntimeCapabilityDeclared` — #150's generic Capability Gate only
+checks a capability that IS named, so a profile author omitting it entirely
+would otherwise sail through unblocked) and the environment to report that
+exact capability `met`. `planAdvisoryPullRequestLane` composes this check
+with `runCapabilityGate`/`activationDecision` (#150, reused) and never
+returns a rendered workflow while either has an open blocker — the missing/
+unmet case returns `{ rendered: false, state: "deferred", blockers }`,
+mirroring #150's own "no default-open path" invariant exactly.
+
+**The Result Envelope schema is defined** (#151 explicitly left this open):
+`shared/schemas/dynamic-qa-result-envelope-v1.schema.json` plus
+`shared/scripts/result-envelope.mjs`. Small, non-executable (a closed schema
+with no free-form script/command/path/URL field defined at all — nothing
+here a privileged lane could "run"), schema-validated, and independently
+size-bounded (`MAX_ENVELOPE_BYTES` = 16 KiB, checked separately from shape
+validity — an oversized-but-shape-valid envelope is still refused).
+`validatePrivilegedResultEnvelopeArtifact` composes
+`trust-zones.mjs`'s `checkPrivilegedLaneArtifact` (#151) as the sole zone
+gate — reused, never duplicated — before this module's own shape/size
+checks run.
+
+**`preflight.mjs`'s safety check (step 4) now validates the actual
+Execution Profile artifact and proves it enforceable, not just an ID
+string** (#150's explicit hand-off: "preflight.mjs still only checks the
+profile ID is a valid semantic string, not the artifact"). Four sub-checks,
+in order, none skippable: 4a. the id is a valid semantic string (unchanged);
+4b. `<executionProfilesDir>/<id>.yaml` resolves and passes
+`validateExecutionProfile` (#150, reused) — reason
+`invalid-execution-profile`; 4c. the resolved profile honours the flow's
+own Boundary Declarations via `checkExecutionProfileHonoursBoundaries`
+(#150, reused) — reason `execution-profile-boundary-mismatch`; 4d.
+`environmentEvidence` is now a REQUIRED input (never optional — an absent
+environment is its own distinct failure, `missing-environment-evidence`,
+never silently skipped, per #150's "absence of an environment section is
+itself a blocker" note) and, once present, `runCapabilityGate`/
+`activationDecision` (#150/#151, reused) must pass or the call fails
+closed with reason `execution-profile-capability-blocked` and `issues` set
+to the exact named blockers. `runGenerationPreflight`'s success payload now
+also returns the resolved `executionProfile`. `qa-generate/SKILL.md`'s step
+1 prose was updated to match (this is squarely preflight.mjs's own
+description, not qa-setup/qa-generate stage territory the concurrent
+tickets own).
+
+**Sharding is not introduced.** `renderAdvisoryPullRequestLane`'s
+`testCommand` is a single precomputed command string; the seam for a
+matrix strategy exists (a caller could pass several `testCommand`s once
+measured runtime data justifies it) but nothing here adds one.
+
+**Seams left for #154, #155, #157, #158, #168:**
+- Nightly full suite, manual/provider-API trigger, and merge-group trigger
+  (DESIGN-dynamic-qa-spec.md §8's other three Provider-native CI exposures)
+  are named (`DEFERRED_TRIGGERS`) but not built — only `pull_request`
+  (`SUPPORTED_TRIGGERS`).
+- Impact-path-based Binding selection ("only the Bindings relevant to the
+  change") is not implemented — `testCommand` is caller-precomputed.
+- Required-lane and quarantine-lane rendering are not built — only
+  `renderAdvisoryPullRequestLane` exists.
+- Full semantic inventory of an existing arbitrary workflow's content
+  (adapter contract point 1) stays filename-level only —
+  `detectProviderConfiguration` never parses third-party workflow YAML.
+- Wiring `planAdvisoryPullRequestLane`'s invocation into
+  `qa-generate/SKILL.md`'s own step sequence is left to a coordinated
+  follow-up — see `shared/references/github-actions-adapter.md` for the
+  exact contract a wiring step should call, and that SKILL.md's step 5 note
+  for the placeholder pointer.
+- Action-pin SHAs (`CHECKOUT_ACTION_SHA`, `SETUP_NODE_ACTION_SHA`) need
+  re-verification against real upstream tags before first real rollout.
+
 ## 21. qa-setup stage 7 safe execution design (#166)
 
 **Modules.** `shared/scripts/safe-execution-design.mjs` (21 Tier 1/2 tests
@@ -1269,446 +1396,6 @@ re-deriving the burn-in gate elsewhere.
 
 **No real VibeFileSync baseline data was created or written by this
 ticket.** All tests exercise disposable temp directories only.
-## 20. GitHub Actions adapter and the advisory PR lane (#153)
-
-**GitHub Actions is the first named provider adapter**
-(DESIGN-dynamic-qa-spec.md §9). Two new modules split the concern the same
-way #150 split Execution Profile shape from Capability Gate enforcement:
-`shared/scripts/github-actions-workflow.mjs` is the pure renderer plus a
-reusable hardening detector; `shared/scripts/github-actions-adapter.mjs` is
-the seven-point provider-adapter contract (detect, prove capability
-evidence, render without deciding policy, name supported triggers, publish
-JUnit/annotations/summary, resolve a run reference, validate that generated
-configuration enforces the profile). Only the advisory pull-request lane is
-built. Required and quarantine lane rendering (contract point 3 names all
-three) are an explicit seam for a later ticket, reusing the same hardening
-detector rather than duplicating it.
-
-**The hardening detector is the acceptance mechanism, not just the
-renderer's own self-check.** `checkWorkflowHardening(yamlText)` scans
-arbitrary rendered/mutated workflow YAML text (a targeted line-scanner, not
-a general YAML parser — no dependency added) and names, individually, any
-of: missing/non-minimal `permissions`, a checkout step missing
-`persist-credentials: false`, a tag-pinned (not full-40-hex-SHA-pinned)
-action, the unsafe `pull_request_target` trigger, a job missing
-`continue-on-error: true` (which is how the advisory lane is structurally
-prevented from ever failing the merge gate — GitHub Actions' own documented
-job-level mechanism, not a policy convention this bundle merely asks for), a
-referenced secret, a requested OIDC `id-token: write` permission, a
-declared protected environment, a granted write permission scope, a
-privileged cache action, or a self-hosted runner label. Every one of these
-has its own Tier 1 test that mutates one property at a time and asserts the
-exact named code — proving each is *individually* detected, never bundled
-into one generic "unsafe" flag.
-
-**No third-party action beyond `actions/checkout` and `actions/setup-node`,
-both full-commit-SHA pinned.** Native GitHub Actions annotations and the job
-summary are produced by this bundle's own zero-dependency scripts
-(`github-actions-annotations-cli.mjs`, `github-actions-summary-cli.mjs`)
-reading a restricted-subset JUnit XML parser (`junit-report.mjs`, refuses an
-`<!ENTITY` declaration and any processing instruction beyond the XML
-declaration) rather than adding and pinning a third-party JUnit-reporter
-action — one fewer supply-chain dependency to pin, verify, and keep current.
-**Action-pin freshness is an explicit, named assumption, not a silent
-claim**: the deterministic core has zero network access and cannot itself
-resolve "the current commit behind tag vX" — the two SHAs shipped are
-placeholders shaped as real pins, flagged in the module header for
-re-verification before the generated workflow is ever enabled for a real
-repository (the pilot, #171-175, is deliberately not being run yet).
-
-**The Node-runtime caveat is a Safety Blocker, never a silent skip.** Node
-is guaranteed on a developer machine and a GitHub-hosted runner, but not
-automatically on a minimal self-hosted runner. The renderer always emits an
-explicit `actions/setup-node` step (never assumes an ambient `node`); the
-adapter additionally requires the Execution Profile to declare a
-`runtime.node-available` capability at all
-(`checkNodeRuntimeCapabilityDeclared` — #150's generic Capability Gate only
-checks a capability that IS named, so a profile author omitting it entirely
-would otherwise sail through unblocked) and the environment to report that
-exact capability `met`. `planAdvisoryPullRequestLane` composes this check
-with `runCapabilityGate`/`activationDecision` (#150, reused) and never
-returns a rendered workflow while either has an open blocker — the missing/
-unmet case returns `{ rendered: false, state: "deferred", blockers }`,
-mirroring #150's own "no default-open path" invariant exactly.
-
-**The Result Envelope schema is defined** (#151 explicitly left this open):
-`shared/schemas/dynamic-qa-result-envelope-v1.schema.json` plus
-`shared/scripts/result-envelope.mjs`. Small, non-executable (a closed schema
-with no free-form script/command/path/URL field defined at all — nothing
-here a privileged lane could "run"), schema-validated, and independently
-size-bounded (`MAX_ENVELOPE_BYTES` = 16 KiB, checked separately from shape
-validity — an oversized-but-shape-valid envelope is still refused).
-`validatePrivilegedResultEnvelopeArtifact` composes
-`trust-zones.mjs`'s `checkPrivilegedLaneArtifact` (#151) as the sole zone
-gate — reused, never duplicated — before this module's own shape/size
-checks run.
-
-**`preflight.mjs`'s safety check (step 4) now validates the actual
-Execution Profile artifact and proves it enforceable, not just an ID
-string** (#150's explicit hand-off: "preflight.mjs still only checks the
-profile ID is a valid semantic string, not the artifact"). Four sub-checks,
-in order, none skippable: 4a. the id is a valid semantic string (unchanged);
-4b. `<executionProfilesDir>/<id>.yaml` resolves and passes
-`validateExecutionProfile` (#150, reused) — reason
-`invalid-execution-profile`; 4c. the resolved profile honours the flow's
-own Boundary Declarations via `checkExecutionProfileHonoursBoundaries`
-(#150, reused) — reason `execution-profile-boundary-mismatch`; 4d.
-`environmentEvidence` is now a REQUIRED input (never optional — an absent
-environment is its own distinct failure, `missing-environment-evidence`,
-never silently skipped, per #150's "absence of an environment section is
-itself a blocker" note) and, once present, `runCapabilityGate`/
-`activationDecision` (#150/#151, reused) must pass or the call fails
-closed with reason `execution-profile-capability-blocked` and `issues` set
-to the exact named blockers. `runGenerationPreflight`'s success payload now
-also returns the resolved `executionProfile`. `qa-generate/SKILL.md`'s step
-1 prose was updated to match (this is squarely preflight.mjs's own
-description, not qa-setup/qa-generate stage territory the concurrent
-tickets own).
-
-**Sharding is not introduced.** `renderAdvisoryPullRequestLane`'s
-`testCommand` is a single precomputed command string; the seam for a
-matrix strategy exists (a caller could pass several `testCommand`s once
-measured runtime data justifies it) but nothing here adds one.
-
-**Seams left for #154, #155, #157, #158, #168:**
-- Nightly full suite, manual/provider-API trigger, and merge-group trigger
-  (DESIGN-dynamic-qa-spec.md §8's other three Provider-native CI exposures)
-  are named (`DEFERRED_TRIGGERS`) but not built — only `pull_request`
-  (`SUPPORTED_TRIGGERS`).
-- Impact-path-based Binding selection ("only the Bindings relevant to the
-  change") is not implemented — `testCommand` is caller-precomputed.
-- Required-lane and quarantine-lane rendering are not built — only
-  `renderAdvisoryPullRequestLane` exists.
-- Full semantic inventory of an existing arbitrary workflow's content
-  (adapter contract point 1) stays filename-level only —
-  `detectProviderConfiguration` never parses third-party workflow YAML.
-- Wiring `planAdvisoryPullRequestLane`'s invocation into
-  `qa-generate/SKILL.md`'s own step sequence is left to a coordinated
-  follow-up — see `shared/references/github-actions-adapter.md` for the
-  exact contract a wiring step should call, and that SKILL.md's step 5 note
-  for the placeholder pointer.
-- Action-pin SHAs (`CHECKOUT_ACTION_SHA`, `SETUP_NODE_ACTION_SHA`) need
-  re-verification against real upstream tags before first real rollout.
-
-## 26. Failure diagnosis axes (#158)
-
-**Failure Owner and Repeatability are two genuinely independent axes, and
-Failure Class is derived, never assigned** (DESIGN-dynamic-qa-spec.md §5.6
-and §12). `shared/scripts/diagnosis.mjs`'s `deriveFailureClass(owner,
-repeatability)` is the single source of truth for the full 4 x 3 = 12
-combinations — the design table's own collapsed rows ("Product / any",
-"Binding or Environment / intermittent") are expanded here explicitly so
-every combination has exactly one documented answer, not an inferred one.
-Schema: `shared/schemas/dynamic-qa-diagnosis-v1.schema.json` (human-readable
-contract only, same split as every other schema in this bundle — the actual
-hand-written, fail-closed validation is `validateDiagnosisRecord`).
-
-**A retry pass never proves flake — enforced structurally, not by
-convention.** The Diagnosis Record's `repeatabilityBasis` field names what
-actually grounds a repeatability call (`retry-pass | reproduction |
-hypothesis-probe | historical-evidence | external-report |
-insufficient-evidence`). `validateDiagnosisRecord` rejects any record where
-`repeatabilityBasis === "retry-pass"` and `repeatability !== "unknown"` — a
-single passing retry can justify neither "intermittent" (flake) nor
-"deterministic" (fixed). The retry itself is still recorded honestly, as an
-attempt of `kind: "retry"` in the record's own `attempts` list; nothing in
-this module derives a repeatability conclusion from that list.
-
-**A failed attempt stays failed, by construction of an append-only API, not
-by promise.** `attempts` only grows via `appendAttempt`, which re-freezes
-every prior entry and copies it verbatim rather than editing in place,
-and refuses a second `kind: "original"` attempt outright (there is no
-function anywhere in this module that can replace or edit an existing
-entry). `assertOriginalAttemptStaysFailed(before, after)` compares the
-`original` attempt across two attempts-list snapshots and throws on any
-field drift, including a changed verdict. Verified across the full
-retry -> repair-verification -> quarantine-check sequence in
-`diagnosis.test.mjs`.
-
-**Routing by owner is structural, not a policy note.** A Product Regression
-carries no Binding-mutation field anywhere on the Diagnosis Record schema —
-there is nowhere to put one, so a test cannot hide changed behaviour even
-by accident. An Environment Failure (`owner: "environment"`) requires a
-non-empty `failedCapability` — the validator rejects a vague "infra
-flaked". Binding Defect is the only class this ticket makes eligible for
-repair.
-
-**Repair eligibility defaults to ineligible.** `isRepairEligible(record)`
-first runs the record through `validateDiagnosisRecord` (a malformed record
-is ineligible, full stop), then requires simultaneously `status ===
-"confirmed"`, `owner === "binding"`, and `failureClass ===
-"binding-defect"`. This is narrower than "any confirmed Binding-owned
-diagnosis": the `binding` + `intermittent` (Test Flake) combination is
-confirmed and Binding-owned but is **not** granted general repair
-eligibility here — DESIGN-dynamic-qa-spec.md §12's policy table names a
-distinct, narrower "optional Binding stabilization" action for that row,
-left for #159/#160 to build if they choose to. `isRepairEligible` never
-throws; an input it cannot make sense of is ineligible, not an exception a
-caller must remember to catch.
-
-**`qa-generate/SKILL.md` was not touched** (owned elsewhere per run
-coordination). Its repair-mode step 3 placeholder — "Diagnose Failure Owner
-and Repeatability, emit a Diagnosis Record — placeholder, same scope." —
-and step 4's gate placeholder are the exact seams a later wiring ticket
-should replace with calls into `deriveFailureClass` /
-`validateDiagnosisRecord` / `isRepairEligible`. See
-`shared/references/failure-diagnosis.md` for the full routing table and
-the seam note.
-
-**Not built here (left for #159/#160/#157):** the actual repair proposal,
-negative-control gate, and Repair Review Packet (#159/#160); Quarantine
-Record shape and expiry (#157's territory — Flow State / Binding Freshness
-/ Enforcement State lifecycle axes are deliberately not modelled by this
-module); a Failure Evidence Bundle schema/validator (referenced by DESIGN
-§5.6 as a companion artifact, distinct from the Diagnosis Record this
-ticket builds); and wiring this module's functions into
-`qa-generate/SKILL.md`'s actual step sequence.
-## 25. Flow State, Binding Freshness and Enforcement State (#157)
-
-**Three axes, three existing owners — nothing redeclared.** `Flow State`
-(`draft`/`deferred`/`active`/`retired`) already lives in
-`flow-definition.mjs`'s `FLOW_STATES` (#143); `Binding Freshness`
-(`absent`/`current`/`stale`) is already mechanically derived by
-`drift-gate.mjs`'s `FRESHNESS_STATES` (#148); `Enforcement State`
-(`advisory`/`required`) already lives in `provenance.mjs`'s
-`ENFORCEMENT_LANES` (#146/#153). New module `shared/scripts/lifecycle-
-state.mjs` (43 tests, `lifecycle-state.test.mjs`) re-exports all three
-rather than inventing a fourth copy, and adds only the rules layer: allowed
-Flow State transitions, the nine-requirement Activation checklist,
-brownfield/greenfield enforcement defaults, and Qualifying-Run-based
-promotion. Reference: `shared/references/lifecycle-axes.md`.
-
-**"A failure must never silently rewrite policy" is enforced structurally,
-not by convention.** Each axis has exactly one function that can change it
-(`applyFlowStateChange`, `applyBindingFreshnessReport`,
-`applyEnforcementPromotion`), and each declares a fixed, tiny delta-key set
-(`{to, context}` / `{freshness}` / `{qualifyingRunSummary, approval}`).
-Every one of the three rejects on shape alone — before any transition logic
-runs — when the delta carries a key outside its own set. A real
-test-runner result (`{passed, bindingId, failureReason}`) shares no key
-name with any of the three sets, so it cannot even be constructed as an
-argument that would express a state change to any of them; there is no
-parameter path from "a test failed" into a state change to close off,
-because none exists to begin with. On success each function spreads the
-caller's record and replaces exactly its own key, so the other two axes
-pass through unmodified by construction. There is also no reverse-direction
-function anywhere (no "demote enforcement", no "mark stale") — the
-guarantee is the absence of the function, not a guard sitting in front of
-one.
-
-**Activation: nine requirements, all checked, first-unmet named.**
-`checkActivationRequirements(evidence)` runs all nine of the ticket's named
-requirements unconditionally (approved product behaviour, deterministic
-observability, stable interaction points, isolated data and cleanup,
-enforceable boundaries, a passing Capability Gate, a verified candidate
-Binding, current provenance, both approvals — the last one reusing
-`authority.mjs`'s `qaOwnerGate`/`technicalOwnerGate` shape directly rather
-than a bespoke boolean pair) and reports every unmet one, naming the first
-as the refusal reason. `decideFlowActivation` mirrors #150's
-`activationDecision` shape: no path returns `activate: true` with any
-requirement unmet. Note: DESIGN-dynamic-qa-spec.md §8 restates the same
-requirements at slightly finer granularity (splitting "generated/adopted
-candidate" from "isolated verification" where the ticket's own text
-combines them as "a verified candidate Binding") — not a real conflict, the
-ticket's nine-item list is what is implemented, per the run brief's
-tie-break rule.
-
-**Flow State transitions** follow DESIGN-dynamic-qa-spec.md §8's table
-exactly (`retired` never appears as a `from`, which is the whole terminal
-rule). `active -> deferred` refuses when `suspension.reason` is
-`test-failure`/`flaky`/`slow`/`inconvenient` — suspension is an exceptional
-reviewed decision the flow genuinely cannot run, never a red-suite escape
-hatch. `-> retired` requires `retirement.approvedBy` plus
-`bindingRemoved: true` and `ciEnrollmentRemoved: true` together, and
-returns an `auditRecord` on success — retirement is a reviewed contract
-change, never implicit.
-
-**Brownfield vs. greenfield:** `resolveActivationEnforcementDefault`
-returns `advisory` for `"brownfield"`, `required` for `"greenfield"`, and
-refuses (`enforcementState: null`) on anything else rather than guessing a
-third default.
-
-**Promotion models exactly the ticket's own gate, not the pilot's full
-measurement.** DESIGN-dynamic-qa-spec.md §8's full Burn-in Qualification
-(14 days, 20 Qualifying Runs, five commits, 100 executions, ≤1%
-flake/false-positive, PR-fast p95 budget, continuous safety/provenance
-health, ...) is explicitly the pilot's job (#171-175) — nobody fabricates
-that measurement here. `decidePromotion({ qualifyingRunSummary, approval })`
-requires both `qualifyingCount >= MIN_QUALIFYING_RUNS` (20) and an explicit
-`{ granted: true, approver }`; the parameter shape has no `elapsedDays` or
-`greenStreak` field at all, so neither can promote alone — the exclusion is
-structural, same technique as the cross-axis-write guard above.
-
-**Seams left for #161 and #172:** no on-disk storage/schema wiring (this
-module operates on plain in-memory lifecycle records and evidence a caller
-assembles); no `qa-setup`/`qa-generate` `SKILL.md` wiring (neither file was
-touched, per this ticket's coordination note); the nine activation
-booleans (`capabilityGatePassed`, `provenanceCurrent`, etc.) are entirely
-caller-supplied — wiring them to real `runCapabilityGate` (#150) and
-`evaluateBindingDrift` (#148) results is left to the caller; quarantine and
-Failure Owner/Repeatability are explicitly out of scope (#158's territory)
-and this module's guarantees hold regardless of how #158 eventually
-classifies a failure, because no failure-shaped object can be expressed as
-a delta to any axis to begin with.
-## 27. qa-setup stage 9 provider-native CI design (#168)
-
-**Ordering is structural, not a convention.** `shared/scripts/ci-design.mjs`'s
-`designProviderNativeCI` throws unless
-`portfolioApproval.portfolioFullyApproved === true` (#165's own field) —
-there is no code path that reaches lane assignment, the smallest-diff
-choice, or the proposal artifact for a portfolio with any flow still in
-`draftFlowIds`. This is deliberately stronger than #166's per-flow gate:
-SPEC-135 story 45 is about the whole portfolio, not one flow's readiness.
-
-**Real lane assignment is this ticket's own job, not #165's
-`classifyCandidateLane`.** #165 was explicit that its lane signal
-(`pr-fast-candidate` / `nightly-candidate`) is a coherence check only, with
-no lane/trigger concept in its schema. `assignFlowLane` treats that signal
-as one input among three: the required trigger it implies, whether the
-flow's own #166 `designExecutionProfile` result actually activated, and
-whether #153's GitHub Actions adapter can render that trigger today
-(`SUPPORTED_TRIGGERS` vs. `DEFERRED_TRIGGERS`). A flow failing either of
-the latter two never gets a lane; `assigned: false` always names why
-(`execution-profile-not-activatable` or
-`trigger-not-yet-supported-by-adapter`, with the exact deferred-trigger
-label in the second case).
-
-**Not hard-coded to "only pull_request exists."** `LANE_TRIGGERS` names all
-four Provider-native CI exposures (PR-fast, nightly-full, manual,
-merge-queue) up front. Availability is decided at call time against
-caller-supplied `supportedTriggers`/`deferredTriggers` (defaulted to, never
-copied from, #153's own exported lists) — this is the concrete seam for
-#154's concurrent work: once the adapter's `SUPPORTED_TRIGGERS` grows, this
-module's lane assignment widens automatically, with a dedicated test
-(`assignFlowLane picks up a newly supported trigger with no code change`)
-proving it.
-
-**Smallest diff is decided on real numbers, not a reflexive new file.**
-`summarizeCiInventory` groups #162's own CI Facts
-(`inventory-ci.mjs`'s `scanCiWorkflows`) by each fact's own `evidence`
-field to reconstruct which existing workflow already has which
-trigger/runner. `chooseSmallestDiff` scores every workflow with a real,
-hosted runner as an amend candidate (its estimated diff is the job-block
-slice of the exact YAML `renderAdvisoryPullRequestLane`, #153, would
-produce for a new file, plus a small named constant only when the required
-trigger is not already present) against that same renderer's actual
-full-file line count, and prefers amend on a tie or smaller estimate.
-Applied to this repository, `.github/workflows/acceptance.yml` already has
-a matching `pull_request` trigger and a real hosted runner (`macos-14`) —
-amending it, not adding `dynamic-qa.yml`, is what stage 9 proposes here. A
-self-hosted-only workflow is never proposed as an amend target. Tested both
-ways: amend-preferred (an eligible, matching existing workflow) and
-new-file (no eligible workflow inventoried, and separately, a self-hosted-
-only workflow).
-
-**The proposal cites only real, inventoried infrastructure.**
-`namedInfrastructure` (runners, environments, triggers, existing workflow
-paths) is read straight from the CI Facts summary, never invented.
-`runnerMatchesInventory` separately flags when an Execution Profile's own
-`runnerClass` was never actually observed in the CI inventory, rather than
-silently treating an unobserved runner as reusable.
-
-**`qa-setup/SKILL.md` stage 9 is filled in.** Its own STATUS line and stage
-8 cross-reference are corrected too (ticket #167 had already landed stage
-8's content but left STATUS saying "stages 1–7 built... 8–10 remain
-placeholders" — a stale line this ticket did not want stage 10's future
-implementer to trust).
-
-**Only the advisory lane is ever proposed** (`enforcementState:
-"advisory"` on every assigned lane) — #153 built no required/quarantine
-renderer, and inventing an enforcement state this module cannot actually
-render would be exactly the kind of guess the run brief forbids.
-
-**Seams left for #169 and beyond:**
-- No actual amend-renderer exists — this module decides whether to amend
-  and estimates its size, but producing the exact merged YAML for an
-  existing third-party workflow file is left to whichever ticket wires
-  this proposal into a real patch (stage 10's Setup Review Packet, or a
-  later `qa-generate` step).
-- Nightly-full, manual/API, and merge-group lanes stay `assigned: false`
-  until #154 lands their triggers in the adapter.
-- `github-actions-workflow.mjs` and `github-actions-adapter.mjs` are
-  untouched by this ticket — #154/#155's concurrent edits to those modules
-  land independently; this ticket only ever calls their exported
-  functions/constants.
-## 24. Low-trust hardening and diagnostics scrubbing (#155)
-
-**Completes #153's hardening with allowlisting, and adds the diagnostics
-scrub/suppress gate the spec's §11 "Safe execution" requires.** Two new
-modules, both reusing rather than duplicating what #144/#151/#153 already
-built: `shared/scripts/diagnostics-scrub.mjs` and
-`shared/scripts/workflow-hardening.mjs`. No edit was needed to
-`github-actions-workflow.mjs` — the new module imports only its
-already-exported `CHECKOUT_ACTION_SHA`/`SETUP_NODE_ACTION_SHA` constants, so
-concurrent work on that file (#154) is untouched.
-
-**Diagnostics scrubbing reuses #144's secret detector, not a second one.**
-`secret-detection.mjs` gained two free-text variants of its existing
-patterns — `redactSecretsInText` (finds and replaces every secret-shaped
-substring in a blob) and `textStillContainsSecretShapedValue` (re-scans for
-verification) — because `detectSecretValue` only judges one anchored
-scalar, and a log/DOM/trace/JUnit body is prose containing many values.
-Every pattern mirrored down is the exact same rule, never a new one.
-
-**The five diagnostic kinds this ticket names split into exactly two
-buckets, matching the spec's two retention windows:** rich (log, dom,
-trace, screenshot — off by default, failure-only when enabled, 7-day
-retention) and bundle (junit — always produced, scrubbed, 30-day
-retention). `prepareDiagnosticForUpload(kind, diagnostic, opts)` is the
-single entry point; `buildDiagnosticsManifest` turns a caller's list into
-an exact (never globbed) artifact manifest plus a withheld list with named
-reasons.
-
-**Scrub failure suppresses upload — structurally, not by convention.**
-`prepareDiagnosticForUpload` is the only function that can return
-`{ upload: true, artifact }`, and every text-kind path reaches that only
-after `redactSecretsInText` runs AND `textStillContainsSecretShapedValue`
-re-scans the redacted output and returns `false`. No branch skips the
-re-scan; no other exported function hands back raw or redacted content, so
-there is no side door to an unscrubbed upload. Screenshots (the one binary
-kind) have no in-process scrub at all — no image parser exists or will be
-added — so they are suppressed outright absent an explicit,
-externally-verified `verifiedRedacted: true`; suppression is their only
-possible outcome from this module, never redaction. An oversized artifact
-is likewise suppressed rather than truncated, since truncation could cut a
-redaction placeholder in half. The one dependency-injection seam
-(`opts.verify`) exists solely so this ticket's own tests can force the
-"cannot trust this scrub" branch deterministically; production callers
-never override it.
-
-**Action/reusable-workflow allowlisting completes #153's SHA-pinning.**
-`checkActionAndReusableWorkflowAllowlist` scans every `uses:` reference
-(action step or reusable-workflow call — identical YAML shape) and names,
-individually: `action.not-pinned`, `action.not-allowlisted`, and
-`action.sha-mismatch` (an allowlisted identity re-pinned to an unapproved
-SHA needs fresh approval, not silent acceptance).
-`DEFAULT_ALLOWLISTED_ACTIONS` names exactly #153's two actions; growing it
-is an explicit caller choice, never assumed.
-
-**A privileged lane refuses low-trust code and artifacts, on both the
-YAML-shape and the data axis.** `checkPrivilegedLaneRefusesLowTrustBridge`
-detects the "pwn request" bridge shape in workflow text: a privileged job
-(secrets/OIDC/protected-environment/write-permission) declared alongside a
-`pull_request_target`/`workflow_run` trigger, or downloading an artifact
-with no visible Result Envelope validation reference.
-`assertPrivilegedJobRefusesArtifact` is the structured-data form, composing
-trust-zones.mjs's `checkPrivilegedLaneArtifact` (#151) directly — the sole
-gate, never re-implemented. The advisory PR lane itself is proven, by this
-ticket's test, to carry none of the six privileged identities an unreviewed
-PR job must never receive, reusing `checkWorkflowHardening` rather than a
-hand-rolled re-scan.
-
-**Seams for #156/#170:** no required/quarantine lane renderer exists yet to
-wire the bridge check against beyond this ticket's own fixtures; no caller
-wires `prepareDiagnosticForUpload`/`buildDiagnosticsManifest` into a real
-generated workflow step, the Failure Evidence Bundle schema (§5.6), or
-`retention-days` on a rendered `actions/upload-artifact` step; no real
-Playwright trace/DOM/screenshot capture pipeline feeds this module's
-`{ text }`/`{ bytes, verifiedRedacted }` shape yet. Per the run brief,
-`qa-generate/SKILL.md` was deliberately not edited — see
-`shared/references/diagnostics-and-hardening.md`'s closing section for the
-exact placeholder text a later coordinated edit should add to that
-skill's step 5.
 ## 23. Nightly, manual and merge-group lanes (#154)
 
 Completes DESIGN-dynamic-qa-spec.md §8's four Provider-native CI exposures:
@@ -1799,64 +1486,325 @@ new REQUIRED renderer, for merge-group). Impact-path-based Binding selection,
 full semantic inventory of third-party workflow YAML, and action-pin
 freshness re-verification remain exactly as #153 left them.
 
-## 29. Quarantine overlay (#161)
+## 24. Low-trust hardening and diagnostics scrubbing (#155)
 
-`shared/scripts/quarantine.mjs` (37 tests), schema
-`shared/schemas/dynamic-qa-quarantine-v1.schema.json`, reference
-`shared/references/quarantine.md`.
+**Completes #153's hardening with allowlisting, and adds the diagnostics
+scrub/suppress gate the spec's §11 "Safe execution" requires.** Two new
+modules, both reusing rather than duplicating what #144/#151/#153 already
+built: `shared/scripts/diagnostics-scrub.mjs` and
+`shared/scripts/workflow-hardening.mjs`. No edit was needed to
+`github-actions-workflow.mjs` — the new module imports only its
+already-exported `CHECKOUT_ACTION_SHA`/`SETUP_NODE_ACTION_SHA` constants, so
+concurrent work on that file (#154) is untouched.
 
-**Overlay, not a fourth axis.** This module imports no mutator from
-`lifecycle-state.mjs` (#157) and exports none of its own. A Quarantine
-Record's full key set (`QUARANTINE_KEYS`) shares no key with any of the
-three axes' delta shapes (`{to,context}` / `{freshness}` /
-`{qualifyingRunSummary,approval}`), proven by
-`quarantineSharesNoKeyWithLifecycleAxisDeltas()` and by three tests that
-pass a real Quarantine Record straight into `applyFlowStateChange`,
-`applyBindingFreshnessReport`, and `applyEnforcementPromotion` and confirm
-each refuses it on foreign keys alone.
+**Diagnostics scrubbing reuses #144's secret detector, not a second one.**
+`secret-detection.mjs` gained two free-text variants of its existing
+patterns — `redactSecretsInText` (finds and replaces every secret-shaped
+substring in a blob) and `textStillContainsSecretShapedValue` (re-scans for
+verification) — because `detectSecretValue` only judges one anchored
+scalar, and a log/DOM/trace/JUnit body is prose containing many values.
+Every pattern mirrored down is the exact same rule, never a new one.
 
-**Both approvals, always already granted.** `createQuarantineRecord` is the
-only constructor and reuses `authority.mjs`'s `qaOwnerGate`/
-`technicalOwnerGate` shape, tightened so both gates must already be
-`present:true` with a named `identifier` — there is no pending/partial
-state a caller can construct a valid record from. No function anywhere in
-the bundle derives a Quarantine Record automatically from a Diagnosis
-Record or a failed run; quarantine is always this explicit human call.
+**The five diagnostic kinds this ticket names split into exactly two
+buckets, matching the spec's two retention windows:** rich (log, dom,
+trace, screenshot — off by default, failure-only when enabled, 7-day
+retention) and bundle (junit — always produced, scrubbed, 30-day
+retention). `prepareDiagnosticForUpload(kind, diagnostic, opts)` is the
+single entry point; `buildDiagnosticsManifest` turns a caller's list into
+an exact (never globbed) artifact manifest plus a withheld list with named
+reasons.
 
-**Default seven-day expiry, fail-closed on both expiry and malformed
-shape.** `DEFAULT_QUARANTINE_DAYS = 7`; `defaultExpiry(startAt)` computes
-it when a caller omits `expiresAt`. `isQuarantineActive(record, now)`
-returns `{active:false, reason:"expired"}` once `now >= expiresAt`, and
-`{active:false, reason:"malformed"}` for any record failing
-`validateQuarantineRecord` (missing approval, bad timestamp, wrong
-`effectiveLane`, etc.) — both collapse to the same "no exception" outcome
-for every downstream function; there is no third, more permissive state.
+**Scrub failure suppresses upload — structurally, not by convention.**
+`prepareDiagnosticForUpload` is the only function that can return
+`{ upload: true, artifact }`, and every text-kind path reaches that only
+after `redactSecretsInText` runs AND `textStillContainsSecretShapedValue`
+re-scans the redacted output and returns `false`. No branch skips the
+re-scan; no other exported function hands back raw or redacted content, so
+there is no side door to an unscrubbed upload. Screenshots (the one binary
+kind) have no in-process scrub at all — no image parser exists or will be
+added — so they are suppressed outright absent an explicit,
+externally-verified `verifiedRedacted: true`; suppression is their only
+possible outcome from this module, never redaction. An oversized artifact
+is likewise suppressed rather than truncated, since truncation could cut a
+redaction placeholder in half. The one dependency-injection seam
+(`opts.verify`) exists solely so this ticket's own tests can force the
+"cannot trust this scrub" branch deterministically; production callers
+never override it.
 
-**Never counts as pass, coverage, or qualification — proven three ways.**
-`quarantineReportStatus` hard-codes `countsAsPass`/`countsAsCoverage`/
-`countsAsQualifying` to the literal `false` whenever quarantine is active,
-regardless of the caller's own `testPassed` value.
-`contributesToCoverage` returns `false` for any actively-quarantined
-`bindingId`. `excludeQuarantinedFromQualifyingRuns` /
-`summarizeQualifyingRunsExcludingQuarantine` filter matching runs out
-*before* handing the rest to #157's own, unmodified `isQualifyingRun` /
-`summarizeQualifyingRuns` — reusing that Qualifying Run model exactly,
-rather than re-implementing it, to prove a quarantined Binding cannot
-qualify.
+**Action/reusable-workflow allowlisting completes #153's SHA-pinning.**
+`checkActionAndReusableWorkflowAllowlist` scans every `uses:` reference
+(action step or reusable-workflow call — identical YAML shape) and names,
+individually: `action.not-pinned`, `action.not-allowlisted`, and
+`action.sha-mismatch` (an allowlisted identity re-pinned to an unapproved
+SHA needs fresh approval, not silent acceptance).
+`DEFAULT_ALLOWLISTED_ACTIONS` names exactly #153's two actions; growing it
+is an explicit caller choice, never assumed.
 
-**Visibility.** `describeQuarantineForReporting` always names the
-`flowId`/`bindingId` and the exact reason (`active` / `expired` /
-`malformed`), even for a malformed record, with `missingProtection: true`
-on an active quarantine — a quarantined flow never silently disappears
-from a report.
+**A privileged lane refuses low-trust code and artifacts, on both the
+YAML-shape and the data axis.** `checkPrivilegedLaneRefusesLowTrustBridge`
+detects the "pwn request" bridge shape in workflow text: a privileged job
+(secrets/OIDC/protected-environment/write-permission) declared alongside a
+`pull_request_target`/`workflow_run` trigger, or downloading an artifact
+with no visible Result Envelope validation reference.
+`assertPrivilegedJobRefusesArtifact` is the structured-data form, composing
+trust-zones.mjs's `checkPrivilegedLaneArtifact` (#151) directly — the sole
+gate, never re-implemented. The advisory PR lane itself is proven, by this
+ticket's test, to carry none of the six privileged identities an unreviewed
+PR job must never receive, reusing `checkWorkflowHardening` rather than a
+hand-rolled re-scan.
 
-**Coordination note:** neither `SKILL.md` was touched (per this ticket's
-coordination note); the existing repair-mode placeholder text in
-`qa-generate/SKILL.md` ("failure evidence, diagnosis, proposal-only
-repair, negative-control gate, and quarantine validation") is unchanged.
-Failure Evidence Bundle modeling is #159's territory and is not
-duplicated here — `originatingFailureRef` is only a stable pointer.
+**Seams for #156/#170:** no required/quarantine lane renderer exists yet to
+wire the bridge check against beyond this ticket's own fixtures; no caller
+wires `prepareDiagnosticForUpload`/`buildDiagnosticsManifest` into a real
+generated workflow step, the Failure Evidence Bundle schema (§5.6), or
+`retention-days` on a rendered `actions/upload-artifact` step; no real
+Playwright trace/DOM/screenshot capture pipeline feeds this module's
+`{ text }`/`{ bytes, verifiedRedacted }` shape yet. Per the run brief,
+`qa-generate/SKILL.md` was deliberately not edited — see
+`shared/references/diagnostics-and-hardening.md`'s closing section for the
+exact placeholder text a later coordinated edit should add to that
+skill's step 5.
+## 25. Flow State, Binding Freshness and Enforcement State (#157)
 
+**Three axes, three existing owners — nothing redeclared.** `Flow State`
+(`draft`/`deferred`/`active`/`retired`) already lives in
+`flow-definition.mjs`'s `FLOW_STATES` (#143); `Binding Freshness`
+(`absent`/`current`/`stale`) is already mechanically derived by
+`drift-gate.mjs`'s `FRESHNESS_STATES` (#148); `Enforcement State`
+(`advisory`/`required`) already lives in `provenance.mjs`'s
+`ENFORCEMENT_LANES` (#146/#153). New module `shared/scripts/lifecycle-
+state.mjs` (43 tests, `lifecycle-state.test.mjs`) re-exports all three
+rather than inventing a fourth copy, and adds only the rules layer: allowed
+Flow State transitions, the nine-requirement Activation checklist,
+brownfield/greenfield enforcement defaults, and Qualifying-Run-based
+promotion. Reference: `shared/references/lifecycle-axes.md`.
+
+**"A failure must never silently rewrite policy" is enforced structurally,
+not by convention.** Each axis has exactly one function that can change it
+(`applyFlowStateChange`, `applyBindingFreshnessReport`,
+`applyEnforcementPromotion`), and each declares a fixed, tiny delta-key set
+(`{to, context}` / `{freshness}` / `{qualifyingRunSummary, approval}`).
+Every one of the three rejects on shape alone — before any transition logic
+runs — when the delta carries a key outside its own set. A real
+test-runner result (`{passed, bindingId, failureReason}`) shares no key
+name with any of the three sets, so it cannot even be constructed as an
+argument that would express a state change to any of them; there is no
+parameter path from "a test failed" into a state change to close off,
+because none exists to begin with. On success each function spreads the
+caller's record and replaces exactly its own key, so the other two axes
+pass through unmodified by construction. There is also no reverse-direction
+function anywhere (no "demote enforcement", no "mark stale") — the
+guarantee is the absence of the function, not a guard sitting in front of
+one.
+
+**Activation: nine requirements, all checked, first-unmet named.**
+`checkActivationRequirements(evidence)` runs all nine of the ticket's named
+requirements unconditionally (approved product behaviour, deterministic
+observability, stable interaction points, isolated data and cleanup,
+enforceable boundaries, a passing Capability Gate, a verified candidate
+Binding, current provenance, both approvals — the last one reusing
+`authority.mjs`'s `qaOwnerGate`/`technicalOwnerGate` shape directly rather
+than a bespoke boolean pair) and reports every unmet one, naming the first
+as the refusal reason. `decideFlowActivation` mirrors #150's
+`activationDecision` shape: no path returns `activate: true` with any
+requirement unmet. Note: DESIGN-dynamic-qa-spec.md §8 restates the same
+requirements at slightly finer granularity (splitting "generated/adopted
+candidate" from "isolated verification" where the ticket's own text
+combines them as "a verified candidate Binding") — not a real conflict, the
+ticket's nine-item list is what is implemented, per the run brief's
+tie-break rule.
+
+**Flow State transitions** follow DESIGN-dynamic-qa-spec.md §8's table
+exactly (`retired` never appears as a `from`, which is the whole terminal
+rule). `active -> deferred` refuses when `suspension.reason` is
+`test-failure`/`flaky`/`slow`/`inconvenient` — suspension is an exceptional
+reviewed decision the flow genuinely cannot run, never a red-suite escape
+hatch. `-> retired` requires `retirement.approvedBy` plus
+`bindingRemoved: true` and `ciEnrollmentRemoved: true` together, and
+returns an `auditRecord` on success — retirement is a reviewed contract
+change, never implicit.
+
+**Brownfield vs. greenfield:** `resolveActivationEnforcementDefault`
+returns `advisory` for `"brownfield"`, `required` for `"greenfield"`, and
+refuses (`enforcementState: null`) on anything else rather than guessing a
+third default.
+
+**Promotion models exactly the ticket's own gate, not the pilot's full
+measurement.** DESIGN-dynamic-qa-spec.md §8's full Burn-in Qualification
+(14 days, 20 Qualifying Runs, five commits, 100 executions, ≤1%
+flake/false-positive, PR-fast p95 budget, continuous safety/provenance
+health, ...) is explicitly the pilot's job (#171-175) — nobody fabricates
+that measurement here. `decidePromotion({ qualifyingRunSummary, approval })`
+requires both `qualifyingCount >= MIN_QUALIFYING_RUNS` (20) and an explicit
+`{ granted: true, approver }`; the parameter shape has no `elapsedDays` or
+`greenStreak` field at all, so neither can promote alone — the exclusion is
+structural, same technique as the cross-axis-write guard above.
+
+**Seams left for #161 and #172:** no on-disk storage/schema wiring (this
+module operates on plain in-memory lifecycle records and evidence a caller
+assembles); no `qa-setup`/`qa-generate` `SKILL.md` wiring (neither file was
+touched, per this ticket's coordination note); the nine activation
+booleans (`capabilityGatePassed`, `provenanceCurrent`, etc.) are entirely
+caller-supplied — wiring them to real `runCapabilityGate` (#150) and
+`evaluateBindingDrift` (#148) results is left to the caller; quarantine and
+Failure Owner/Repeatability are explicitly out of scope (#158's territory)
+and this module's guarantees hold regardless of how #158 eventually
+classifies a failure, because no failure-shaped object can be expressed as
+a delta to any axis to begin with.
+## 26. Failure diagnosis axes (#158)
+
+**Failure Owner and Repeatability are two genuinely independent axes, and
+Failure Class is derived, never assigned** (DESIGN-dynamic-qa-spec.md §5.6
+and §12). `shared/scripts/diagnosis.mjs`'s `deriveFailureClass(owner,
+repeatability)` is the single source of truth for the full 4 x 3 = 12
+combinations — the design table's own collapsed rows ("Product / any",
+"Binding or Environment / intermittent") are expanded here explicitly so
+every combination has exactly one documented answer, not an inferred one.
+Schema: `shared/schemas/dynamic-qa-diagnosis-v1.schema.json` (human-readable
+contract only, same split as every other schema in this bundle — the actual
+hand-written, fail-closed validation is `validateDiagnosisRecord`).
+
+**A retry pass never proves flake — enforced structurally, not by
+convention.** The Diagnosis Record's `repeatabilityBasis` field names what
+actually grounds a repeatability call (`retry-pass | reproduction |
+hypothesis-probe | historical-evidence | external-report |
+insufficient-evidence`). `validateDiagnosisRecord` rejects any record where
+`repeatabilityBasis === "retry-pass"` and `repeatability !== "unknown"` — a
+single passing retry can justify neither "intermittent" (flake) nor
+"deterministic" (fixed). The retry itself is still recorded honestly, as an
+attempt of `kind: "retry"` in the record's own `attempts` list; nothing in
+this module derives a repeatability conclusion from that list.
+
+**A failed attempt stays failed, by construction of an append-only API, not
+by promise.** `attempts` only grows via `appendAttempt`, which re-freezes
+every prior entry and copies it verbatim rather than editing in place,
+and refuses a second `kind: "original"` attempt outright (there is no
+function anywhere in this module that can replace or edit an existing
+entry). `assertOriginalAttemptStaysFailed(before, after)` compares the
+`original` attempt across two attempts-list snapshots and throws on any
+field drift, including a changed verdict. Verified across the full
+retry -> repair-verification -> quarantine-check sequence in
+`diagnosis.test.mjs`.
+
+**Routing by owner is structural, not a policy note.** A Product Regression
+carries no Binding-mutation field anywhere on the Diagnosis Record schema —
+there is nowhere to put one, so a test cannot hide changed behaviour even
+by accident. An Environment Failure (`owner: "environment"`) requires a
+non-empty `failedCapability` — the validator rejects a vague "infra
+flaked". Binding Defect is the only class this ticket makes eligible for
+repair.
+
+**Repair eligibility defaults to ineligible.** `isRepairEligible(record)`
+first runs the record through `validateDiagnosisRecord` (a malformed record
+is ineligible, full stop), then requires simultaneously `status ===
+"confirmed"`, `owner === "binding"`, and `failureClass ===
+"binding-defect"`. This is narrower than "any confirmed Binding-owned
+diagnosis": the `binding` + `intermittent` (Test Flake) combination is
+confirmed and Binding-owned but is **not** granted general repair
+eligibility here — DESIGN-dynamic-qa-spec.md §12's policy table names a
+distinct, narrower "optional Binding stabilization" action for that row,
+left for #159/#160 to build if they choose to. `isRepairEligible` never
+throws; an input it cannot make sense of is ineligible, not an exception a
+caller must remember to catch.
+
+**`qa-generate/SKILL.md` was not touched** (owned elsewhere per run
+coordination). Its repair-mode step 3 placeholder — "Diagnose Failure Owner
+and Repeatability, emit a Diagnosis Record — placeholder, same scope." —
+and step 4's gate placeholder are the exact seams a later wiring ticket
+should replace with calls into `deriveFailureClass` /
+`validateDiagnosisRecord` / `isRepairEligible`. See
+`shared/references/failure-diagnosis.md` for the full routing table and
+the seam note.
+
+**Not built here (left for #159/#160/#157):** the actual repair proposal,
+negative-control gate, and Repair Review Packet (#159/#160); Quarantine
+Record shape and expiry (#157's territory — Flow State / Binding Freshness
+/ Enforcement State lifecycle axes are deliberately not modelled by this
+module); a Failure Evidence Bundle schema/validator (referenced by DESIGN
+§5.6 as a companion artifact, distinct from the Diagnosis Record this
+ticket builds); and wiring this module's functions into
+`qa-generate/SKILL.md`'s actual step sequence.
+## 27. qa-setup stage 9 provider-native CI design (#168)
+
+**Ordering is structural, not a convention.** `shared/scripts/ci-design.mjs`'s
+`designProviderNativeCI` throws unless
+`portfolioApproval.portfolioFullyApproved === true` (#165's own field) —
+there is no code path that reaches lane assignment, the smallest-diff
+choice, or the proposal artifact for a portfolio with any flow still in
+`draftFlowIds`. This is deliberately stronger than #166's per-flow gate:
+SPEC-135 story 45 is about the whole portfolio, not one flow's readiness.
+
+**Real lane assignment is this ticket's own job, not #165's
+`classifyCandidateLane`.** #165 was explicit that its lane signal
+(`pr-fast-candidate` / `nightly-candidate`) is a coherence check only, with
+no lane/trigger concept in its schema. `assignFlowLane` treats that signal
+as one input among three: the required trigger it implies, whether the
+flow's own #166 `designExecutionProfile` result actually activated, and
+whether #153's GitHub Actions adapter can render that trigger today
+(`SUPPORTED_TRIGGERS` vs. `DEFERRED_TRIGGERS`). A flow failing either of
+the latter two never gets a lane; `assigned: false` always names why
+(`execution-profile-not-activatable` or
+`trigger-not-yet-supported-by-adapter`, with the exact deferred-trigger
+label in the second case).
+
+**Not hard-coded to "only pull_request exists."** `LANE_TRIGGERS` names all
+four Provider-native CI exposures (PR-fast, nightly-full, manual,
+merge-queue) up front. Availability is decided at call time against
+caller-supplied `supportedTriggers`/`deferredTriggers` (defaulted to, never
+copied from, #153's own exported lists) — this is the concrete seam for
+#154's concurrent work: once the adapter's `SUPPORTED_TRIGGERS` grows, this
+module's lane assignment widens automatically, with a dedicated test
+(`assignFlowLane picks up a newly supported trigger with no code change`)
+proving it.
+
+**Smallest diff is decided on real numbers, not a reflexive new file.**
+`summarizeCiInventory` groups #162's own CI Facts
+(`inventory-ci.mjs`'s `scanCiWorkflows`) by each fact's own `evidence`
+field to reconstruct which existing workflow already has which
+trigger/runner. `chooseSmallestDiff` scores every workflow with a real,
+hosted runner as an amend candidate (its estimated diff is the job-block
+slice of the exact YAML `renderAdvisoryPullRequestLane`, #153, would
+produce for a new file, plus a small named constant only when the required
+trigger is not already present) against that same renderer's actual
+full-file line count, and prefers amend on a tie or smaller estimate.
+Applied to this repository, `.github/workflows/acceptance.yml` already has
+a matching `pull_request` trigger and a real hosted runner (`macos-14`) —
+amending it, not adding `dynamic-qa.yml`, is what stage 9 proposes here. A
+self-hosted-only workflow is never proposed as an amend target. Tested both
+ways: amend-preferred (an eligible, matching existing workflow) and
+new-file (no eligible workflow inventoried, and separately, a self-hosted-
+only workflow).
+
+**The proposal cites only real, inventoried infrastructure.**
+`namedInfrastructure` (runners, environments, triggers, existing workflow
+paths) is read straight from the CI Facts summary, never invented.
+`runnerMatchesInventory` separately flags when an Execution Profile's own
+`runnerClass` was never actually observed in the CI inventory, rather than
+silently treating an unobserved runner as reusable.
+
+**`qa-setup/SKILL.md` stage 9 is filled in.** Its own STATUS line and stage
+8 cross-reference are corrected too (ticket #167 had already landed stage
+8's content but left STATUS saying "stages 1–7 built... 8–10 remain
+placeholders" — a stale line this ticket did not want stage 10's future
+implementer to trust).
+
+**Only the advisory lane is ever proposed** (`enforcementState:
+"advisory"` on every assigned lane) — #153 built no required/quarantine
+renderer, and inventing an enforcement state this module cannot actually
+render would be exactly the kind of guess the run brief forbids.
+
+**Seams left for #169 and beyond:**
+- No actual amend-renderer exists — this module decides whether to amend
+  and estimates its size, but producing the exact merged YAML for an
+  existing third-party workflow file is left to whichever ticket wires
+  this proposal into a real patch (stage 10's Setup Review Packet, or a
+  later `qa-generate` step).
+- Nightly-full, manual/API, and merge-group lanes stay `assigned: false`
+  until #154 lands their triggers in the adapter.
+- `github-actions-workflow.mjs` and `github-actions-adapter.mjs` are
+  untouched by this ticket — #154/#155's concurrent edits to those modules
+  land independently; this ticket only ever calls their exported
+  functions/constants.
 ## 28. Failure Evidence Bundle (#159)
 
 **Repair is explicitly invoked with a strict Failure Evidence Bundle;
@@ -1917,6 +1865,64 @@ repair-execution behavior, not a bundle-shape property, and belongs to
 unedited per coordination — see `shared/references/failure-evidence.md`
 for the exact repair-mode step 1 / step 4 placeholder text this ticket
 leaves in place.
+
+## 29. Quarantine overlay (#161)
+
+`shared/scripts/quarantine.mjs` (37 tests), schema
+`shared/schemas/dynamic-qa-quarantine-v1.schema.json`, reference
+`shared/references/quarantine.md`.
+
+**Overlay, not a fourth axis.** This module imports no mutator from
+`lifecycle-state.mjs` (#157) and exports none of its own. A Quarantine
+Record's full key set (`QUARANTINE_KEYS`) shares no key with any of the
+three axes' delta shapes (`{to,context}` / `{freshness}` /
+`{qualifyingRunSummary,approval}`), proven by
+`quarantineSharesNoKeyWithLifecycleAxisDeltas()` and by three tests that
+pass a real Quarantine Record straight into `applyFlowStateChange`,
+`applyBindingFreshnessReport`, and `applyEnforcementPromotion` and confirm
+each refuses it on foreign keys alone.
+
+**Both approvals, always already granted.** `createQuarantineRecord` is the
+only constructor and reuses `authority.mjs`'s `qaOwnerGate`/
+`technicalOwnerGate` shape, tightened so both gates must already be
+`present:true` with a named `identifier` — there is no pending/partial
+state a caller can construct a valid record from. No function anywhere in
+the bundle derives a Quarantine Record automatically from a Diagnosis
+Record or a failed run; quarantine is always this explicit human call.
+
+**Default seven-day expiry, fail-closed on both expiry and malformed
+shape.** `DEFAULT_QUARANTINE_DAYS = 7`; `defaultExpiry(startAt)` computes
+it when a caller omits `expiresAt`. `isQuarantineActive(record, now)`
+returns `{active:false, reason:"expired"}` once `now >= expiresAt`, and
+`{active:false, reason:"malformed"}` for any record failing
+`validateQuarantineRecord` (missing approval, bad timestamp, wrong
+`effectiveLane`, etc.) — both collapse to the same "no exception" outcome
+for every downstream function; there is no third, more permissive state.
+
+**Never counts as pass, coverage, or qualification — proven three ways.**
+`quarantineReportStatus` hard-codes `countsAsPass`/`countsAsCoverage`/
+`countsAsQualifying` to the literal `false` whenever quarantine is active,
+regardless of the caller's own `testPassed` value.
+`contributesToCoverage` returns `false` for any actively-quarantined
+`bindingId`. `excludeQuarantinedFromQualifyingRuns` /
+`summarizeQualifyingRunsExcludingQuarantine` filter matching runs out
+*before* handing the rest to #157's own, unmodified `isQualifyingRun` /
+`summarizeQualifyingRuns` — reusing that Qualifying Run model exactly,
+rather than re-implementing it, to prove a quarantined Binding cannot
+qualify.
+
+**Visibility.** `describeQuarantineForReporting` always names the
+`flowId`/`bindingId` and the exact reason (`active` / `expired` /
+`malformed`), even for a malformed record, with `missingProtection: true`
+on an active quarantine — a quarantined flow never silently disappears
+from a report.
+
+**Coordination note:** neither `SKILL.md` was touched (per this ticket's
+coordination note); the existing repair-mode placeholder text in
+`qa-generate/SKILL.md` ("failure evidence, diagnosis, proposal-only
+repair, negative-control gate, and quarantine validation") is unchanged.
+Failure Evidence Bundle modeling is #159's territory and is not
+duplicated here — `originatingFailureRef` is only a stable pointer.
 
 ## 30. Setup Review Packet and emit-then-stop (#169)
 
@@ -2005,6 +2011,84 @@ no "apply this patch" function. `dataSets` is caller-supplied in memory
 here reads `qa/data/` from disk, since nothing is written there until this
 same emission. No Provenance Manifest (`qa/provenance.json`) is produced
 here; that begins with qa-generate's first Binding.
+## 31. Provider-neutral adapter contract (#156)
+
+Extracts DESIGN-dynamic-qa-spec.md §9's seven-point provider-neutral CI
+adapter contract from the working GitHub Actions adapter (#153/#154/#155)
+rather than designing it ahead of one, per the ticket. New modules:
+`shared/scripts/adapter-contract.mjs` (the contract: the seven points and
+six security obligations as data, plus one behavioral checker per
+point/obligation — imports nothing provider-specific), `shared/scripts/
+adapter-conformance.mjs` (`runAdapterConformanceSuite(adapter, fixtures)`,
+the single reusable entry point, always running every point and obligation
+unconditionally, mirroring `capability-gate.mjs`'s composition style), and
+`shared/scripts/fixture-adapter.mjs` (a second, independently-implemented,
+fully-conforming "fixture-ci" adapter — JSON-shaped configuration, composing
+only `capability-gate.mjs`/`diagnostics-scrub.mjs`/`junit-report.mjs`,
+nothing GitHub-specific — proving the suite is genuinely reusable and that a
+second adapter needs no bundle-internal access; deliberately not a second
+real provider, per the ticket).
+
+**GitHub Actions is refactored, not rewritten, to conform.** No pre-existing
+function's signature or behaviour changed; every pre-existing test still
+passes unmodified. `github-actions-adapter.mjs` gains an exported `adapter`
+object plus three thin, additive compositions: `planLane` (a single
+`{ lane, trigger, ... }` entry point dispatching to the same four `plan*`
+functions #153/#154 already built — the private internal composer those
+functions shared was renamed `composeLanePlan` to free the `planLane` name
+for this public one), `emitReporting` (reuses `junit-report.mjs`'s
+`parseJUnitXML`/`summarizeJUnit`), and `emitFailureBundle` (reuses
+`diagnostics-scrub.mjs`'s `buildDiagnosticsManifest` directly) — the latter
+two close the point-5 seam #155's own notes named for this ticket.
+
+**One real strengthening, not a behaviour change.** `checkGeneratedConfig
+EnforcesProfile` (point 7) now ALSO composes #155's
+`checkActionAndReusableWorkflowAllowlist` and
+`checkPrivilegedLaneRefusesLowTrustBridge` — both existed since #155 but
+were never wired into this adapter's own enforcement gate. Every lane this
+adapter has ever rendered already satisfies both (only the two
+`DEFAULT_ALLOWLISTED_ACTIONS` entries are ever emitted, pinned to the exact
+SHAs that allowlist approves; no lane declares `pull_request_target`/
+`workflow_run` alongside a privileged job), so no existing assertion's
+expected result changes — what changes is that a configuration violating
+either property, previously invisible to this gate, is now caught. Portability
+must not weaken security; closing this seam is exactly what the ticket
+requires.
+
+**The six security obligations are fail-closed, never "untestable = fine".**
+Exact egress, minimal permissions, immutable pins, no-persisted-credential,
+privileged/low-trust separation, and diagnostics scrubbing each have their
+own named checker in `adapter-contract.mjs`. An adapter (or a fixtures bag)
+that cannot even be probed for an obligation FAILS that obligation — there is
+no path that treats an untestable adapter as presumed conformant. Diagnostics
+scrubbing is proven via `diagnostics-scrub.mjs`'s own documented test seam
+(forcing `opts.verify` to report failure) rather than depending on
+`secret-detection.mjs`'s exact regex coverage — a conforming
+`emitFailureBundle` must withhold every diagnostic when the scrub gate is
+forced to fail; a "rubber stamp" that bypasses the gate does not.
+
+**Quarantine-lane rendering remains an explicit seam**, declared via
+`DEFERRED_LANES = ["quarantine"]` on the GitHub Actions adapter (mirroring
+`DEFERRED_TRIGGERS`'s pattern) — not built here, matching #153/#154's own
+notes that this remains open for a later ticket.
+
+**Documentation:** prose lives in the new `shared/references/
+adapter-contract.md` (the neutral adapter shape, the seven points, the six
+obligations and how each is probed, how to run the suite against an
+arbitrary adapter, and exactly what changed in the GitHub Actions adapter).
+`qa-generate/SKILL.md` and `qa-setup/SKILL.md` were NOT edited, per the run's
+coordination note for this ticket.
+
+**Tests:** `shared/scripts/adapter-conformance.test.mjs` — both the real
+GitHub Actions adapter and the fixture-ci adapter pass the full suite
+(reusability, two adapter objects); a fixture adapter missing each of the 7
+points fails conformance naming that exact point (7 tests); a "rubber stamp"
+adapter unable to enforce each of the 6 security obligations fails
+conformance for that obligation rather than degrading to a silent pass (6
+tests); a sanity check confirms the fixture-ci adapter's own real methods
+are not accidentally penalized by the obligation tests' rubber-stamp
+counterexamples.
+
 ## 32. Guarded repair and the Repair Review Packet (#160)
 
 **Repair proposes; it never applies, never heals silently, and never
@@ -2088,84 +2172,6 @@ verify one-hypothesis/protected-contracts/coverage/negative-control/
 neighbouring-coverage; emit the packet and stop) now name the exact
 functions above instead of "placeholder, same scope." #156 (adapter
 contract) and #169 (`qa-setup/SKILL.md`) were not touched.
-## 31. Provider-neutral adapter contract (#156)
-
-Extracts DESIGN-dynamic-qa-spec.md §9's seven-point provider-neutral CI
-adapter contract from the working GitHub Actions adapter (#153/#154/#155)
-rather than designing it ahead of one, per the ticket. New modules:
-`shared/scripts/adapter-contract.mjs` (the contract: the seven points and
-six security obligations as data, plus one behavioral checker per
-point/obligation — imports nothing provider-specific), `shared/scripts/
-adapter-conformance.mjs` (`runAdapterConformanceSuite(adapter, fixtures)`,
-the single reusable entry point, always running every point and obligation
-unconditionally, mirroring `capability-gate.mjs`'s composition style), and
-`shared/scripts/fixture-adapter.mjs` (a second, independently-implemented,
-fully-conforming "fixture-ci" adapter — JSON-shaped configuration, composing
-only `capability-gate.mjs`/`diagnostics-scrub.mjs`/`junit-report.mjs`,
-nothing GitHub-specific — proving the suite is genuinely reusable and that a
-second adapter needs no bundle-internal access; deliberately not a second
-real provider, per the ticket).
-
-**GitHub Actions is refactored, not rewritten, to conform.** No pre-existing
-function's signature or behaviour changed; every pre-existing test still
-passes unmodified. `github-actions-adapter.mjs` gains an exported `adapter`
-object plus three thin, additive compositions: `planLane` (a single
-`{ lane, trigger, ... }` entry point dispatching to the same four `plan*`
-functions #153/#154 already built — the private internal composer those
-functions shared was renamed `composeLanePlan` to free the `planLane` name
-for this public one), `emitReporting` (reuses `junit-report.mjs`'s
-`parseJUnitXML`/`summarizeJUnit`), and `emitFailureBundle` (reuses
-`diagnostics-scrub.mjs`'s `buildDiagnosticsManifest` directly) — the latter
-two close the point-5 seam #155's own notes named for this ticket.
-
-**One real strengthening, not a behaviour change.** `checkGeneratedConfig
-EnforcesProfile` (point 7) now ALSO composes #155's
-`checkActionAndReusableWorkflowAllowlist` and
-`checkPrivilegedLaneRefusesLowTrustBridge` — both existed since #155 but
-were never wired into this adapter's own enforcement gate. Every lane this
-adapter has ever rendered already satisfies both (only the two
-`DEFAULT_ALLOWLISTED_ACTIONS` entries are ever emitted, pinned to the exact
-SHAs that allowlist approves; no lane declares `pull_request_target`/
-`workflow_run` alongside a privileged job), so no existing assertion's
-expected result changes — what changes is that a configuration violating
-either property, previously invisible to this gate, is now caught. Portability
-must not weaken security; closing this seam is exactly what the ticket
-requires.
-
-**The six security obligations are fail-closed, never "untestable = fine".**
-Exact egress, minimal permissions, immutable pins, no-persisted-credential,
-privileged/low-trust separation, and diagnostics scrubbing each have their
-own named checker in `adapter-contract.mjs`. An adapter (or a fixtures bag)
-that cannot even be probed for an obligation FAILS that obligation — there is
-no path that treats an untestable adapter as presumed conformant. Diagnostics
-scrubbing is proven via `diagnostics-scrub.mjs`'s own documented test seam
-(forcing `opts.verify` to report failure) rather than depending on
-`secret-detection.mjs`'s exact regex coverage — a conforming
-`emitFailureBundle` must withhold every diagnostic when the scrub gate is
-forced to fail; a "rubber stamp" that bypasses the gate does not.
-
-**Quarantine-lane rendering remains an explicit seam**, declared via
-`DEFERRED_LANES = ["quarantine"]` on the GitHub Actions adapter (mirroring
-`DEFERRED_TRIGGERS`'s pattern) — not built here, matching #153/#154's own
-notes that this remains open for a later ticket.
-
-**Documentation:** prose lives in the new `shared/references/
-adapter-contract.md` (the neutral adapter shape, the seven points, the six
-obligations and how each is probed, how to run the suite against an
-arbitrary adapter, and exactly what changed in the GitHub Actions adapter).
-`qa-generate/SKILL.md` and `qa-setup/SKILL.md` were NOT edited, per the run's
-coordination note for this ticket.
-
-**Tests:** `shared/scripts/adapter-conformance.test.mjs` — both the real
-GitHub Actions adapter and the fixture-ci adapter pass the full suite
-(reusability, two adapter objects); a fixture adapter missing each of the 7
-points fails conformance naming that exact point (7 tests); a "rubber stamp"
-adapter unable to enforce each of the 6 security obligations fails
-conformance for that obligation rather than degrading to a silent pass (6
-tests); a sanity check confirms the fixture-ci adapter's own real methods
-are not accidentally penalized by the obligation tests' rubber-stamp
-counterexamples.
-
 ## 33. Untrusted-content proof (#170)
 
 The adversarial ticket: attack every already-landed defence

@@ -221,30 +221,7 @@ jobs:
     timeout-minutes: ${timeoutMinutes}
     continue-on-error: true
     steps:
-      - name: Checkout
-        uses: ${CHECKOUT_ACTION_REF}
-        with:
-          persist-credentials: false
-
-      - name: Set up Node (explicit runtime; never assumed ambient on the runner)
-        uses: ${SETUP_NODE_ACTION_REF}
-        with:
-          node-version: "${nodeVersion}"
-
-      - name: Deterministic drift gate (runs before tests)
-        run: node ${driftGateScript}
-
-      - name: Run relevant deterministic Bindings
-        run: ${testCommand}
-
-      - name: Publish native annotations
-        if: always()
-        run: node ${annotationsScript} ${junitPath}
-
-      - name: Publish job summary
-        if: always()
-        run: node ${summaryScript} ${junitPath} >> "$GITHUB_STEP_SUMMARY"
-`;
+${renderCommonSteps({ nodeVersion, driftGateScript, annotationsScript, summaryScript, testCommand, junitPath, testStepName: "Run relevant deterministic Bindings" })}`;
 }
 
 // --- ticket #154: nightly, manual/provider, and merge-group lanes ---------
