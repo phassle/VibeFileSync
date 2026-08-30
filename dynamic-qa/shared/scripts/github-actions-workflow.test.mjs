@@ -16,6 +16,8 @@ import {
   renderManualTriggerLane,
   renderMergeGroupLane,
   checkWorkflowHardening,
+  checkActionPinsResolved,
+  ACTION_PINS,
   CHECKOUT_ACTION_REF,
   SETUP_NODE_ACTION_REF,
   SAFE_PR_TRIGGER,
@@ -321,4 +323,30 @@ test("nightly lane accepts a caller-supplied cron and rejects an empty one", () 
   const yaml = renderNightlyFullSuiteLane(baseConfig({ cron: "0 6 * * 1-5" }));
   assert.ok(yaml.includes('cron: "0 6 * * 1-5"'));
   assert.throws(() => renderNightlyFullSuiteLane(baseConfig({ cron: "" })));
+});
+
+// --- finding #3, closed: placeholder action pins fail closed, never silently ---
+
+test("checkActionPinsResolved: both shipped action pins are honestly reported as unresolved placeholders until a human re-verifies each against the real upstream commit", () => {
+  // This is a TRUE statement about this bundle's current, honest state, not
+  // an aspiration: neither pin has been re-verified against a live upstream
+  // checkout (this module has zero network access and cannot do so itself).
+  // Once a human completes the steps documented beside ACTION_PINS above and
+  // flips a pin's `resolved` flag to `true`, this test must be updated to
+  // match — that is the intended, visible signal that the pin was actually
+  // resolved, not merely silently forgotten about.
+  assert.equal(ACTION_PINS.checkout.resolved, false);
+  assert.equal(ACTION_PINS.setupNode.resolved, false);
+
+  const result = checkActionPinsResolved();
+  assert.equal(result.valid, false);
+  const codes = result.errors.map((e) => e.code);
+  assert.deepEqual(codes, ["actions.placeholder-pin-unresolved", "actions.placeholder-pin-unresolved"]);
+  assert.ok(result.errors.some((e) => e.message.includes("checkout")));
+  assert.ok(result.errors.some((e) => e.message.includes("setupNode") || e.message.includes("actions/setup-node")));
+});
+
+test("checkActionPinsResolved: a hypothetical fully-resolved pin set is not flagged (proves the check reacts to the flag, not just always-fails)", () => {
+  const allResolved = { checkout: { ...ACTION_PINS.checkout, resolved: true }, setupNode: { ...ACTION_PINS.setupNode, resolved: true } };
+  assert.deepEqual(checkActionPinsResolved(allResolved), { valid: true, errors: [] });
 });

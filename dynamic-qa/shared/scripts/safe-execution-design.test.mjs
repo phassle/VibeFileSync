@@ -150,6 +150,30 @@ test("checkTrustZoneForExecution: untrusted content combined with a privileged c
   assert.ok(issues.some((i) => i.error === "trust-invariant.untrusted-content-with-privileged-identity"));
 });
 
+test("checkTrustZoneForExecution: omitting context.zone entirely produces a named zone-not-classified blocker, never a silent skip (finding #1, closed)", () => {
+  const profile = { paths: { allowedRead: [], allowedWrite: [] }, network: { mode: "none" }, credentials: {} };
+  // contentSource is deliberately TRUSTED so checkHardSecurityInvariant stays
+  // silent, isolating exactly what omitting context.zone alone would lose.
+  const issues = checkTrustZoneForExecution(profile, { contentSource: "reviewed-base-branch" });
+  assert.ok(
+    issues.some((i) => i.error === "zone-not-classified"),
+    "an omitted context.zone must itself surface as a named trust-zone issue",
+  );
+});
+
+test("designExecutionProfile: omitting context.zone defers the flow — checkAuthoringAuthority/checkVerificationCompute/checkPrivilegedLaneArtifact can never be silently bypassed by leaving zone out (finding #1, closed)", () => {
+  const privilegedCredentials = { scopes: ["write:contents", "deploy"] };
+  const result = designExecutionProfile(
+    sampleFlow(),
+    baseInventory({ credentials: { handle: "deploy-token", audience: "github-actions", scopes: privilegedCredentials.scopes, lifetimeSeconds: 600, injectionPhase: "pr", revocation: "auto-expire" } }),
+    passingContext({ zone: undefined, contentSource: "reviewed-base-branch", credentials: privilegedCredentials }),
+  );
+  assert.equal(result.decision.activate, false);
+  assert.equal(result.decision.state, "deferred");
+  const zoneBlocker = result.decision.blockers.find((b) => b.category === "trust-zone" && b.capability === "zone-not-classified");
+  assert.ok(zoneBlocker, "an omitted zone must produce its own named blocker rather than silently skipping every zone-dependent check");
+});
+
 test("a Trust Zone violation surfaces as a Safety Blocker and defers the flow", () => {
   const inventory = baseInventory({
     credentials: { handle: "deploy-token", audience: "github-actions", scopes: ["repo:write"], lifetimeSeconds: 600, injectionPhase: "pr", revocation: "auto-expire" },

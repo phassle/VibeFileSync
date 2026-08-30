@@ -14,14 +14,91 @@ import {
   attachDiagnosis,
   attachNegativeControlReport,
   stayedRedUntilRepairVerification,
-  recordRepairReview,
+  attachRepairReviewPacket,
+  recordRepairReviewOutcome,
   isCorrectlyHandledSeededDefect,
   wasAcceptedUnchanged,
   summarizeSeededDefectResults,
   evaluateSeededDefectThreshold,
 } from "./seeded-defects.mjs";
+import { evaluateRepairProposal } from "./repair.mjs";
+import { computeBundleDigest } from "./failure-evidence.mjs";
+import { buildNegativeControlPlan, EXECUTED_MODE } from "./negative-controls.mjs";
+import { declaredViolationDigest } from "./repair.mjs";
 
 const SHA = "a".repeat(40);
+
+// --- a real, valid #160 evaluateRepairProposal fixture, mirroring
+// repair.test.mjs's own baseRepairInput so seeded-defects gets the exact
+// same real packet #160's own tests prove is shape-valid — never a second,
+// hand-rolled packet shape. ---
+
+const FLOW_DATA = {
+  boundaries: [{ id: "checkout-service", role: "owned" }],
+  steps: [
+    { id: "given-a", kind: "given", intent: "..." },
+    {
+      id: "then-b",
+      kind: "then",
+      intent: "...",
+      outcomes: [{ id: "destination-content-matches-source", expect: "..." }],
+    },
+  ],
+};
+
+function protectedSnapshot() {
+  return {
+    flowSemantics: "unchanged", tolerances: "unchanged", boundaries: "unchanged", dataMeaning: "unchanged",
+    levelOverrides: "unchanged", lifecycle: "unchanged", enforcement: "unchanged", dependencies: "unchanged",
+    lockfiles: "unchanged", workflows: "unchanged", profiles: "unchanged", identities: "unchanged",
+    networkAccess: "unchanged", quarantine: "unchanged", requiredCheckPolicy: "unchanged",
+  };
+}
+
+function acceptedRepairProposalResult(diagnosisRecord) {
+  const plan = buildNegativeControlPlan(FLOW_DATA);
+  const negativeControlReports = plan.map((v) => ({
+    stepId: v.stepId,
+    outcomeId: v.outcomeId,
+    mode: EXECUTED_MODE,
+    appliedViolation: { outcome: "assertion-failed", declaredViolationDigest: declaredViolationDigest(v) },
+  }));
+  const snapshot = protectedSnapshot();
+  const withoutDigest = {
+    schema: "dynamic-qa-failure-evidence-v1",
+    bundleId: "bundle-seed-1",
+    repository: "phassle/VibeFileSync",
+    sourceCommit: SHA,
+    generatedAt: "2026-02-01T00:00:00Z",
+    workflow: { provider: "github-actions", workflowFile: "dynamic-qa.yml", runId: "1", runAttempt: "1" },
+    flowId: diagnosisRecord.flowId,
+    bindingId: diagnosisRecord.bindingId,
+    profileId: "update-replacement-retention-profile",
+    provenanceDigest: `sha256:${"a".repeat(64)}`,
+    originalConclusion: "failed",
+    diagnosisRecord,
+    junitFacts: [{ suite: "update", name: "retention", verdict: "failed", message: "assertion failed", durationMs: 50 }],
+    expectedVsObserved: [{ expectedOutcomeId: "destination-content-matches-source", expected: "prior content preserved", observed: "prior content missing" }],
+    fixtureBoundaryEnforcement: { boundariesEnforced: ["checkout-service stubbed"], fixtureIsolation: "fresh namespace per run" },
+    environmentHealth: { checkedAt: "2026-02-01T00:00:00Z", capabilities: [{ name: "runtime.node-available", status: "met" }] },
+    approvedDiagnostics: [{ label: "console capture", digest: `sha256:${"a".repeat(64)}` }],
+  };
+  const bundle = { ...withoutDigest, bundleDigest: computeBundleDigest(withoutDigest) };
+
+  return evaluateRepairProposal({
+    bundle,
+    hypothesesConsidered: [diagnosisRecord.causalChain],
+    proposedFiles: [{ path: "tests/update-replacement-retention.spec.ts", content: "test('fixed', () => {});" }],
+    assertions: [{ stepId: "then-b", outcomeId: "destination-content-matches-source", location: "update-replacement-retention.spec.ts:10" }],
+    flowData: FLOW_DATA,
+    affectedOutcomeIds: ["destination-content-matches-source"],
+    protectedContractsBefore: snapshot,
+    protectedContractsAfter: snapshot,
+    negativeControlReports,
+    neighboringFlows: [],
+    residualRisk: ["none identified"],
+  });
+}
 
 function baseDiagnosis({ attempts }) {
   return {
@@ -83,10 +160,10 @@ test("createSeededDefectCase has no parameter path to inject a product-kind chan
   assert.equal(c.injectedChange.kind, "binding");
 });
 
-test("a case starts red and cannot record repair review before diagnosis", () => {
+test("a case starts red and cannot have a Repair Review Packet attached before diagnosis", () => {
   const c = newCase();
   assert.equal(c.status, "red");
-  assert.throws(() => recordRepairReview(c, { outcome: "accepted-unchanged", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z", proposalOnly: true }));
+  assert.throws(() => attachRepairReviewPacket(c, { status: "proposal", packet: {} }));
 });
 
 test("attachDiagnosis refuses a non-binding-owned diagnosis", () => {
@@ -116,18 +193,32 @@ test("stayedRedUntilRepairVerification: false when a retry passes before any rep
   assert.equal(stayedRedUntilRepairVerification([originalFailedAttempt(), sneakyRetry]), false);
 });
 
-test("recordRepairReview rejects an outcome that is not proposal-only", () => {
+test("recordRepairReviewOutcome refuses an outcome before a Repair Review Packet is attached (structural ordering)", () => {
   const c = attachDiagnosis(newCase(), baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] }));
+  assert.equal(c.status, "diagnosed");
   assert.throws(
-    () => recordRepairReview(c, { outcome: "accepted-unchanged", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z", proposalOnly: false }),
-    /proposalOnly must be exactly true/,
+    () => recordRepairReviewOutcome(c, { outcome: "accepted-unchanged", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z" }),
+    /must have an attached Repair Review Packet/,
   );
 });
 
-test("a fully-handled, accepted-unchanged case is correctly handled and counts toward acceptance", () => {
+test("attachRepairReviewPacket refuses a refused (non-\"proposal\") evaluateRepairProposal result — a refusal has nothing to review", () => {
+  const c = attachDiagnosis(newCase(), baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] }));
+  const refused = { status: "refused", reasons: [{ gate: "bundle-eligibility" }], packet: null };
+  assert.throws(() => attachRepairReviewPacket(c, refused), /requires a real evaluateRepairProposal result/);
+});
+
+test("a fully-handled, accepted-unchanged case is correctly handled and counts toward acceptance, carrying a real, shape-valid #160 Repair Review Packet", () => {
   let c = newCase();
-  c = attachDiagnosis(c, baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] }));
-  c = recordRepairReview(c, { outcome: "accepted-unchanged", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z", proposalOnly: true });
+  const diagnosis = baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] });
+  c = attachDiagnosis(c, diagnosis);
+  const proposalResult = acceptedRepairProposalResult(diagnosis);
+  assert.equal(proposalResult.status, "proposal", JSON.stringify(proposalResult.reasons));
+  c = attachRepairReviewPacket(c, proposalResult);
+  assert.equal(c.status, "repair-proposed");
+  assert.deepEqual(Object.keys(c.repairReviewPacket).sort(), ["diff", "evidence", "mappings", "protectedContractDigests", "residualRisk", "verification"].sort());
+
+  c = recordRepairReviewOutcome(c, { outcome: "accepted-unchanged", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z" });
   assert.equal(c.status, "resolved");
   assert.equal(isCorrectlyHandledSeededDefect(c), true);
   assert.equal(wasAcceptedUnchanged(c), true);
@@ -135,8 +226,10 @@ test("a fully-handled, accepted-unchanged case is correctly handled and counts t
 
 test("a rejected proposal is correctly handled but does not count as accepted unchanged", () => {
   let c = newCase("seed-2");
-  c = attachDiagnosis(c, baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] }));
-  c = recordRepairReview(c, { outcome: "rejected", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z", proposalOnly: true });
+  const diagnosis = baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] });
+  c = attachDiagnosis(c, diagnosis);
+  c = attachRepairReviewPacket(c, acceptedRepairProposalResult(diagnosis));
+  c = recordRepairReviewOutcome(c, { outcome: "rejected", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z" });
   assert.equal(c.status, "rejected");
   assert.equal(isCorrectlyHandledSeededDefect(c), true);
   assert.equal(wasAcceptedUnchanged(c), false);
@@ -163,8 +256,10 @@ test("summarizeSeededDefectResults yields real known counts once measured:true, 
       description: "test",
       injectedChange: { summary: "test" },
     });
-    c = attachDiagnosis(c, baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] }));
-    c = recordRepairReview(c, { outcome: "accepted-unchanged", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z", proposalOnly: true });
+    const diagnosis = baseDiagnosis({ attempts: [originalFailedAttempt(), repairVerificationPassedAttempt()] });
+    c = attachDiagnosis(c, diagnosis);
+    c = attachRepairReviewPacket(c, acceptedRepairProposalResult(diagnosis));
+    c = recordRepairReviewOutcome(c, { outcome: "accepted-unchanged", reviewer: "Per", reviewedAt: "2026-02-03T00:00:00Z" });
     return c;
   }
   const cases = [handledAcceptedCase("s1"), handledAcceptedCase("s2"), handledAcceptedCase("s3")];

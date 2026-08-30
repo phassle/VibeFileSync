@@ -76,7 +76,11 @@ case_run() {
     };
 
     const flows = [flowA, flowB, flowC];
-    const report = reconcilePortfolio(flows);
+    // findDataSetIssues (and therefore reconcilePortfolio) now requires a
+    // real resolver rather than silently skipping the check when omitted
+    // (finding #1, closed); none of these fixture flows declare data_sets,
+    // so the resolver's own behaviour never matters here.
+    const report = reconcilePortfolio(flows, { resolveDataSet: () => ({ found: true }) });
 
     const approval = { approvedBy: 'per', role: 'qa-owner', timestamp: '2026-08-30' };
     const approvals = { 'update-preserves-safetynet': approval, 'update-keeps-old-version': approval, 'compare-detects-conflicts': approval };

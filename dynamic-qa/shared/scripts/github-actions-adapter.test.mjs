@@ -21,6 +21,7 @@ import {
   checkLaneTrustInvariant,
   resolveRunReference,
   checkGeneratedConfigEnforcesProfile,
+  checkShippable,
   NODE_RUNTIME_CAPABILITY,
   SUPPORTED_TRIGGERS,
   DEFERRED_TRIGGERS,
@@ -146,6 +147,32 @@ test("planAdvisoryPullRequestLane renders a hardened workflow once every capabil
   assert.equal(result.state, "activatable");
   assert.equal(result.path, ".github/workflows/dynamic-qa.yml");
   assert.equal(checkWorkflowHardening(result.yaml).valid, true);
+});
+
+// --- finding #3, closed: checkShippable refuses while action pins are placeholders ---
+
+test("checkShippable refuses a fully-rendered, otherwise-hardened workflow while its action pins remain unresolved placeholders (finding #3, closed)", () => {
+  const profile = fullProfile();
+  const environmentEvidence = deriveCapabilityEvidence({
+    runnerClass: RUNNER_CLASS,
+    enforcedRead: profile.paths.allowedRead,
+    enforcedWrite: profile.paths.allowedWrite,
+    enforcedCommands: profile.commands.allowed,
+    enforcedBoundaryIds: profile.effects.allowedBoundaryIds,
+    resources: profile.resources,
+    nodeRuntimeAvailable: true,
+  });
+  const result = planAdvisoryPullRequestLane({ profile, environmentEvidence, workflowConfig: workflowConfig() });
+  assert.equal(result.rendered, true, JSON.stringify(result));
+  // The rendered draft is itself perfectly hardened (proven above) — the
+  // ONLY reason checkShippable refuses it is the still-unresolved action
+  // pins, proving the two concerns are checked independently rather than
+  // one masking the other.
+  assert.equal(checkGeneratedConfigEnforcesProfile(profile, result.yaml).valid, true);
+
+  const shippable = checkShippable(profile, result.yaml);
+  assert.equal(shippable.valid, false);
+  assert.ok(shippable.errors.some((e) => e.code === "actions.placeholder-pin-unresolved"));
 });
 
 test("planAdvisoryPullRequestLane defers when the environment does not match the profile's required paths (an ordinary Capability Gate blocker, not just the Node-runtime one)", () => {

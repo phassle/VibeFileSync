@@ -60,10 +60,77 @@ const nonEmptyString = (v) => typeof v === "string" && v.trim() !== "";
 // repository: confirm each SHA still corresponds to the intended upstream
 // release before first real rollout (the pilot, #171-175, is deliberately
 // not being run yet, so nothing here has executed against real CI).
-export const CHECKOUT_ACTION_SHA = "692973e3d937129bcbf40652eb9f2f61becf3332"; // actions/checkout, tagged v4.1.7 at authoring time
-export const SETUP_NODE_ACTION_SHA = "1e60f620b9541d16bece96c5465dc8ee9832be0a"; // actions/setup-node, tagged v4.0.3 at authoring time
+export const CHECKOUT_ACTION_SHA = "692973e3d937129bcbf40652eb9f2f61becf3332"; // actions/checkout, tagged v4.1.7 at authoring time — PLACEHOLDER, see ACTION_PINS below
+export const SETUP_NODE_ACTION_SHA = "1e60f620b9541d16bece96c5465dc8ee9832be0a"; // actions/setup-node, tagged v4.0.3 at authoring time — PLACEHOLDER, see ACTION_PINS below
 export const CHECKOUT_ACTION_REF = `actions/checkout@${CHECKOUT_ACTION_SHA}`;
 export const SETUP_NODE_ACTION_REF = `actions/setup-node@${SETUP_NODE_ACTION_SHA}`;
+
+// --- finding #3, closed: placeholder pins must be loud, never silent -------
+//
+// This module has zero network access (the deterministic core's own hard
+// invariant), so it cannot itself resolve "the current commit behind tag
+// v4.x" against the real upstream repository. The two SHAs above were never
+// independently re-verified against a live GitHub API/checkout — they were
+// authored as the commits believed to correspond to the named tags at
+// authoring time, which is exactly the hazard: a security-critical
+// immutable-pin list must never ship an unverified value silently.
+//
+// ACTION_PINS is the single, unmistakable source of truth for "has a human
+// actually re-verified this SHA against the real upstream commit for the
+// intended release." Each entry's `resolved` flag sits directly beside the
+// SHA it describes — there is no separate list to fall out of sync with the
+// pin it is about. It starts `false` for both pins and MUST stay that way
+// until a human operator has done the following, for EACH pin, before this
+// workflow is ever enabled against a real repository:
+//
+//   1. Look up the exact commit SHA GitHub's own release page (or
+//      `git ls-remote --tags https://github.com/<owner>/<repo>`) reports for
+//      the intended tag (currently targeted: actions/checkout v4.1.7,
+//      actions/setup-node v4.0.3, or whichever later release is actually
+//      being adopted).
+//   2. Compare that SHA, byte for byte, against CHECKOUT_ACTION_SHA /
+//      SETUP_NODE_ACTION_SHA above. Update the constant if it does not
+//      match exactly.
+//   3. Only then flip that pin's `resolved` entry below to `true`.
+//
+// `checkActionPinsResolved()` fails closed on the CURRENT, honest state
+// (both still `false`) — see its own doc comment — and `checkShippable`
+// (github-actions-adapter.mjs) refuses to call a rendered workflow
+// shippable while any pin is unresolved. Neither planAdvisoryPullRequestLane
+// nor any other renderer here is blocked from producing a REVIEWABLE draft
+// (a human must be able to see the generated YAML in order to review and
+// resolve the pins in the first place) — it is `checkShippable`, the
+// pre-rollout gate, that refuses.
+export const ACTION_PINS = Object.freeze({
+  checkout: Object.freeze({ ref: "actions/checkout", sha: CHECKOUT_ACTION_SHA, resolved: false }),
+  setupNode: Object.freeze({ ref: "actions/setup-node", sha: SETUP_NODE_ACTION_SHA, resolved: false }),
+});
+
+/**
+ * Checks whether every named action pin in `pins` (defaults to this
+ * module's own ACTION_PINS — the shipped, real pin set) has actually been
+ * re-verified by a human (`resolved: true`). Returns `{ valid, errors }`;
+ * `errors` names each still-unresolved pin individually, `{ code:
+ * "actions.placeholder-pin-unresolved", message }`, so a caller (or a test)
+ * can see exactly which pin(s) remain unverified rather than one generic
+ * "something about the pins is wrong" flag. `pins` is accepted as an
+ * argument (rather than always reading the module-level ACTION_PINS)
+ * purely so a test can exercise the detector's own logic against a
+ * hypothetical fully-resolved set without mutating the real, honest
+ * placeholder state. Never throws.
+ */
+export function checkActionPinsResolved(pins = ACTION_PINS) {
+  const errors = [];
+  for (const [key, pin] of Object.entries(pins)) {
+    if (pin.resolved !== true) {
+      errors.push({
+        code: "actions.placeholder-pin-unresolved",
+        message: `ACTION_PINS.${key} (${pin.ref}@${pin.sha}) has not been re-verified by a human against the real upstream commit for its intended release — this pin must never be treated as shippable while it remains a placeholder`,
+      });
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
 
 // --- safe PR events ---------------------------------------------------------
 //

@@ -200,9 +200,19 @@ function mapTrustZoneIssues(errors) {
  *     "regardless of which zone it happens in" per that module's own
  *     doc); this module feeds it the profile's own `paths`, `network`, and
  *     `credentials` so a caller never has to restate them separately.
- *   - `checkZoneTransition` runs only when both `context.fromZone` and
- *     `context.zone` are supplied (a caller not modelling a transition for
- *     this run yet is not penalized for omitting one).
+ *   - `context.zone` is now REQUIRED (finding #1, closed): omitting it used
+ *     to skip `checkAuthoringAuthority` / `checkVerificationCompute` /
+ *     `checkPrivilegedLaneArtifact` wholesale, and #170 confirmed
+ *     `checkHardSecurityInvariant` alone does not substitute for them when
+ *     content is classified trusted. A missing `context.zone` now itself
+ *     produces a named, non-bypassable blocker (`trust-zone` /
+ *     `zone-not-classified`) that flows into `activationDecision` exactly
+ *     like every other blocker — there is no code path where an omitted
+ *     zone reads as "nothing to check."
+ *   - `checkZoneTransition` runs only when `context.fromZone` is also
+ *     supplied (a caller not modelling a transition for this run yet is not
+ *     penalized for omitting `fromZone` specifically — `zone` itself is
+ *     still required).
  *   - `checkAuthoringAuthority` runs whenever `context.zone` is known.
  *   - `checkVerificationCompute` runs only for
  *     `zone === "candidate-verification"` (the zone it exists to check).
@@ -217,6 +227,14 @@ function mapTrustZoneIssues(errors) {
 export function checkTrustZoneForExecution(profile, context = {}) {
   const issues = [];
   const { zone, fromZone, contentSource, credentials, environment, sourceCommit, privilegedArtifact } = context;
+
+  if (zone === undefined) {
+    issues.push({
+      error: "zone-not-classified",
+      message:
+        "context.zone is required — a run cannot be activated without an explicit Trust Zone classification. Omitting it must never silently skip checkAuthoringAuthority, checkVerificationCompute, or checkPrivilegedLaneArtifact (finding #1, closed)",
+    });
+  }
 
   if (fromZone !== undefined && zone !== undefined) {
     const transition = checkZoneTransition(fromZone, zone);

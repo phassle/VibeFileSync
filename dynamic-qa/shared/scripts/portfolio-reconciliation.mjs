@@ -241,12 +241,24 @@ export function findIsolationNamespaceCollisions(flows) {
  * reimplementing it: `resolveDataSet(id)` is caller-supplied (mirroring
  * resolve-data-sets.mjs's "callers must supply dataSetsDir" contract — this
  * module does not know where Named Data Sets live) and must return
- * `{ found: boolean }`. Omitting `resolveDataSet` skips this check rather
- * than guessing — see reconcilePortfolio's doc comment.
+ * `{ found: boolean }`.
+ *
+ * FAILS CLOSED (throws a named error) when `resolveDataSet` is not a
+ * function — omission is never read as "skip this check." #170 confirmed
+ * this was previously a silent fail-open: no current caller wires a real
+ * resolver into `reconcilePortfolio`, so nothing is exploitable *yet*, but
+ * the recommendation (and this fix) is to make the resolver required before
+ * anything does. A caller with no real Named Data Set store to resolve
+ * against must pass an explicit resolver that says so (e.g.
+ * `() => ({ found: false })`), never omit the argument.
  */
 export function findDataSetIssues(flows, resolveDataSet) {
+  if (typeof resolveDataSet !== "function") {
+    throw new Error(
+      "findDataSetIssues requires a resolveDataSet(id) resolver — omitting it must never silently skip the unresolved-data-set-reference check (finding #1, closed)",
+    );
+  }
   const issues = [];
-  if (typeof resolveDataSet !== "function") return issues;
 
   for (const flow of flows) {
     if (!flow || typeof flow.id !== "string" || !Array.isArray(flow.data_sets)) continue;
@@ -371,8 +383,10 @@ export function findStateDeclarationConflicts(flows, priorIssues) {
  *
  *   { issues, issuesByFlowId, isPortfolioCoherent }
  *
- * `resolveDataSet` is optional (see findDataSetIssues); every other
- * detector always runs. `issuesByFlowId` is a Map<flowId, issue[]> so a
+ * `resolveDataSet` is REQUIRED (see findDataSetIssues — omitting it now
+ * throws rather than silently skipping the unresolved-data-set-reference
+ * check, finding #1 closed); every other detector always runs.
+ * `issuesByFlowId` is a Map<flowId, issue[]> so a
  * caller can look up exactly which issues implicate one flow without
  * re-scanning `issues` itself — `issuesForFlow` below is the fail-closed
  * accessor built on top of it.

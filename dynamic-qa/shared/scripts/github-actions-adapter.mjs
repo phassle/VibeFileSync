@@ -61,6 +61,7 @@ import {
   renderManualTriggerLane,
   renderMergeGroupLane,
   checkWorkflowHardening,
+  checkActionPinsResolved,
 } from "./github-actions-workflow.mjs";
 import { checkActionAndReusableWorkflowAllowlist, checkPrivilegedLaneRefusesLowTrustBridge } from "./workflow-hardening.mjs";
 import { parseJUnitXML, summarizeJUnit } from "./junit-report.mjs";
@@ -483,6 +484,25 @@ export function checkGeneratedConfigEnforcesProfile(profile, yamlText, { lane = 
   }
 
   return { valid: errors.length === 0, errors };
+}
+
+// --- finding #3, closed: the pre-rollout shippability gate -----------------
+//
+// `plan*`/`planLane` render a REVIEWABLE draft workflow — a human needs to
+// see the generated YAML in order to review it (including its action pins)
+// in the first place, so those functions are deliberately NOT blocked by
+// unresolved action pins. `checkShippable` is the separate, additional gate
+// a human/CI must run before a rendered workflow may actually be committed
+// to a real repository or registered as a required check: it composes
+// `checkGeneratedConfigEnforcesProfile` (point 7) with
+// `checkActionPinsResolved` (github-actions-workflow.mjs, finding #3) so an
+// unresolved placeholder pin can never silently ship alongside "the
+// configuration otherwise looks fine." Returns `{ valid, errors }`; never
+// throws.
+export function checkShippable(profile, yamlText, options = {}) {
+  const enforcement = checkGeneratedConfigEnforcesProfile(profile, yamlText, options);
+  const pins = checkActionPinsResolved();
+  return { valid: enforcement.valid && pins.valid, errors: [...enforcement.errors, ...pins.errors] };
 }
 
 // --- #156: the neutral-contract surface (points 3, 5, and the aggregate) ---

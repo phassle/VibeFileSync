@@ -73,7 +73,11 @@ case_run() {
     };
     const flows = [flow];
 
-    const reconciliation = reconcilePortfolio(flows, {});
+    // findDataSetIssues (and therefore reconcilePortfolio) now requires a
+    // real resolver rather than silently skipping the check when omitted
+    // (finding #1, closed); this fixture flow declares no data_sets, so the
+    // resolver's own behaviour never matters here.
+    const reconciliation = reconcilePortfolio(flows, { resolveDataSet: () => ({ found: true }) });
     const portfolioApproval = evaluatePortfolioApproval(flows, reconciliation, {
       'checkout-flow': { approvedBy: 'qa-owner-alice', role: 'qa-owner' },
     });

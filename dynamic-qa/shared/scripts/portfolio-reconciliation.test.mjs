@@ -22,6 +22,13 @@ import { renderFlowDefinitionYAML } from "./flow-yaml.mjs";
 
 const TICKET = "https://github.com/phassle/VibeFileSync/issues/18";
 
+// findDataSetIssues (and therefore reconcilePortfolio) now requires a real
+// resolver (finding #1, closed) — every test flow below declares
+// `data_sets: []`, so the resolver's own behaviour never matters to these
+// tests; it exists only to prove the tests are not relying on the old
+// fail-open.
+const alwaysFoundDataSet = () => ({ found: true });
+
 function ownedBoundary(overrides = {}) {
   return {
     id: "vibesync-cli",
@@ -177,9 +184,10 @@ test("findDataSetIssues: an unresolved data set reference is named", () => {
   assert.ok(issues.some((i) => i.type === "unresolved-data-set-reference" && i.flowIds.includes("flow-a")));
 });
 
-test("findDataSetIssues: skips resolution entirely when no resolver is supplied (never guesses)", () => {
+test("findDataSetIssues: fails closed (throws a named error) when no resolver is supplied, rather than silently skipping (finding #1, closed)", () => {
   const a = flow({ id: "flow-a", data_sets: ["whatever"] });
-  assert.deepEqual(findDataSetIssues([a], undefined), []);
+  assert.throws(() => findDataSetIssues([a], undefined), /requires a resolveDataSet/);
+  assert.throws(() => findDataSetIssues([a], null), /requires a resolveDataSet/);
 });
 
 test("findDataSetIssues: a resolved data set reference is not flagged", () => {
@@ -256,6 +264,12 @@ test("findStateDeclarationConflicts: a non-draft state on a flow with no issues 
 
 // --- reconcilePortfolio: the aggregate --------------------------------------
 
+test("reconcilePortfolio: fails closed (throws) when resolveDataSet is omitted, rather than silently skipping the data-set check (finding #1, closed)", () => {
+  const a = flow({ id: "flow-a", data_sets: ["some-set"] });
+  assert.throws(() => reconcilePortfolio([a]), /requires a resolveDataSet/);
+  assert.throws(() => reconcilePortfolio([a], {}), /requires a resolveDataSet/);
+});
+
 test("reconcilePortfolio: a coherent portfolio reports no issues", () => {
   const a = flow({ id: "flow-a" });
   const b = flow({
@@ -266,7 +280,7 @@ test("reconcilePortfolio: a coherent portfolio reports no issues", () => {
       { id: "then-outcome", kind: "then", intent: "A different check.", outcomes: [{ id: "flow-b-outcome", expect: "Different text." }] },
     ],
   });
-  const report = reconcilePortfolio([a, b]);
+  const report = reconcilePortfolio([a, b], { resolveDataSet: alwaysFoundDataSet });
   assert.equal(report.isPortfolioCoherent, true);
   assert.deepEqual(report.issues, []);
 });
@@ -274,7 +288,7 @@ test("reconcilePortfolio: a coherent portfolio reports no issues", () => {
 test("reconcilePortfolio: a duplicate pair is surfaced and attributed to both flow ids", () => {
   const a = flow({ id: "flow-a" });
   const b = flow({ id: "flow-b" });
-  const report = reconcilePortfolio([a, b]);
+  const report = reconcilePortfolio([a, b], { resolveDataSet: alwaysFoundDataSet });
   assert.equal(report.isPortfolioCoherent, false);
   assert.deepEqual(issuesForFlow(report, "flow-a").map((i) => i.type), issuesForFlow(report, "flow-b").map((i) => i.type));
   assert.ok(issuesForFlow(report, "flow-a").some((i) => i.type === "duplicate-flow-content"));
@@ -291,7 +305,7 @@ test("reconcilePortfolio: an uninvolved flow carries no issues even when the por
       { id: "then-outcome", kind: "then", intent: "Another check.", outcomes: [{ id: "flow-c-outcome", expect: "Some other text." }] },
     ],
   });
-  const report = reconcilePortfolio([a, b, c]);
+  const report = reconcilePortfolio([a, b, c], { resolveDataSet: alwaysFoundDataSet });
   assert.equal(report.isPortfolioCoherent, false);
   assert.deepEqual(issuesForFlow(report, "flow-c"), []);
 });
@@ -307,7 +321,7 @@ test("issuesForFlow: fails closed on a malformed or missing report rather than r
 test("evaluateFlowForPortfolio: a flow named in an unresolved issue is never eligible", () => {
   const a = flow({ id: "flow-a" });
   const b = flow({ id: "flow-b" });
-  const report = reconcilePortfolio([a, b]);
+  const report = reconcilePortfolio([a, b], { resolveDataSet: alwaysFoundDataSet });
   const evaluation = evaluateFlowForPortfolio("flow-a", report);
   assert.equal(evaluation.eligible, false);
   assert.ok(evaluation.issues.length > 0);
@@ -316,7 +330,7 @@ test("evaluateFlowForPortfolio: a flow named in an unresolved issue is never eli
 test("recordFlowApproval: an unresolved flow stays draft even with a fully valid qa-owner approval record", () => {
   const a = flow({ id: "flow-a" });
   const b = flow({ id: "flow-b" });
-  const report = reconcilePortfolio([a, b]);
+  const report = reconcilePortfolio([a, b], { resolveDataSet: alwaysFoundDataSet });
   const result = recordFlowApproval("flow-a", report, { approvedBy: "Per", role: "qa-owner", timestamp: "2026-08-30T00:00:00Z" });
   assert.equal(result.approved, false);
   assert.equal(result.state, "draft");
@@ -325,7 +339,7 @@ test("recordFlowApproval: an unresolved flow stays draft even with a fully valid
 test("recordFlowApproval: an unresolved flow stays draft regardless of any extra/forceful field an approval object might carry", () => {
   const a = flow({ id: "flow-a" });
   const b = flow({ id: "flow-b" });
-  const report = reconcilePortfolio([a, b]);
+  const report = reconcilePortfolio([a, b], { resolveDataSet: alwaysFoundDataSet });
   // Simulate a caller trying to smuggle an override through the approval
   // payload — evaluateFlowForPortfolio runs first and ignores it entirely.
   const result = recordFlowApproval("flow-a", report, {
@@ -341,7 +355,7 @@ test("recordFlowApproval: an unresolved flow stays draft regardless of any extra
 
 test("recordFlowApproval: a resolved flow is approved only with a valid qa-owner/technical-owner record", () => {
   const a = flow({ id: "flow-a" });
-  const report = reconcilePortfolio([a]);
+  const report = reconcilePortfolio([a], { resolveDataSet: alwaysFoundDataSet });
   assert.equal(report.isPortfolioCoherent, true);
 
   const missingApproval = recordFlowApproval("flow-a", report, undefined);
@@ -369,7 +383,7 @@ test("evaluatePortfolioApproval: one draft-retained flow keeps the whole portfol
       { id: "then-outcome", kind: "then", intent: "Another check.", outcomes: [{ id: "flow-c-outcome", expect: "Some other text." }] },
     ],
   });
-  const report = reconcilePortfolio([a, b, c]);
+  const report = reconcilePortfolio([a, b, c], { resolveDataSet: alwaysFoundDataSet });
   const approvals = {
     "flow-a": { approvedBy: "Per", role: "qa-owner" },
     "flow-b": { approvedBy: "Per", role: "qa-owner" },
@@ -391,7 +405,7 @@ test("evaluatePortfolioApproval: a fully coherent, fully approved portfolio is f
       { id: "then-outcome", kind: "then", intent: "A different check.", outcomes: [{ id: "flow-b-outcome", expect: "Different text." }] },
     ],
   });
-  const report = reconcilePortfolio([a, b]);
+  const report = reconcilePortfolio([a, b], { resolveDataSet: alwaysFoundDataSet });
   const approvals = {
     "flow-a": { approvedBy: "Per", role: "qa-owner" },
     "flow-b": { approvedBy: "Per", role: "technical-owner" },
@@ -406,7 +420,7 @@ test("evaluatePortfolioApproval: a fully coherent, fully approved portfolio is f
 
 test("buildFlowReview: the reviewed YAML is byte-identical to flow-yaml.mjs's direct renderer", () => {
   const a = flow({ id: "flow-a" });
-  const report = reconcilePortfolio([a]);
+  const report = reconcilePortfolio([a], { resolveDataSet: alwaysFoundDataSet });
   const review = buildFlowReview(a, report);
   assert.equal(review.yaml, renderFlowDefinitionYAML(a));
 });
@@ -431,7 +445,7 @@ test("buildFlowReview: reviewing a real stage-5-assembled flow reuses the exact 
   const assembled = assembleAndRenderFlowDefinition(interview);
   assert.equal(assembled.valid, true);
 
-  const report = reconcilePortfolio([assembled.flow]);
+  const report = reconcilePortfolio([assembled.flow], { resolveDataSet: alwaysFoundDataSet });
   const review = buildFlowReview(assembled.flow, report);
 
   // Byte-identical to what stage 5 already rendered and proved round-trips.
@@ -443,7 +457,7 @@ test("buildFlowReview: reviewing a real stage-5-assembled flow reuses the exact 
 test("buildFlowReview: surfaces the reconciliation issues for that flow alongside its exact YAML", () => {
   const a = flow({ id: "flow-a" });
   const b = flow({ id: "flow-b" }); // duplicate
-  const report = reconcilePortfolio([a, b]);
+  const report = reconcilePortfolio([a, b], { resolveDataSet: alwaysFoundDataSet });
   const review = buildFlowReview(a, report);
   assert.ok(review.issues.length > 0);
   assert.equal(review.yaml, renderFlowDefinitionYAML(a));

@@ -2283,27 +2283,39 @@ has no parameter path to a `"product"` kind at all, and
 `productBehaviorChanged` is always `false` and frozen, never
 caller-settable. `attachDiagnosis` refuses any diagnosis whose `owner` is
 not `"binding"` (reuses #158's `validateDiagnosisRecord`/`isRepairEligible`
-unchanged) before repair review can ever be recorded — enforced
-structurally, since `recordRepairReview` refuses a case that is not already
-`"diagnosed"`. `stayedRedUntilRepairVerification` fails a case where
-anything other than a `repair-verification` attempt ever passes — the
-"defect quietly stopped reproducing on its own" failure mode. Repair review
-outcomes (`accepted-unchanged | accepted-with-modification | rejected`) all
-require `proposalOnly: true`; there is no path to record an
-auto-applied/auto-merged outcome. `summarizeSeededDefectResults` returns
-`unknown` Quantities until a caller explicitly asserts `measured: true` —
-no plausible-looking zero before a real seeded-defect pilot ever runs.
+unchanged) before a Repair Review Packet can ever be attached — enforced
+structurally, since `attachRepairReviewPacket` refuses a case that is not
+already `"diagnosed"`. `stayedRedUntilRepairVerification` fails a case
+where anything other than a `repair-verification` attempt ever passes — the
+"defect quietly stopped reproducing on its own" failure mode.
+`summarizeSeededDefectResults` returns `unknown` Quantities until a caller
+explicitly asserts `measured: true` — no plausible-looking zero before a
+real seeded-defect pilot ever runs.
 
-**FLAGGED FOR REVIEW — #160 (Repair Review Packet) has not landed.** #174
-is blocked by #160 in the tracker, but #160 is not in this branch's landed
-set. `seeded-defects.mjs`'s `REPAIR_REVIEW_OUTCOMES`/`recordRepairReview`
-are a deliberately minimal, LOCAL stand-in for the one fact #174's
-acceptance criteria need (an outcome, a named reviewer, `proposalOnly`) —
-NOT a reimplementation of #160's full packet (evidence, mappings,
-protected-contract digests, diff, verification results, residual risk).
-Whoever builds #160 should reconcile this shape with the real Repair Review
-Packet rather than let two review-outcome models diverge; this module says
-so in its own header comment.
+**CLOSED (consolidated fix pass) — #174 wired to the real #160 Repair
+Review Packet.** #174 was originally written before #160 ("Implement
+guarded repair with a Repair Review Packet") landed; `seeded-defects.mjs`
+used a deliberately minimal, LOCAL stand-in
+(`recordRepairReview`/`REPAIR_REVIEW_OUTCOMES`) for the one fact its
+acceptance criteria needed (an outcome, a named reviewer, `proposalOnly`) —
+NOT a reimplementation of #160's full packet. #160 has since landed and is
+now wired in directly: `attachRepairReviewPacket(caseRecord,
+proposalResult)` requires a REAL `evaluateRepairProposal` (#160) result
+whose `status` is `"proposal"` and whose `packet` shape-validates against
+#160's own `validateRepairReviewPacket` (exactly the six required
+sections), and advances the case to `"repair-proposed"` (a status this
+module always named in `CASE_STATUSES` but never previously reached).
+`recordRepairReviewOutcome(caseRecord, { outcome, reviewer, reviewedAt })`
+then records the human's review verdict against that already-attached real
+packet — `REPAIR_REVIEW_OUTCOMES` (`accepted-unchanged |
+accepted-with-modification | rejected`) is kept, since it is #174's own
+concept and not part of #160's packet shape. There is no `proposalOnly`
+parameter any more: "proposal-only, never applied" is now a STRUCTURAL
+property inherited from `repair.mjs` itself (no dependency on
+`node:fs`/`node:child_process`) rather than a caller-asserted boolean this
+module previously had to trust. `isCorrectlyHandledSeededDefect` now
+requires a real, shape-valid `repairReviewPacket` to be present, not merely
+`repairReview.proposalOnly === true`.
 
 **Promotion gate (#175, `pilot-promotion.mjs`).** Evaluates SPEC-135 §13's
 seven thresholds (coverage, escapes, PR p95, flake/false-positive rate,

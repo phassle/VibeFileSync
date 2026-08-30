@@ -19,8 +19,13 @@
 // message }` shapes everywhere.
 //
 // Two soft spots this ticket was explicitly asked to probe (see the two
-// tests under "SOFT SPOT PROBES" near the end) are reported honestly,
-// whichever way they land — see the ticket's own honesty requirement.
+// tests under "SOFT SPOT PROBES" near the end) were reported honestly, per
+// the ticket's own honesty requirement, and have since been CLOSED in a
+// later consolidation pass: portfolio-reconciliation.mjs's findDataSetIssues
+// and safe-execution-design.mjs's Trust Zone composition now both fail
+// closed on omission instead of silently skipping. The tests below still
+// probe the same fixtures directly against the real functions; they now
+// prove the fix rather than the gap.
 //
 // Never a literal secret-shaped string: every secret-shaped fixture here is
 // assembled at runtime via string concatenation (mirroring
@@ -41,7 +46,7 @@ import {
 import { validateFlowDefinition } from "./flow-definition.mjs";
 import { validateNamedDataSet } from "./named-data-set.mjs";
 import { parseRestrictedYAML, YamlSyntaxError } from "./restricted-yaml.mjs";
-import { isValidSemanticId } from "./id-rules.mjs";
+import { isValidSemanticId, MAX_SEMANTIC_ID_LENGTH } from "./id-rules.mjs";
 import { parseJUnitXML } from "./junit-report.mjs";
 import { detectSecretValue, redactSecretsInText, textStillContainsSecretShapedValue } from "./secret-detection.mjs";
 import { prepareDiagnosticForUpload } from "./diagnostics-scrub.mjs";
@@ -235,22 +240,25 @@ test("hostile: a branch name shaped like a shell-injection or path-traversal pay
     assert.equal(isValidSemanticId(name), false, `expected ${JSON.stringify(name)} to be rejected as a semantic id`);
   }
 
-  // FINDING (not one of the two flagged soft spots, but discovered while
-  // attacking this exact defence): SEMANTIC_ID_RE has no maximum length. A
-  // branch name that is otherwise shaped like a valid semantic id (only
-  // lowercase letters/digits/hyphens) but absurdly long — fully within an
-  // attacker's control as a branch name — is currently ACCEPTED, not
-  // rejected. This cannot alter *which* command runs or *escape* an
-  // artifact path (the character set is still exact/safe), but it is an
-  // unbounded-length id an attacker fully controls reaching a filename —
-  // worth a length cap in a follow-up, reported here rather than silently
-  // treated as covered by "malicious names are rejected".
+  // CLOSED (finding #2): SEMANTIC_ID_RE now has a maximum length
+  // (MAX_SEMANTIC_ID_LENGTH). A branch name that is otherwise shaped like a
+  // valid semantic id (only lowercase letters/digits/hyphens) but absurdly
+  // long — fully within an attacker's control as a branch name — is now
+  // rejected before it can reach a filename.
   const absurdlyLongButShapeValid = "a".repeat(300);
   assert.equal(
     isValidSemanticId(absurdlyLongButShapeValid),
-    true,
-    "documents a real gap: id-rules.mjs's SEMANTIC_ID_RE has no length bound",
+    false,
+    "a 300-character shape-valid id must be rejected now that SEMANTIC_ID_RE has a length bound",
   );
+
+  // Exact boundary: an id of exactly MAX_SEMANTIC_ID_LENGTH characters is
+  // still valid; one character over is rejected (finding #2, closed).
+  const atBound = "a" + "b".repeat(MAX_SEMANTIC_ID_LENGTH - 1);
+  assert.equal(atBound.length, MAX_SEMANTIC_ID_LENGTH);
+  assert.equal(isValidSemanticId(atBound), true, "an id at exactly the length bound must still validate");
+  const overBound = atBound + "c";
+  assert.equal(isValidSemanticId(overBound), false, "an id one character past the length bound must be rejected");
 
   // A malicious branch name attempting to author a Flow Definition using
   // itself as the ID is refused at the schema layer with a named error.
@@ -641,10 +649,10 @@ test("hostile: rich diagnostics stay suppressed by default even when a hostile c
 });
 
 // ---------------------------------------------------------------------------
-// SOFT SPOT PROBES — asked for explicitly by the ticket. Report honestly.
+// SOFT SPOT PROBES — asked for explicitly by the ticket, and now CLOSED.
 // ---------------------------------------------------------------------------
 
-test("SOFT SPOT: portfolio-reconciliation's findDataSetIssues silently skips the unresolved-data-set check when no resolver is supplied — proven, and probed for a realistic exploit path", () => {
+test("CLOSED (was SOFT SPOT): portfolio-reconciliation's findDataSetIssues no longer silently skips the unresolved-data-set check when no resolver is supplied — omission now fails closed", () => {
   const flows = [
     {
       schema: "dynamic-qa-flow-v1",
@@ -655,19 +663,19 @@ test("SOFT SPOT: portfolio-reconciliation's findDataSetIssues silently skips the
     },
   ];
 
-  // No resolveDataSet supplied at all: reconcilePortfolio does not throw and
-  // does not report the dangling reference — this is the flagged gap,
-  // reproduced directly against the real function, not paraphrased.
-  const silent = reconcilePortfolio(flows, {});
-  assert.equal(silent.issues.some((i) => i.type === "unresolved-data-set-reference"), false);
+  // No resolveDataSet supplied at all: reconcilePortfolio now throws rather
+  // than silently reading the omission as "no issues" — the previously
+  // flagged gap, reproduced directly against the real function, is closed.
+  assert.throws(() => reconcilePortfolio(flows, {}), /requires a resolveDataSet/);
+  assert.throws(() => reconcilePortfolio(flows), /requires a resolveDataSet/);
 
   // With a resolver supplied, the exact same dangling reference IS caught —
-  // proving the gap is "the check never ran," not "the check is broken."
+  // proving the check itself still works once a resolver is required.
   const withResolver = reconcilePortfolio(flows, { resolveDataSet: () => ({ found: false }) });
   assert.equal(withResolver.issues.some((i) => i.type === "unresolved-data-set-reference"), true);
 });
 
-test("SOFT SPOT: safe-execution-design's trust-zone checks (authoring authority, zone transition, verification compute, privileged-lane artifact) are skipped wholesale when context.zone is simply omitted — the hard security invariant alone is NOT a substitute", () => {
+test("CLOSED (was SOFT SPOT): safe-execution-design's trust-zone checks are no longer skipped wholesale when context.zone is omitted — omission itself now produces a named, non-bypassable blocker", () => {
   const flow = { id: "checkout-flow", boundaries: [] };
   const inventory = {
     owners: { qaOwner: "a", technicalOwner: "b" },
@@ -703,16 +711,16 @@ test("SOFT SPOT: safe-execution-design's trust-zone checks (authoring authority,
     .filter((b) => b.category === "trust-zone")
     .map((b) => b.capability);
 
-  // If this array is non-empty, the omission is NOT exploitable (something
-  // still caught it). If it is empty, checkAuthoringAuthority never ran —
-  // proving the soft spot is real: a privileged identity paired with
-  // trusted content and NO zone classification passes silently through
-  // trust-zones.mjs entirely, and only the (never-invoked-here)
-  // capability gate's own identity checks stand between this and
-  // activation.
-  assert.deepEqual(
-    trustZoneBlockerCategories,
-    [],
-    "expected zone-omission to skip every trust-zone check when content is (deliberately, for this probe) classified trusted",
+  // The omission is no longer exploitable: a missing context.zone now
+  // itself produces a named "zone-not-classified" blocker, so a privileged
+  // identity paired with trusted content and NO zone classification can
+  // never pass silently through trust-zones.mjs — activation is deferred
+  // regardless of what the (still never-invoked-here) capability gate's own
+  // identity checks would have allowed.
+  assert.ok(
+    trustZoneBlockerCategories.includes("zone-not-classified"),
+    "expected zone-omission to itself produce a named trust-zone blocker rather than skipping every zone-dependent check",
   );
+  assert.equal(result.decision.activate, false);
+  assert.equal(result.decision.state, "deferred");
 });
