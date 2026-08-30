@@ -109,6 +109,32 @@ function validateQuantity(q, p, issues) {
 }
 
 // ---------------------------------------------------------------------------
+// extra key safety
+//
+// CodeRabbit re-review finding on PR #177 (pilot-report.mjs:463):
+// validateMetric let metric.extra accept arbitrary string keys, but
+// renderMetric later writes each key as unescaped YAML mapping-key syntax
+// ("${key}:"). parseRestrictedYAML's mapping-key parser only round-trips a
+// PLAIN (unquoted) key that: starts with a letter, contains no ":"/"#"/
+// whitespace/newline/quote/bracket character (any of which either
+// prematurely ends the key at the first unquoted ": ", gets stripped as a
+// trailing comment, or trips a forbidden-indicator/flow-collection/
+// block-scalar rejection), and is not one of the parser's reserved scalar
+// words ("true"/"false"/"null" would parse back as a boolean/null instead
+// of the string key it started as, tripping "mapping keys must be plain
+// strings"). A valid JS object key containing any of that — a colon, a
+// newline — would corrupt the saved report on write, or make
+// resumePilotReport throw or silently return a different key on read back.
+// Restricting extra keys to this safe subset at validation time (fail
+// closed, consistent with the rest of the bundle) closes that gap.
+const PLAIN_YAML_KEY_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const RESERVED_YAML_KEY_WORDS = new Set(["true", "false", "null"]);
+
+function isSafePlainYamlKey(key) {
+  return typeof key === "string" && PLAIN_YAML_KEY_RE.test(key) && !RESERVED_YAML_KEY_WORDS.has(key);
+}
+
+// ---------------------------------------------------------------------------
 // Metric
 // ---------------------------------------------------------------------------
 
@@ -194,6 +220,12 @@ function validateMetric(metric, p, issues) {
       issues.add([...p, "extra"], "extra must be a mapping of named auxiliary Quantities when present");
     } else {
       for (const [key, value] of Object.entries(metric.extra)) {
+        if (!isSafePlainYamlKey(key)) {
+          issues.add(
+            [...p, "extra", key],
+            `extra key ${JSON.stringify(key)} is not a supported plain YAML key (must match ${PLAIN_YAML_KEY_RE} and not be a reserved word) — an unsupported key cannot round-trip through the restricted YAML writer/parser`,
+          );
+        }
         validateQuantity(value, [...p, "extra", key], issues);
       }
     }
@@ -460,6 +492,17 @@ function renderMetric(m, indent) {
     } else {
       lines.push(`${pad(indent + 2)}extra:`);
       for (const key of extraKeys) {
+        // Defense in depth: this should already be unreachable for a
+        // metric that passed validatePilotReport (see the "extra key
+        // safety" section above), but renderMetric has its own exported
+        // caller (renderPilotReportYAML) that a test or future caller could
+        // invoke on an unvalidated draft. Fail closed here too rather than
+        // silently emitting a key that could corrupt the written YAML.
+        if (!isSafePlainYamlKey(key)) {
+          throw new Error(
+            `pilot-report: cannot render extra key ${JSON.stringify(key)} — not a supported plain YAML key (must match ${PLAIN_YAML_KEY_RE} and not be a reserved word)`,
+          );
+        }
         lines.push(`${pad(indent + 4)}${key}:`);
         lines.push(...renderQuantity(m.extra[key], indent + 6));
       }

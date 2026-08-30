@@ -67,20 +67,41 @@ env_absence_run_scrubbed() {
       env > "$DYNAMIC_QA_ENV_FILE"
       : > "$DYNAMIC_QA_PROC_FILE"
 
+      # Print the comm= of every LIVE descendant of $1, walked recursively
+      # (not just direct children) using a breadth-first queue over
+      # `pgrep -P`. A command that starts a shell or package runner that in
+      # turn starts a forbidden model or browser-agent process puts that
+      # process at depth 2+ — a direct-children-only check would miss it
+      # entirely, so this walks the whole tree, one generation at a time,
+      # until no generation produces any further children.
+      list_descendant_comms() {
+        root_pid="$1"
+        command -v pgrep >/dev/null 2>&1 || return 0
+        frontier="$root_pid"
+        while [ -n "$frontier" ]; do
+          next=""
+          for p in $frontier; do
+            children="$(pgrep -P "$p" 2>/dev/null)"
+            for c in $children; do
+              ps -o comm= -p "$c" 2>/dev/null
+              next="$next $c"
+            done
+          done
+          frontier="$next"
+        done
+      }
+
       "$@" &
       cmd_pid=$!
 
-      # Sample the command process and its descendants at least once, then
-      # keep sampling until the command has exited. A do-while shape (sample
-      # first, check afterward) guarantees at least one sample even for a
-      # command that finishes before the loop gets to check it again.
+      # Sample the command process and its full descendant tree at least
+      # once, then keep sampling until the command has exited. A do-while
+      # shape (sample first, check afterward) guarantees at least one sample
+      # even for a command that finishes before the loop gets to check it
+      # again.
       while :; do
         ps -o comm= -p "$cmd_pid" 2>/dev/null >> "$DYNAMIC_QA_PROC_FILE"
-        if command -v pgrep >/dev/null 2>&1; then
-          pgrep -P "$cmd_pid" 2>/dev/null | while read -r child; do
-            ps -o comm= -p "$child" 2>/dev/null
-          done >> "$DYNAMIC_QA_PROC_FILE"
-        fi
+        list_descendant_comms "$cmd_pid" >> "$DYNAMIC_QA_PROC_FILE"
         kill -0 "$cmd_pid" 2>/dev/null || break
         sleep 0.02
       done

@@ -133,3 +133,50 @@ test("fail-closed: refuses a processing instruction other than the XML declarati
   const hostile = `<?xml version="1.0"?><?exec rm -rf / ?><testsuite name="s"></testsuite>`;
   assert.throws(() => parseJUnitXML(hostile), /processing instruction/);
 });
+
+test("a literal '</testcase>'-shaped string inside a <system-out> CDATA block never truncates the real body — the real <failure> after it is still observed", () => {
+  // CodeRabbit re-review finding on PR #177 (junit-report.mjs:78). A JUnit
+  // reporter routinely echoes captured stdout/stderr into a CDATA block,
+  // and that captured text is not trusted content: a test can print
+  // anything, including a string that happens to read like a real XML
+  // closing tag. Before the fix, caseRe's non-greedy "<\/testcase>" search
+  // ran directly against the raw text and matched that literal string
+  // INSIDE the CDATA block, truncating the body before the real <failure>
+  // that follows — silently recording an actually-failing test as
+  // "passed", the most dangerous direction this reader can be wrong in.
+  const xml =
+    `<testsuite name="s">` +
+    `<testcase classname="c" name="a" time="0.1">` +
+    `<system-out><![CDATA[some output that ends with </testcase> literally, not a real tag]]></system-out>` +
+    `<failure message="the real failure"/>` +
+    `</testcase>` +
+    `<testcase classname="c" name="b" time="0.1"/>` +
+    `</testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 2, "the CDATA-embedded fake closing tag must not swallow the second testcase either");
+  assert.equal(parsed.tests[0].name, "a");
+  assert.equal(parsed.tests[0].status, "failed", "a fake '</testcase>' inside CDATA output must never hide the real <failure> that follows it");
+  assert.equal(parsed.tests[0].message, "the real failure");
+  assert.equal(parsed.tests[1].name, "b");
+  assert.equal(parsed.tests[1].status, "passed");
+});
+
+test("a literal '</failure>'-shaped string inside a <failure> element's own CDATA message is preserved as content, not treated as the closing tag", () => {
+  // Same class of hazard, one level down: the failure MESSAGE itself
+  // (arbitrary test output) can contain text shaped like the failure
+  // element's own closing tag. The masked-boundary match must still find
+  // the real "</failure>", so the testcase parse does not run on past it
+  // and swallow whatever follows.
+  const xml =
+    `<testsuite name="s">` +
+    `<testcase classname="c" name="a" time="0.1">` +
+    `<failure><![CDATA[trace ends with </failure> literally]]></failure>` +
+    `</testcase>` +
+    `<testcase classname="c" name="b" time="0.1"/>` +
+    `</testsuite>`;
+  const parsed = parseJUnitXML(xml);
+  assert.equal(parsed.tests.length, 2, "the CDATA-embedded fake '</failure>' must not swallow the second testcase");
+  assert.equal(parsed.tests[0].status, "failed");
+  assert.equal(parsed.tests[0].message, "trace ends with </failure> literally");
+  assert.equal(parsed.tests[1].name, "b");
+});

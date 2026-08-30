@@ -33,8 +33,10 @@ VERIFY_ONLY=0
 # build_shared() below does `rm -rf "$DIST"` before writing the build. An
 # override that names any writable directory would make that an arbitrary
 # `rm -rf` of whatever the caller (or a hostile env) pointed it at. Resolve
-# DIST to its real path and fail closed unless it is $HERE itself or a
-# descendant of $HERE — the only trees this script is allowed to delete.
+# DIST to its real path and fail closed unless it is a STRICT descendant of
+# $HERE — never $HERE itself (that would delete the build source, including
+# qa-setup and qa-generate, before this script tries to copy them), never a
+# parent of $HERE, and never a path that resolves outside $HERE.
 validate_dist_is_descendant_of_here() {
   local candidate="$DIST" resolved parent
 
@@ -61,10 +63,13 @@ validate_dist_is_descendant_of_here() {
   resolved="$(cd "$candidate" && pwd)$tail"
 
   case "$resolved" in
-    "$HERE"|"$HERE"/*)
+    "$HERE")
+      fail "DYNAMIC_QA_DIST ($DIST) resolves to $resolved, which IS $HERE itself — refusing to build, because build.sh would rm -rf the build source (including qa-setup and qa-generate) before copying it. Point DYNAMIC_QA_DIST at a path strictly under $HERE, or unset it to use the default."
+      ;;
+    "$HERE"/*)
       ;;
     *)
-      fail "DYNAMIC_QA_DIST ($DIST) resolves to $resolved, which is not $HERE itself or a descendant of it — refusing to build, because build.sh rm -rf's this directory. Point DYNAMIC_QA_DIST at a path under $HERE, or unset it to use the default."
+      fail "DYNAMIC_QA_DIST ($DIST) resolves to $resolved, which is not a strict descendant of $HERE — refusing to build, because build.sh rm -rf's this directory. Point DYNAMIC_QA_DIST at a path under $HERE, or unset it to use the default."
       ;;
   esac
 }
@@ -246,15 +251,20 @@ write_manifest() {
   # dist/shared, dist/codex, and dist/opencode alike — each file hashed,
   # digests concatenated in path order, then hashed again. Excludes
   # timestamps and machine-local paths, same shape as capabilities.json's
-  # per-harness ladder fingerprint. BUNDLE_MANIFEST.json itself is the only
-  # exclusion (it does not exist yet at this point, but is excluded by name
+  # per-harness ladder fingerprint. The ROOT-level dist/BUNDLE_MANIFEST.json
+  # is the only exclusion (matched by path, "./BUNDLE_MANIFEST.json", never
+  # by bare name — it does not exist yet at this point, but is excluded
   # regardless, so a later re-verify over an already-manifested dist/ hashes
-  # the same input): every other emitted artifact — including the Codex
-  # overlays and OpenCode command adapters BUNDLE_MANIFEST.json declares as
-  # separate builds — is part of the canonical digest, so two bundles that
-  # differ only in adapter content are never assigned the same digest.
+  # the same input). A file that happens to share that name at any OTHER
+  # depth is a real emitted artifact and stays IN the digest: excluding by
+  # bare name would let such a file change without moving contentDigest,
+  # which defeats the whole point of a content-addressed manifest. Every
+  # other emitted artifact — including the Codex overlays and OpenCode
+  # command adapters BUNDLE_MANIFEST.json declares as separate builds — is
+  # part of the canonical digest, so two bundles that differ only in
+  # adapter content are never assigned the same digest.
   local filelist
-  filelist="$(cd "$DIST" && find . -type f ! -name 'BUNDLE_MANIFEST.json' | sort)"
+  filelist="$(cd "$DIST" && find . -type f ! -path './BUNDLE_MANIFEST.json' | sort)"
   while IFS= read -r rel; do
     [ -z "$rel" ] && continue
     f="$DIST/$rel"

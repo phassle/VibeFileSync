@@ -324,3 +324,90 @@ test("savePilotReportToRepo round-trips string values needing escaping (quotes, 
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
+
+// CodeRabbit re-review finding on PR #177 (pilot-report.mjs:463):
+// validateMetric accepted arbitrary metric.extra keys, but renderMetric
+// wrote each key as unescaped YAML mapping-key syntax — a key containing
+// ":" or a newline can corrupt the saved report and make resumePilotReport
+// fail. These two tests prove: (1) such a key is rejected at validation
+// time (fail closed, never silently written), and (2) a metric with only
+// safe extra keys still round-trips end to end through
+// savePilotReportToRepo/resumePilotReport.
+
+test("a metric.extra key containing ':' is rejected by validatePilotReport, never silently written", () => {
+  const metrics = fullyKnownMetrics().map((m) =>
+    m.id === "maintenance-time" ? { ...m, extra: { "p95:injected": knownQuantity(1) } } : m,
+  );
+  const draft = {
+    schema: "dynamic-qa-pilot-report-v1",
+    id: "vibefilesync-pilot",
+    revision: 1,
+    repository: "phassle/VibeFileSync",
+    window: { allBindingsActiveAt: ACTIVE_SINCE },
+    metrics,
+    status: "pilot-incomplete",
+    generatedAt: ACTIVE_SINCE,
+  };
+  const { valid, errors } = validatePilotReport(draft, { now: ACTIVE_SINCE });
+  assert.equal(valid, false);
+  assert.ok(
+    errors.some((e) => e.message.includes("not a supported plain YAML key")),
+    JSON.stringify(errors),
+  );
+
+  // Defense in depth: even bypassing validation and rendering the draft
+  // directly, the writer itself must refuse rather than emit corrupt YAML.
+  assert.throws(() => renderPilotReportYAML(draft), /not a supported plain YAML key/);
+});
+
+test("a metric.extra key containing a newline is rejected by validatePilotReport, never silently written", () => {
+  const metrics = fullyKnownMetrics().map((m) =>
+    m.id === "maintenance-time" ? { ...m, extra: { "line\nbreak": knownQuantity(1) } } : m,
+  );
+  const draft = {
+    schema: "dynamic-qa-pilot-report-v1",
+    id: "vibefilesync-pilot",
+    revision: 1,
+    repository: "phassle/VibeFileSync",
+    window: { allBindingsActiveAt: ACTIVE_SINCE },
+    metrics,
+    status: "pilot-incomplete",
+    generatedAt: ACTIVE_SINCE,
+  };
+  const { valid, errors } = validatePilotReport(draft, { now: ACTIVE_SINCE });
+  assert.equal(valid, false);
+  assert.ok(
+    errors.some((e) => e.message.includes("not a supported plain YAML key")),
+    JSON.stringify(errors),
+  );
+});
+
+test("a metric with only safe extra keys round-trips through savePilotReportToRepo/resumePilotReport", () => {
+  const repoRoot = tempRepoRoot();
+  try {
+    const metrics = fullyKnownMetrics().map((m) =>
+      m.id === "maintenance-time"
+        ? { ...m, extra: { maxEventMinutes: knownQuantity(45), p95_alt: knownQuantity(3) } }
+        : m,
+    );
+    const report = buildPilotReport(
+      {
+        id: "vibefilesync-pilot",
+        revision: 1,
+        repository: "phassle/VibeFileSync",
+        window: { allBindingsActiveAt: ACTIVE_SINCE },
+        metrics,
+        generatedAt: WELL_PAST_WINDOW,
+      },
+      { now: WELL_PAST_WINDOW },
+    );
+    savePilotReportToRepo(repoRoot, report);
+    const resumed = resumePilotReport(repoRoot, { now: WELL_PAST_WINDOW });
+    assert.equal(resumed.valid, true, JSON.stringify(resumed.errors));
+    const maintenanceTime = resumed.report.metrics.find((m) => m.id === "maintenance-time");
+    assert.equal(maintenanceTime.extra.maxEventMinutes.value, 45);
+    assert.equal(maintenanceTime.extra.p95_alt.value, 3);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});

@@ -158,6 +158,32 @@ grep -q '"version"' "$manifest" || fail "$manifest missing version"
 grep -q '"contentDigest": "sha256:' "$manifest" || fail "$manifest missing a sha256 contentDigest"
 pass "bundle release is versioned and content-addressed via BUNDLE_MANIFEST.json"
 
+# A nested file named BUNDLE_MANIFEST.json (at any depth other than the dist
+# root) is a real emitted artifact and must move contentDigest when its
+# content changes. The digest computation must exclude ONLY the root
+# dist/BUNDLE_MANIFEST.json by path, never any file that merely shares that
+# bare name deeper in the tree — a bare-name exclusion would let such a file
+# change without moving contentDigest, defeating the point of a
+# content-addressed manifest. Proven here against a disposable full copy of
+# the dynamic-qa source tree, so the real dist/ this script already built is
+# never disturbed.
+TMP_DIGEST="$(mktemp -d "${TMPDIR:-/tmp}/dynamic-qa-digest-test.XXXXXX")"
+cp -R "$HERE/." "$TMP_DIGEST/"
+rm -rf "$TMP_DIGEST/dist"
+mkdir -p "$TMP_DIGEST/qa-setup/nested-artifact-dir"
+echo '{"nested":"v1"}' > "$TMP_DIGEST/qa-setup/nested-artifact-dir/BUNDLE_MANIFEST.json"
+"$TMP_DIGEST/build.sh" >/dev/null
+nested_out="$TMP_DIGEST/dist/shared/qa-setup/nested-artifact-dir/BUNDLE_MANIFEST.json"
+[ -f "$nested_out" ] || fail "nested BUNDLE_MANIFEST.json fixture did not make it into dist/ — test setup is broken"
+digest_v1="$(grep -o '"contentDigest": "sha256:[^"]*"' "$TMP_DIGEST/dist/BUNDLE_MANIFEST.json")"
+echo '{"nested":"v2-changed"}' > "$TMP_DIGEST/qa-setup/nested-artifact-dir/BUNDLE_MANIFEST.json"
+"$TMP_DIGEST/build.sh" >/dev/null
+digest_v2="$(grep -o '"contentDigest": "sha256:[^"]*"' "$TMP_DIGEST/dist/BUNDLE_MANIFEST.json")"
+[ "$digest_v1" != "$digest_v2" ] \
+  || fail "changing a nested (non-root) BUNDLE_MANIFEST.json-named file did not change contentDigest — the digest exclusion is matching by bare name instead of by root path"
+rm -rf "$TMP_DIGEST"
+pass "a nested file named BUNDLE_MANIFEST.json affects contentDigest; only the dist root manifest is excluded"
+
 # The real-$HOME-unchanged comparison (and the final "all checks passed"
 # line) runs unconditionally in the on_exit EXIT trap above, not here — see
 # its comment for why.
