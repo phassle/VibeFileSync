@@ -1,0 +1,71 @@
+# Pilot Flow Definition (dynamic-qa-flow-v1) — VibeFileSync brownfield pilot,
+# flow 2 of 5 (ticket #172, SPEC-135.md §13 "Mirror archives
+# destination-only content").
+#
+# state: deferred — see dynamic-qa/pilot/vibefilesync/README.md.
+#
+# Grounds this Flow in Mirror's real removal guarantee (CONTEXT.md's
+# "Mirror" and "SafetyNet" entries): Mirror is the only mode that removes a
+# destination object for being absent from the source, and that removal
+# still goes through SafetyNet unless `--permanent-delete` was explicitly
+# selected. The Binding reuses the real-binary test
+# `tests/cli.rs::mirror_deletion_archives_old_file_and_leaves_safetynet_untouched`.
+schema: dynamic-qa-flow-v1
+id: mirror-destination-only-retention
+revision: 1
+title: "Mirror mode archives a destination-only file into a new SafetyNet Run folder, leaving prior archives untouched"
+intent: "Prove that Mirror's removal path never silently discards a destination-only file: the removed content is retained in a new SafetyNet Run folder, and pre-existing SafetyNet content from earlier runs is never touched."
+criticality: critical
+state: deferred
+origin:
+  tickets:
+    - "https://github.com/phassle/VibeFileSync/issues/4"
+    - "https://github.com/phassle/VibeFileSync/issues/172"
+test_level:
+  selection: inferred
+data_sets: []
+boundaries:
+  - id: vibesync-cli
+    system: "the vibesync CLI binary"
+    treatment: real
+    behavior: "Invoke Mirror mode's Run against a Folder pair whose destination holds a file absent from the source, plus a pre-existing SafetyNet Run folder from an earlier run."
+    side_effects: "none"
+    role: owned
+  - id: system-clock
+    system: "the system clock"
+    treatment: simulated
+    behavior: "The Run id is a UTC timestamp; the test does not depend on any particular wall-clock value."
+    side_effects: "none"
+    volatile: true
+  - id: production-paths
+    system: "production paths, user HOME, and external volumes"
+    treatment: forbidden
+    behavior: "No production or developer HOME path is read or written; only disposable temporary trees are touched."
+    side_effects: "none"
+  - id: safetynet-archive
+    system: "the local SafetyNet archive under the destination tempdir"
+    treatment: real
+    behavior: "The run creates one new Run folder under _SafetyNet/ holding the removed destination-only file, without modifying any earlier Run folder already present."
+    side_effects: "Creates one new Run folder under a disposable temporary destination root; never deletes or edits an existing one."
+    isolation:
+      namespace: "one tempfile::TempDir per test, created fresh by tests/cli.rs::Fixture::new"
+      cleanup: "the Rust test harness removes the tempdir on both success and failure"
+steps:
+  - id: given-mirror-pair-with-destination-only-file-and-prior-archive
+    kind: given
+    intent: "A Folder pair uses Mirror mode; the destination holds a file absent from the source, and _SafetyNet/ already holds one Run folder from an earlier run."
+  - id: when-run-executes-with-empty-source-allowed
+    kind: when
+    intent: "Run executes with the empty-source override and completes for that Folder pair."
+  - id: then-destination-only-file-removed-and-archived-prior-archive-untouched
+    kind: then
+    intent: "The destination-only file is gone from the live destination, is retrievable from exactly one new SafetyNet Run folder, and the pre-existing Run folder from the earlier run is unchanged."
+    outcomes:
+      - id: destination-only-file-removed-from-live-destination
+        expect: "The removed file no longer exists at its live destination path."
+      - id: exactly-one-new-safetynet-run-folder
+        expect: "Exactly one new Run folder (other than the pre-existing one) exists under _SafetyNet/."
+      - id: new-safetynet-run-folder-holds-removed-content
+        expect: "The new Run folder's copy of the file reads '${case.removedContent}'."
+      - id: prior-safetynet-run-folder-unchanged
+        expect: "The pre-existing Run folder's own file still reads '${case.priorArchivedContent}'."
