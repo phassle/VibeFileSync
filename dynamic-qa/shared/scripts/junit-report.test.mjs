@@ -186,11 +186,13 @@ test("a literal '</testcase>'-shaped string inside an XML COMMENT never truncate
   assert.equal(parsed.tests[1].status, "passed");
 });
 
-test("a tag-shaped string inside the leading <?xml ...?> declaration does not defeat the first testsuite/testcase boundary match", () => {
-  // Processing instructions other than the XML declaration are rejected
-  // outright (see the fail-closed tests below), so the only PI region this
-  // parser ever has to mask is the XML declaration itself. A value inside
-  // it that happens to read like a tag boundary must still be neutralized.
+test("a tag-shaped string inside a MALFORMED <?xml ...?> declaration does not defeat the first testsuite/testcase boundary match", () => {
+  // Deliberately malformed, and named as such. A conformant XML declaration
+  // admits only version/encoding/standalone, so a tag-shaped string cannot
+  // legally appear in one at all -- `xml.etree` rejects this document. What
+  // this asserts is robustness: given a malformed declaration, the parser must
+  // still find the real boundaries rather than stopping at the tag-shaped
+  // text. It does not claim a real reporter would ever emit this.
   const xml =
     `<?xml version="1.0" comment="</testsuite>"?>` +
     `<testsuite name="s"><testcase classname="c" name="only" time="0.1"/></testsuite>`;
@@ -200,9 +202,13 @@ test("a tag-shaped string inside the leading <?xml ...?> declaration does not de
   assert.equal(parsed.tests[0].name, "only");
 });
 
-test("a tag-shaped string inside a DOCTYPE declaration (no internal subset, so no ENTITY) does not defeat boundary matching", () => {
+test("a tag-shaped string inside a DOCTYPE system identifier (well-formed XML, no internal subset) does not defeat boundary matching", () => {
+  // This one IS well-formed: a SystemLiteral admits any character except its
+  // own quote, so "</testcase>" is legal there -- whereas a PubidLiteral would
+  // not admit '<' or '>'. So this is the realistic shape of the hazard, and
+  // masking DOCTYPE regions earns its place rather than being merely defensive.
   const xml =
-    `<!DOCTYPE testsuite "-//dynamic-qa//DTD testsuite </testcase> fake//EN">` +
+    `<!DOCTYPE testsuite SYSTEM "urn:dynamic-qa:</testcase>:fake">` +
     `<testsuite name="s"><testcase classname="c" name="only" time="0.1"/></testsuite>`;
   const parsed = parseJUnitXML(xml);
   assert.equal(parsed.testsuiteName, "s");
