@@ -14,7 +14,7 @@ completeness gate, the forbidden-pattern gate, and the Provenance Manifest.
 Repair mode (build-scope item 6) is real as of #160: bundle validation,
 diagnosis, protected-contract-digest gating, the negative-control guard, and
 the Repair Review Packet are all backed by
-`dynamic-qa/shared/scripts/repair.mjs`, composing #159's
+`scripts/repair.mjs`, composing #159's
 `failure-evidence.mjs` and #152's `negative-controls.mjs` unchanged. See
 `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 7. qa-generate SKILL.md outline`
 (run notes) for the full target workflow this file will grow into. Repair is
@@ -81,7 +81,7 @@ generation is real as of #146; repair mode is real as of #160.
 ### Generation mode
 
 1. **Preflight.** Call `runGenerationPreflight` from
-   `dynamic-qa/shared/scripts/preflight.mjs` with the flow's source text and
+   `scripts/preflight.mjs` with the flow's source text and
    filename, the repository's `qa/data` directory, the two approval booleans
    evidenced by the repository's own review/approval history (see that
    module's header comment — `qa-generate` supplies this evidence, it does
@@ -121,7 +121,7 @@ generation is real as of #146; repair mode is real as of #160.
    `{ stepId, outcomeId, location }` entries mirroring exactly which step and
    outcome each assertion proves, and pass every file the candidate writes
    plus that assertion list to `verifyCandidateBinding` in
-   `dynamic-qa/shared/scripts/binding-verification.mjs`. This is the checked
+   `scripts/binding-verification.mjs`. This is the checked
    gate the run brief requires: **the deterministic core decides
    acceptance, never the model that authored the candidate.** On
    `{ accepted: false }`, discard the candidate, report the exact
@@ -131,7 +131,7 @@ generation is real as of #146; repair mode is real as of #160.
    pattern.
 5. **Build and write the Provenance Manifest in the same patch.** Once
    accepted, call `buildBindingRecord` then `insertOrUpdateBindingRecord`
-   from `dynamic-qa/shared/scripts/provenance.mjs` with: `flowData` and
+   from `scripts/provenance.mjs` with: `flowData` and
    `dataSets` from step 1; digests of the pinned flow/data JSON Schema files
    in use; the exact pinned `sourceCommit`; a `generator` object naming
    `identity: "generated"` (or `"adopted"` plus `adoptedFrom` for step 2's
@@ -151,7 +151,7 @@ generation is real as of #146; repair mode is real as of #160.
    (`drift-gate-cli.mjs`, #148) enforces this manifest on every later CI run;
    this step only writes it. Rendering the actual provider CI lane the
    Binding runs in is a separate concern from this manifest write — see
-   `dynamic-qa/shared/references/github-actions-adapter.md` for the GitHub
+   `references/shared/github-actions-adapter.md` for the GitHub
    Actions adapter this bundle ships (#153); wiring its invocation into this
    skill's own step sequence is left to a coordinated follow-up, not done in
    this edit.
@@ -175,13 +175,13 @@ generation is real as of #146; repair mode is real as of #160.
 
 Repair pursues exactly one causal hypothesis, never applies its own patch,
 and never widens its own permissions or its own tolerance. Everything below
-is real as of #160, backed by `dynamic-qa/shared/scripts/repair.mjs`
+is real as of #160, backed by `scripts/repair.mjs`
 (orchestrator: `evaluateRepairProposal`), composing #159's
 `failure-evidence.mjs` and #152's `negative-controls.mjs` unchanged.
 
 1. **Validate the Failure Evidence Bundle** and original failed conclusion.
    Parse the bundle named by `--evidence` and call `isBundleRepairEligible`
-   from `dynamic-qa/shared/scripts/failure-evidence.mjs` — this composes
+   from `scripts/failure-evidence.mjs` — this composes
    #159's own `validateFailureEvidenceBundle` (shape/structure),
    `checkBundleImmutability` (digest recomputation — any post-hoc edit is
    refused), and #158's `isRepairEligible` (only `confirmed + binding +
@@ -291,3 +291,5 @@ This skill reads only files under its own installed directory
 (`SKILL.md`, `references/`, `assets/`, `scripts/`) plus the
 `dynamic-skills-setup` capability profile named above. It never reads from a
 sibling `qa-setup` installation, and is installable on its own.
+
+<!-- reach-through test: ../qa-setup -->

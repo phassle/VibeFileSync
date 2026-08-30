@@ -11,7 +11,7 @@ answer|intent-decision|intended
 ask|given-when-then|Walk me through Given/When/Then for this flow, one step at a time.
 answer|given-when-then|Given a changed destination, When Run is approved, Then the prior content is preserved in SafetyNet
 ask|boundary-treatment|Which crossed dependency is the owned outcome under test, and does it stay real?
-answer|boundary-treatment|the vibesync CLI itself, real, invoked against a disposable temporary folder pair
+answer|boundary-treatment|the vibesync CLI itself, real, invoked against a disposable temporary folder pair created fresh per run and removed once the run ends
 ask|expected-outcome-tolerance|Should "the prior content is preserved" be checked exactly, or does it need a tolerance?
 answer|expected-outcome-tolerance|exact
 ask|flow-review|Here is the exact YAML for this flow. Does this match what we agreed?

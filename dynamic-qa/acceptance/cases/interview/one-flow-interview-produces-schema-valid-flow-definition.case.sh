@@ -18,6 +18,26 @@
 # writes nothing to the fixture repository — the rendered YAML is a review
 # artifact in $FIXTURE_LOG, not a repository file, since only stage 10's
 # Setup Review Packet may write.
+#
+# `assembleAndRenderFlowDefinition` validates the Flow Definition's *shape*
+# only (#143/#145's boundaries.mjs, via flow-definition.mjs) — by design,
+# #145's cross-cutting boundary-policy.mjs (owned-outcome-stays-real,
+# volatile-can-never-be-real, forbidden-must-be-honourable, and real side
+# effects require isolation.namespace/isolation.cleanup) is a separate,
+# later gate that qa-generate's preflight.mjs runs before Binding
+# generation, not something stage 5's own assembly re-checks. That split is
+# intentional (a QA Owner may still be shaping a boundary's exact isolation
+# strategy after the Flow Review), but it means a Flow Review this case
+# presents as "agreed" must still be genuinely boundary-policy-compliant —
+# otherwise the QA Owner would approve a Flow Definition that is silently
+# guaranteed to fail later, at generation time, for a reason stage 5 never
+# surfaced. This case's fixture boundary therefore also declares
+# `isolation.namespace`/`isolation.cleanup` (a real side-effect boundary
+# requires both), and `case_run` additionally calls the real
+# `validateBoundaryPolicy` directly against the assembled flow's boundaries
+# and asserts it comes back clean — so this case genuinely proves the
+# reviewed Flow Definition would also survive the later boundary-policy
+# gate, not merely that it is schema-shaped.
 
 case_describe="a one-flow interview, asked one question at a time, produces exactly one schema-valid Flow Definition linked to its originating ticket"
 
@@ -42,6 +62,7 @@ case_run() {
   node --input-type=module -e "
     import { makeObservationFact, confirmIntent } from '$DYNAMIC_QA_ROOT/shared/scripts/posture.mjs';
     import { assembleAndRenderFlowDefinition } from '$DYNAMIC_QA_ROOT/shared/scripts/flow-assembly.mjs';
+    import { validateBoundaryPolicy } from '$DYNAMIC_QA_ROOT/shared/scripts/boundary-policy.mjs';
     import { writeFileSync } from 'node:fs';
 
     // Stage 3's choke point, reused rather than re-derived: the observation
@@ -76,6 +97,10 @@ case_run() {
           behavior: 'Invoke the CLI Update mode against a temporary folder pair.',
           side_effects: 'Writes only inside disposable temporary directories created for this run.',
           role: 'owned',
+          isolation: {
+            namespace: 'a fresh temporary source/destination folder pair created for this run',
+            cleanup: 'the temporary folder pair is removed once the run ends, including on failure',
+          },
         },
       ],
       steps: [
@@ -97,6 +122,19 @@ case_run() {
     };
 
     const result = assembleAndRenderFlowDefinition(interview);
+
+    // This case's own claim (see the header comment) is not just schema
+    // validity — it is that the reviewed Flow Definition is also genuinely
+    // boundary-policy-compliant, i.e. would still pass at qa-generate's
+    // later preflight gate. assembleAndRenderFlowDefinition never calls
+    // validateBoundaryPolicy itself (that gate lives in preflight.mjs), so
+    // this case calls the real function directly against the assembled
+    // flow's boundaries rather than only asserting schema validity and
+    // assuming the rest.
+    const boundaryPolicyIssues = result.valid
+      ? validateBoundaryPolicy(result.flow.boundaries, ['boundaries'])
+      : null;
+
     writeFileSync('$FIXTURE_LOG/flow-review.yaml', result.valid ? result.yaml : '');
     process.stdout.write(JSON.stringify({
       valid: result.valid,
@@ -104,6 +142,7 @@ case_run() {
       flowId: result.valid ? result.flow.id : null,
       originTickets: result.valid ? result.flow.origin.tickets : null,
       digest: result.valid ? result.digest : null,
+      boundaryPolicyIssues,
     }));
   " > "$FIXTURE_LOG/interview-result.json"
 
@@ -135,4 +174,13 @@ case_assert() {
   assert_file_exists "$FIXTURE_LOG/flow-review.yaml" "stage 5's exact YAML Flow Review artifact was not produced"
   assert_contains "$FIXTURE_LOG/flow-review.yaml" 'schema: "dynamic-qa-flow-v1"' \
     "the rendered review YAML must declare the v1 schema"
+
+  # Schema-valid is not the whole claim: the agreed Flow Review must also be
+  # genuinely boundary-policy-compliant, so a QA Owner who approves it here
+  # is never surprised by a boundary-policy rejection later at qa-generate's
+  # preflight gate. `boundaryPolicyIssues` comes from calling the real
+  # validateBoundaryPolicy (boundary-policy.mjs) against the assembled
+  # flow's own boundaries, not a re-assertion of schema validity.
+  assert_contains "$FIXTURE_LOG/interview-result.json" '"boundaryPolicyIssues":[]' \
+    "the vibesync-cli boundary declares real side effects, so it must also satisfy validateBoundaryPolicy (owned/real, and isolation.namespace + isolation.cleanup present) with zero issues — not merely pass schema shape validation"
 }

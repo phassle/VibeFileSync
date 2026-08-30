@@ -14,14 +14,14 @@ readiness; ticket #168: provider-native CI design; ticket #169: Setup
 Review Packet, emit patch and stop). See
 `dynamic-qa/DESIGN-dynamic-qa-spec.md ## 6. qa-setup SKILL.md outline` (run
 notes) for the full target workflow this file grew into,
-`dynamic-qa/shared/references/authority-and-inventory.md` for stages 1–2,
-`dynamic-qa/shared/references/posture-specific-evidence.md` for stage 3,
-`dynamic-qa/shared/references/candidate-ranking-and-interviews.md` for
-stages 4–5, `dynamic-qa/shared/references/portfolio-reconciliation.md` for
-stage 6, `dynamic-qa/shared/references/safe-execution-design.md` for
-stage 7, `dynamic-qa/shared/references/baseline-plan.md` for stage 8,
-`dynamic-qa/shared/references/ci-design.md` for stage 9, and
-`dynamic-qa/shared/references/setup-review-packet.md` for stage 10 below.
+`references/shared/authority-and-inventory.md` for stages 1–2,
+`references/shared/posture-specific-evidence.md` for stage 3,
+`references/shared/candidate-ranking-and-interviews.md` for
+stages 4–5, `references/shared/portfolio-reconciliation.md` for
+stage 6, `references/shared/safe-execution-design.md` for
+stage 7, `references/shared/baseline-plan.md` for stage 8,
+`references/shared/ci-design.md` for stage 9, and
+`references/shared/setup-review-packet.md` for stage 10 below.
 
 ## Explicit invocation only
 
@@ -85,7 +85,7 @@ an agent can never impersonate the accountable human.
 
 1. **Check the invocation gate first.** Classify how this run started
    (explicit user command, explicit coordinator selection, or anything else)
-   and evaluate it against `shared/scripts/authority.mjs`'s
+   and evaluate it against `scripts/authority.mjs`'s
    `evaluateInvocation`. Anything other than an explicit command or explicit
    coordinator selection — a natural-language mention, an inferred intent,
    another skill invoking this one on its own initiative, or a source this
@@ -116,7 +116,7 @@ an agent can never impersonate the accountable human.
    it. Domain Experts are invited into stage 5's per-flow interview later;
    they are never asked to approve the portfolio or the review packet.
 
-See `shared/references/authority-and-inventory.md` for the full rationale
+See `references/shared/authority-and-inventory.md` for the full rationale
 and the deterministic core's test coverage for each rule above.
 
 ## Stage 2: Inventory facts read-only
@@ -126,7 +126,7 @@ in the repository, so they decide policy instead of reciting facts you could
 have found yourself.
 
 1. **Run the inventory scan.** Call
-   `shared/scripts/inventory.mjs`'s `buildSetupInventory(repoRoot)`. It
+   `scripts/inventory.mjs`'s `buildSetupInventory(repoRoot)`. It
    combines:
    - existing tests and the outcome they already prove
      (`inventory-tests.scanExistingTests`);
@@ -137,7 +137,7 @@ have found yourself.
    Every returned fact carries `observed`, `reported`, or `unknown`
    provenance (`fact.mjs`); the whole inventory is validated before use.
    This scan is read-only by construction — see
-   `shared/references/authority-and-inventory.md` for how that is enforced
+   `references/shared/authority-and-inventory.md` for how that is enforced
    and tested.
 2. **Present the inventory as evidence, not intended behavior.** Summarize
    what was found (`inventory.summarizeProvenance` gives the
@@ -150,7 +150,7 @@ have found yourself.
    repository. Nothing from this stage touches a repository file, provider
    policy, secret, or piece of infrastructure.
 
-See `shared/references/authority-and-inventory.md` for the detailed
+See `references/shared/authority-and-inventory.md` for the detailed
 breakdown of every fact category and how secret names are handled without
 ever reading a value.
 
@@ -167,7 +167,7 @@ and a not-yet-built flow must never get an invented one.
    Owner) directly: is this repository brownfield (the application exists)
    or greenfield (it does not yet)? Classify the answer's source
    (`qa-owner-declaration` or `technical-owner-declaration`) and evaluate it
-   with `shared/scripts/posture.mjs`'s `evaluatePostureDeclaration`. Do
+   with `scripts/posture.mjs`'s `evaluatePostureDeclaration`. Do
    **not** decide posture yourself from what stage 2's inventory or
    `posture.repositoryShapeSignal` shows — that signal exists only to give
    the human something concrete to react to ("discovery found substantial
@@ -200,7 +200,7 @@ and a not-yet-built flow must never get an invented one.
    ticket(s) or worked example(s) describe each candidate flow's intended
    behaviour, and record each as a source (`type`, `reference`,
    `approvedBy`, `approvedByRole`) for
-   `shared/scripts/posture.mjs`'s `requireApprovedGreenfieldEvidence`. A
+   `scripts/posture.mjs`'s `requireApprovedGreenfieldEvidence`. A
    flow with no valid approved source stays blocked for this stage — do not
    invent plausible-sounding behaviour to fill the gap, and do not accept a
    Domain Expert's description alone as the approving authority
@@ -214,7 +214,7 @@ and a not-yet-built flow must never get an invented one.
    that flow going into stage 4's ranking — never a weaker Expected Outcome,
    a widened tolerance, or a flow silently dropped from consideration.
 
-See `shared/references/posture-specific-evidence.md` for the full rationale,
+See `references/shared/posture-specific-evidence.md` for the full rationale,
 the exact shape of `brownfield-observation` and `greenfield-source` facts,
 and the deterministic core's test coverage for each rule above.
 
@@ -229,7 +229,7 @@ whichever flow came to mind first.
    (`intentStatus: "confirmed-intended"` brownfield observations,
    `greenfield-source` facts with `provenance: "reported"`) — never from
    imagination. For each candidate, construct it with
-   `shared/scripts/candidate-ranking.mjs`'s `makeCandidateFlow`, which fails
+   `scripts/candidate-ranking.mjs`'s `makeCandidateFlow`, which fails
    closed on a missing originating ticket link, exactly as stage 5's Flow
    Definition will (AC: "each flow linked to originating tickets, so its
    purpose and implementation context remain traceable").
@@ -259,7 +259,7 @@ whichever flow came to mind first.
    blocked candidate, never silently drop it or rank it as if its evidence
    were settled.
 
-See `shared/references/candidate-ranking-and-interviews.md` for the full
+See `references/shared/candidate-ranking-and-interviews.md` for the full
 rationale and the deterministic core's test coverage for each rule above.
 
 ## Stage 5: Interview one flow at a time
@@ -277,7 +277,7 @@ flows from one interview, and never a partial one left half-assembled.
 2. **Cite evidence only through the choke point already built.** When an
    Expected Outcome's wording rests on a specific brownfield observation or
    greenfield source, cite that fact and let
-   `shared/scripts/flow-assembly.mjs`'s `evidenceIsEligibleForExpectedOutcome`
+   `scripts/flow-assembly.mjs`'s `evidenceIsEligibleForExpectedOutcome`
    decide eligibility — for a brownfield fact this delegates entirely to
    ticket #163's `posture.canBecomeExpectedOutcome`; do not read
    `intentStatus` directly here. An Expected Outcome may also be authored
@@ -309,7 +309,7 @@ flows from one interview, and never a partial one left half-assembled.
    unapproved custom tolerance) is a blocker to resolve with the QA Owner
    before moving to the next flow, never a shape to quietly relax.
 
-See `shared/references/candidate-ranking-and-interviews.md` for the full
+See `references/shared/candidate-ranking-and-interviews.md` for the full
 rationale and the deterministic core's test coverage for each rule above.
 
 ## Stage 6: Reconcile the portfolio
@@ -319,7 +319,7 @@ set together — a pile of independently-sensible interviews can still be an
 incoherent portfolio.
 
 1. **Run reconciliation across every assembled Flow Definition.** Call
-   `shared/scripts/portfolio-reconciliation.mjs`'s `reconcilePortfolio` over
+   `scripts/portfolio-reconciliation.mjs`'s `reconcilePortfolio` over
    the full in-memory set stage 5 produced (nothing has been written to the
    repository yet). It surfaces, by name: duplicate flows, contradictory
    Expected Outcomes, conflicting boundary treatments for a shared
@@ -359,7 +359,7 @@ incoherent portfolio.
    expected stopping point to report, not an error to explain away or a
    reason to loosen anything.
 
-See `shared/references/portfolio-reconciliation.md` for the full rationale
+See `references/shared/portfolio-reconciliation.md` for the full rationale
 and the deterministic core's test coverage for each rule above.
 
 ## Stage 7: Define safe execution
@@ -388,7 +388,7 @@ already built, not a new safety model:
   never combines with a privileged identity, broad filesystem access, or
   unrestricted network reach.
 
-`shared/scripts/safe-execution-design.mjs` is where this stage's own logic
+`scripts/safe-execution-design.mjs` is where this stage's own logic
 lives, and it calls both of the above directly rather than re-deriving any
 of their checks:
 
@@ -451,9 +451,9 @@ of their checks:
    updated, re-run `designExecutionProfile` for that flow; do not assume a
    fix worked without seeing its blocker disappear from a fresh run.
 
-See `shared/references/safe-execution-design.md`,
-`shared/references/execution-profiles.md`, and
-`shared/references/trust-zones.md` for the full rationale and the
+See `references/shared/safe-execution-design.md`,
+`references/shared/execution-profiles.md`, and
+`references/shared/trust-zones.md` for the full rationale and the
 deterministic core's test coverage for each rule above.
 ## Stage 8: Establish measurement readiness
 
@@ -463,7 +463,7 @@ the pilot improves anything. This stage never invents a number and never
 treats missing evidence as zero.
 
 1. **Load or start the Baseline Plan.** Call
-   `shared/scripts/baseline-plan.mjs`'s `resumeBaselinePlan(repoRoot)`.
+   `scripts/baseline-plan.mjs`'s `resumeBaselinePlan(repoRoot)`.
    This reads only `qa/baseline-plan.yaml` from the repository — nothing
    else, no prior conversation state — so measurement can span days: a
    plan started on day one and resumed on day fifteen produces the same
@@ -507,7 +507,7 @@ treats missing evidence as zero.
    Baseline Plan forward into stage 10's Setup Review Packet alongside the
    Execution Profiles and CI proposal.
 
-See `shared/references/baseline-plan.md` for the full rationale, the
+See `references/shared/baseline-plan.md` for the full rationale, the
 Quantity type's three states, and the deterministic core's test coverage
 for each rule above.
 
@@ -521,7 +521,7 @@ approval — not merely once some flows have — and it proposes the smallest
 change that carries that approved portfolio, matching what the repository
 actually has rather than introducing a parallel stack.
 
-`shared/scripts/ci-design.mjs` is where this stage's own logic lives. It
+`scripts/ci-design.mjs` is where this stage's own logic lives. It
 composes three earlier tickets' results; it re-derives none of them:
 
 1. **Confirm the ordering gate before anything else.** Call
@@ -600,7 +600,7 @@ composes three earlier tickets' results; it re-derives none of them:
    this stage never invents an enforcement state it cannot actually
    render.
 
-See `shared/references/ci-design.md` for the full rationale, the
+See `references/shared/ci-design.md` for the full rationale, the
 amend-vs-new-file scoring in detail, and the deterministic core's test
 coverage for each rule above.
 
@@ -614,7 +614,7 @@ After emission, `qa-setup` stops: generation, merging, provider-policy
 changes, and pilot execution are separate actions this skill never takes
 on its own.
 
-`shared/scripts/setup-review-packet.mjs` is where this stage's own logic
+`scripts/setup-review-packet.mjs` is where this stage's own logic
 lives. It composes five earlier tickets' results; it re-derives none of
 them, and it introduces no second approval model:
 
@@ -693,14 +693,43 @@ them, and it introduces no second approval model:
    `portfolioFullyApproved` before a CI proposal can exist at all — by the
    time stage 10 runs, that condition already holds structurally.)
 
-See `shared/references/setup-review-packet.md` for the full rationale and
+See `references/shared/setup-review-packet.md` for the full rationale and
 the deterministic core's test coverage for each rule above.
 
-## Dependencies
+## Dependency precondition: `grilling` and `domain-modeling` must be installed
 
-Requires the installed `grilling` and `domain-modeling` skills (Matt Pocock
-skill set, tracked in `skills-lock.json`). Uses the repository's issue tracker
-and documented Git workflow. Never creates its own product backlog.
+`qa-setup` depends on the installed `grilling` and `domain-modeling` skills
+(Matt Pocock skill set, tracked in `skills-lock.json`) for the accountable
+human decisions this workflow requires — stress-testing the QA Owner's
+portfolio and safety-boundary choices, and recording the resulting domain
+vocabulary and ADRs. This bundle installs and validates only `qa-setup` and
+`qa-generate`; it does not install, vendor, or substitute for `grilling` or
+`domain-modeling`, so a standalone install of this skill alone cannot
+complete stages that call on them.
+
+Before any stage that would invoke `grilling` or `domain-modeling` (stage 1
+authority framing, stage 5 one-flow interviews, and stage 6 portfolio
+reconciliation), confirm each skill is actually installed and loadable for
+the harness in use. If either is missing, **stop immediately** at that
+stage — do not skip the step, weaken it to a plain question, or proceed
+without it — and print an actionable message naming exactly which skill is
+missing and how to install it, mirroring the installation-precondition
+pattern above:
+
+```
+qa-setup: STOP — required skill `grilling` is not installed.
+Install Matt Pocock's engineering skills, then re-run qa-setup:
+
+  npx skills@latest add mattpocock/skills
+
+Select at least `grilling` and `domain-modeling` (see skills-lock.json),
+then re-invoke qa-setup.
+```
+
+This is the same graceful, named, actionable stop this skill already uses
+for a missing or stale `dynamic-skills-setup` capability profile — never a
+silent skip and never an obscure failure. Uses the repository's issue
+tracker and documented Git workflow. Never creates its own product backlog.
 
 ## Self-containment
 
